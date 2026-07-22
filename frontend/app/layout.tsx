@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import BackendStatus from "@/components/BackendStatus";
 import UploadProvider from "@/components/UploadProvider";
 import "./globals.css";
 
@@ -16,6 +17,7 @@ export default function RootLayout({
     <html lang="en">
       <body>
         <UploadProvider>{children}</UploadProvider>
+        <BackendStatus />
       </body>
     </html>
   );

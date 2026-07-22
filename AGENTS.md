@@ -50,7 +50,6 @@ Current frontend stack:
 
 Do not add these unless explicitly requested:
 
-- backend services;
 - OpenAI integration;
 - OCR;
 - code compilation;
@@ -95,3 +94,13 @@ A feature is complete only when:
 - C++ is the only supported language for the current MVP.
 - Downloaded files use the `.cpp` extension.
 - Compilation and testing remain mocked until explicitly implemented.
+
+## Backend foundation
+
+- The backend uses Python and FastAPI.
+- Backend code lives in the `backend` directory.
+- The frontend and backend run as separate local services.
+- API responses must use structured JSON.
+- Environment-specific values must come from environment variables.
+- Do not place secrets or API keys in frontend code.
+- OpenAI integration and file transcription remain excluded until explicitly requested.

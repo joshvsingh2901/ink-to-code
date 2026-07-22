@@ -1,30 +1,13 @@
 "use client";
 
-import { useState } from "react";
-import ImageUploadCard, {
-  type UploadState,
-} from "@/components/ImageUploadCard";
+import { useRouter } from "next/navigation";
+import ImageUploadCard from "@/components/ImageUploadCard";
+import { useUploads } from "@/components/UploadProvider";
 
 export default function Home() {
-  const [codeUpload, setCodeUpload] = useState<UploadState>({
-    mode: "empty",
-    pages: [],
-  });
-  const [questionUpload, setQuestionUpload] = useState<UploadState>({
-    mode: "empty",
-    pages: [],
-  });
-  const [isComplete, setIsComplete] = useState(false);
-
-  function handleCodeUploadChange(upload: UploadState) {
-    setCodeUpload(upload);
-    setIsComplete(false);
-  }
-
-  function handleQuestionUploadChange(upload: UploadState) {
-    setQuestionUpload(upload);
-    setIsComplete(false);
-  }
+  const router = useRouter();
+  const { codeUpload, setCodeUpload, questionUpload, setQuestionUpload } =
+    useUploads();
 
   return (
     <main className="min-h-screen bg-slate-50 px-4 py-8 sm:px-6 sm:py-12 lg:px-8">
@@ -53,7 +36,7 @@ export default function Home() {
             description="Upload up to 5 images or one PDF."
             required
             upload={codeUpload}
-            onUploadChange={handleCodeUploadChange}
+            onUploadChange={setCodeUpload}
           />
           <ImageUploadCard
             id="question-images"
@@ -61,7 +44,7 @@ export default function Home() {
             title="Programming Question"
             description="Add up to 5 images or one PDF."
             upload={questionUpload}
-            onUploadChange={handleQuestionUploadChange}
+            onUploadChange={setQuestionUpload}
           />
         </div>
 
@@ -69,16 +52,11 @@ export default function Home() {
           <button
             type="button"
             disabled={codeUpload.pages.length === 0}
-            onClick={() => setIsComplete(true)}
+            onClick={() => router.push("/review")}
             className="rounded-lg bg-slate-900 px-6 py-3 font-semibold text-white transition-colors hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-slate-900"
           >
             Continue
           </button>
-          {isComplete && (
-            <p className="text-sm text-slate-600" role="status">
-              Upload screen complete. OCR review will be added next.
-            </p>
-          )}
         </div>
       </div>
     </main>

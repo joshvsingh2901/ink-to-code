@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import { useUploads } from "@/components/UploadProvider";
 import {
   PdfPreviewError,
   renderPdfPages,
@@ -118,20 +119,17 @@ export default function ImageUploadCard({
   const addInputRef = useRef<HTMLInputElement>(null);
   const pdfReplaceInputRef = useRef<HTMLInputElement>(null);
   const imageReplaceInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
-  const objectUrlsRef = useRef(new Set<string>());
   const isMountedRef = useRef(true);
+  const { registerPreviewUrls, revokePreviewUrls } = useUploads();
   const pages = upload.pages;
   const accessibleSection =
     sectionLabel === "code" ? "handwritten code" : "programming question";
 
   useEffect(() => {
-    const objectUrls = objectUrlsRef.current;
     isMountedRef.current = true;
 
     return () => {
       isMountedRef.current = false;
-      objectUrls.forEach((previewUrl) => URL.revokeObjectURL(previewUrl));
-      objectUrls.clear();
     };
   }, []);
 
@@ -140,14 +138,7 @@ export default function ImageUploadCard({
   }
 
   function trackPreviewUrls(nextPages: { previewUrl: string }[]) {
-    nextPages.forEach((page) => objectUrlsRef.current.add(page.previewUrl));
-  }
-
-  function revokePreviewUrls(oldPages: { previewUrl: string }[]) {
-    oldPages.forEach((page) => {
-      URL.revokeObjectURL(page.previewUrl);
-      objectUrlsRef.current.delete(page.previewUrl);
-    });
+    registerPreviewUrls(nextPages);
   }
 
   async function processPdf(file: File, isReplacement = false) {
@@ -222,7 +213,7 @@ export default function ImageUploadCard({
       }
 
       const previewUrl = URL.createObjectURL(file);
-      objectUrlsRef.current.add(previewUrl);
+      registerPreviewUrls([{ previewUrl }]);
       nextImages.push({ id: crypto.randomUUID(), kind: "image", file, previewUrl });
       nextTotalSize += file.size;
     });
@@ -329,7 +320,7 @@ export default function ImageUploadCard({
 
     const oldPage = upload.pages[pageIndex];
     const previewUrl = URL.createObjectURL(replacement);
-    objectUrlsRef.current.add(previewUrl);
+    registerPreviewUrls([{ previewUrl }]);
     const nextPages = [...upload.pages];
     nextPages[pageIndex] = {
       id: oldPage.id,

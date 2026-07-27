@@ -88,19 +88,29 @@ Current MVP language:
 
 Do not add these unless explicitly requested:
 
-- Docker-based sandboxing;
-- real generated test cases;
+- Gemini-generated test cases;
 - automatic code repair;
 - AI-generated code fixes;
+- function harness generation for function-only submissions;
+- Docker-based sandboxing;
+- production-grade remote code execution infrastructure;
 - authentication;
 - database integration;
 - permanent file storage;
 - Python language support;
 - additional programming languages;
-- cloud deployment;
-- production-grade remote code execution infrastructure.
+- cloud deployment.
 
-Real local C++ compilation is now part of the current development plan.
+Real local C++ compilation is implemented.
+
+Real local C++ test execution with explicit/manual test cases is now part of the current development plan.
+
+For the current local MVP:
+- test execution may run student C++ code only after an explicit `Run Tests` action;
+- auto-compile must never execute student code;
+- test execution must use strict timeouts, output limits, temporary files, and safe subprocess invocation;
+- function-only code without `main()` is not executable yet;
+- stronger sandboxing is required before arbitrary code execution is exposed to real users.
 
 ## Definition of done
 
@@ -297,3 +307,28 @@ The expected request should contain the current source code in structured JSON, 
 - Automatic compilation compiles only and never executes the resulting program.
 - Gemini is not involved in compilation or automatic compilation.
 - Clicking a diagnostic temporarily highlights its source line without modifying source text.
+
+## Test execution stage
+
+- Compile and Run Tests are separate operations.
+- Compile performs C++17 syntax/type checking and does not require `main()`.
+- Run Tests executes student code only after an explicit user action.
+- Run Tests currently requires a complete runnable C++ program with `main()`.
+- Function-only harness generation is not implemented yet.
+- Tests are explicit/manual in this stage.
+- Gemini must not generate tests, expected outputs, or runtime fixes.
+- Test execution must use strict timeouts and output-size limits.
+- Student programs must run only inside unique temporary working directories.
+- Temporary source files and binaries must be deleted after execution.
+- Never use `shell=True`.
+- Never allow user-controlled compiler flags, executable paths, or shell commands.
+- Auto-compile must never execute student binaries.
+- Run Tests must never modify Monaco source code.
+- Preserve raw expected and actual output for display.
+- Compare output using whitespace-separated token sequences.
+- Ignore leading, trailing, and repeated whitespace only during comparison.
+- Token text, punctuation, capitalization, and order must match exactly.
+- Runtime stderr, exit codes, and timeouts must be reported explicitly.
+- A compile failure during Run Tests must prevent execution.
+- Local subprocess execution is for development only and is not production-grade sandboxing.
+- Stronger sandboxing/container isolation is required before exposing arbitrary code execution to real users.

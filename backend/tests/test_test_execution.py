@@ -1,0 +1,331 @@
+import asyncio
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+from app.schemas.test_execution import ExecutionTestCase
+from app.services import test_execution
+from app.services.test_execution import (
+    FUNCTION_ONLY_MESSAGE,
+    TEST_OUTPUT_LIMIT_BYTES,
+    _classify_output_match,
+    run_cpp_tests,
+)
+
+RUNNABLE_PROGRAM = """
+#include <iostream>
+#include <string>
+
+int main()
+{
+    std::string value;
+    std::getline(std::cin, value);
+    std::cout << value << "\\n";
+    return 0;
+}
+""".strip()
+
+
+async def api_request(payload: object):
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        return await client.post("/api/run-tests", json=payload)
+
+
+def make_test_case(
+    *,
+    name: str = "Test 1",
+    stdin: str = "",
+    expected_stdout: str = "",
+) -> ExecutionTestCase:
+    return ExecutionTestCase(
+        name=name,
+        stdin=stdin,
+        expected_stdout=expected_stdout,
+    )
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_valid_program_passes_and_receives_stdin():
+    result = run_cpp_tests(
+        RUNNABLE_PROGRAM,
+        [make_test_case(stdin="hello\n", expected_stdout="hello\n")],
+    )
+
+    assert result.success is True
+    assert result.compile_error is None
+    assert result.tests[0].passed is True
+    assert result.tests[0].actual_stdout == "hello\n"
+    assert result.tests[0].match_type == "exact"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_expected_output_mismatch_fails():
+    result = run_cpp_tests(
+        RUNNABLE_PROGRAM,
+        [make_test_case(stdin="actual\n", expected_stdout="expected\n")],
+    )
+
+    assert result.success is False
+    assert result.tests[0].passed is False
+    assert result.tests[0].actual_stdout == "actual\n"
+    assert result.tests[0].match_type == "mismatch"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_multiple_tests_execute_in_request_order():
+    result = run_cpp_tests(
+        RUNNABLE_PROGRAM,
+        [
+            make_test_case(name="First", stdin="one\n", expected_stdout="one\n"),
+            make_test_case(name="Second", stdin="two\n", expected_stdout="two\n"),
+        ],
+    )
+
+    assert [item.name for item in result.tests] == ["First", "Second"]
+    assert [item.actual_stdout for item in result.tests] == ["one\n", "two\n"]
+    assert all(item.passed for item in result.tests)
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_runtime_stderr_and_nonzero_exit_are_reported():
+    result = run_cpp_tests(
+        '#include <iostream>\nint main() { std::cerr << "problem"; return 7; }',
+        [make_test_case()],
+    )
+
+    assert result.success is False
+    assert result.tests[0].passed is False
+    assert result.tests[0].stderr == "problem"
+    assert result.tests[0].exit_code == 7
+    assert result.tests[0].timed_out is False
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_infinite_loop_times_out():
+    result = run_cpp_tests(
+        "int main() { while (true) {} }",
+        [make_test_case()],
+        test_timeout_seconds=0.05,
+    )
+
+    assert result.success is False
+    assert result.tests[0].passed is False
+    assert result.tests[0].timed_out is True
+    assert result.tests[0].exit_code is None
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_compile_failure_prevents_execution():
+    result = run_cpp_tests(
+        "int main() { return missing; }",
+        [make_test_case()],
+    )
+
+    assert result.success is False
+    assert result.compile_error
+    assert result.tests == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_function_only_source_returns_clear_unsupported_result():
+    result = run_cpp_tests(
+        "int findMax(int a, int b) { return a > b ? a : b; }",
+        [make_test_case()],
+    )
+
+    assert result.success is False
+    assert result.compile_error == FUNCTION_ONLY_MESSAGE
+    assert result.tests == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_temporary_files_are_cleaned(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(test_execution.tempfile, "tempdir", str(tmp_path))
+
+    run_cpp_tests(RUNNABLE_PROGRAM, [make_test_case()])
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_compiler_and_program_never_use_shell_true(monkeypatch):
+    original_run = test_execution.subprocess.run
+    original_popen = test_execution.subprocess.Popen
+    invocations: list[bool | None] = []
+
+    def recording_run(*args, **kwargs):
+        invocations.append(kwargs.get("shell"))
+        return original_run(*args, **kwargs)
+
+    def recording_popen(*args, **kwargs):
+        invocations.append(kwargs.get("shell"))
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(test_execution.subprocess, "run", recording_run)
+    monkeypatch.setattr(test_execution.subprocess, "Popen", recording_popen)
+
+    result = run_cpp_tests(RUNNABLE_PROGRAM, [make_test_case()])
+
+    assert result.tests
+    assert len(invocations) >= 2
+    assert all(shell is False for shell in invocations)
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_whitespace_only_difference_passes_and_preserves_raw_output():
+    result = run_cpp_tests(
+        '#include <iostream>\nint main() { std::cout << "15 \\n"; }',
+        [make_test_case(expected_stdout="15\n")],
+    )
+
+    assert result.tests[0].passed is True
+    assert result.tests[0].match_type == "whitespace_normalized"
+    assert result.tests[0].expected_stdout == "15\n"
+    assert result.tests[0].actual_stdout == "15 \n"
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("2", "2\n"),
+        ("2", "   2"),
+        ("2 3", "2    3"),
+        ("hello\tworld", "hello world"),
+        ("2 3", "2\n3\n"),
+        ("one\r\ntwo\r\n", "one\ntwo\n"),
+    ],
+)
+def test_whitespace_variants_are_normalized(expected: str, actual: str):
+    assert _classify_output_match(expected, actual) == "whitespace_normalized"
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("2", "3"),
+        ("2 3", "3 2"),
+        ("hello world", "hello there"),
+        ("value.", "value"),
+        ("Hello", "hello"),
+    ],
+)
+def test_meaningful_token_differences_remain_mismatches(
+    expected: str,
+    actual: str,
+):
+    assert _classify_output_match(expected, actual) == "mismatch"
+
+
+def test_identical_output_is_classified_as_exact():
+    assert _classify_output_match("hello world\n", "hello world\n") == "exact"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_output_limit_stops_large_output():
+    result = run_cpp_tests(
+        """
+#include <iostream>
+int main()
+{
+    while (true) {
+        std::cout << "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    }
+}
+""".strip(),
+        [make_test_case()],
+    )
+
+    assert result.tests[0].passed is False
+    assert result.tests[0].output_limited is True
+    assert len(result.tests[0].actual_stdout.encode("utf-8")) <= (
+        TEST_OUTPUT_LIMIT_BYTES + 64
+    )
+
+
+def test_empty_test_list_is_rejected():
+    response = asyncio.run(
+        api_request(
+            {
+                "code": "int main() {}",
+                "language": "cpp",
+                "tests": [],
+            }
+        )
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"
+
+
+def test_malformed_test_is_rejected():
+    response = asyncio.run(
+        api_request(
+            {
+                "code": "int main() {}",
+                "language": "cpp",
+                "tests": [{"name": "", "stdin": ""}],
+            }
+        )
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"
+
+
+def test_compile_command_is_fixed_and_source_is_not_interpolated(monkeypatch):
+    source = "int main() { return 0; }"
+    invocation: dict[str, object] = {}
+
+    def recording_run(command, **kwargs):
+        invocation["command"] = command
+        invocation["shell"] = kwargs["shell"]
+        invocation["source"] = (Path(kwargs["cwd"]) / "main.cpp").read_text()
+        (Path(kwargs["cwd"]) / "program").touch()
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"",
+            stderr=b"",
+        )
+
+    class CompletedProgram:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+    def recording_popen(command, **kwargs):
+        invocation["program_command"] = command
+        invocation["program_shell"] = kwargs["shell"]
+        return CompletedProgram()
+
+    monkeypatch.setattr(test_execution.subprocess, "run", recording_run)
+    monkeypatch.setattr(test_execution.subprocess, "Popen", recording_popen)
+
+    result = run_cpp_tests(source, [make_test_case()])
+
+    assert result.tests
+    assert invocation["command"] == [
+        "g++",
+        "-std=c++17",
+        "main.cpp",
+        "-o",
+        "program",
+    ]
+    program_command = invocation["program_command"]
+    assert isinstance(program_command, list)
+    assert len(program_command) == 1
+    assert Path(program_command[0]).name == "program"
+    assert invocation["shell"] is False
+    assert invocation["program_shell"] is False
+    assert invocation["source"] == source
+    assert source not in invocation["command"]

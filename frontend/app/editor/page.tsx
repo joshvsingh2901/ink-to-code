@@ -9,6 +9,10 @@ import {
   type CompileDiagnostic,
   type CompileResult,
 } from "@/lib/compiler";
+import {
+  runCppTests,
+  type RunTestsResult,
+} from "@/lib/testExecution";
 
 type SidebarTab = "compiler" | "tests";
 type PrimaryDiagnostic = CompileDiagnostic & {
@@ -28,17 +32,24 @@ type IssueCategory =
   | "Operator issue"
   | "Warning"
   | "Other issue";
+type EditableTestCase = {
+  id: string;
+  name: string;
+  stdin: string;
+  expected_stdout: string;
+};
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
 const AUTO_COMPILE_DEBOUNCE_MS = 900;
 const ISSUE_HIGHLIGHT_DURATION_MS = 1500;
 
-const MOCK_TESTS = [
-  { name: "Test 1", result: "Passed" },
-  { name: "Test 2", result: "Failed" },
-  { name: "Test 3", result: "Passed" },
-  { name: "Test 4", result: "Failed" },
-] as const;
+const MAX_TEST_CASES = 10;
+const INITIAL_TEST_CASE: EditableTestCase = {
+  id: "test-1",
+  name: "Test 1",
+  stdin: "",
+  expected_stdout: "",
+};
 
 function sanitizeFilename(filename: string) {
   const withoutExtension = filename.replace(/\.cpp$/i, "");
@@ -137,7 +148,14 @@ export default function EditorPage() {
   const [isCompiling, setIsCompiling] = useState(false);
   const [isChecking, setIsChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
-  const [hasRunTests, setHasRunTests] = useState(false);
+  const [testCases, setTestCases] = useState<EditableTestCase[]>([
+    INITIAL_TEST_CASE,
+  ]);
+  const [testRunResult, setTestRunResult] = useState<RunTestsResult | null>(
+    null,
+  );
+  const [testRunError, setTestRunError] = useState<string | null>(null);
+  const [isRunningTests, setIsRunningTests] = useState(false);
   const [isEdited, setIsEdited] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const initialCodeRef = useRef(reviewedCode ?? "");
@@ -145,6 +163,7 @@ export default function EditorPage() {
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const currentSourceRef = useRef(reviewedCode ?? "");
   const codeVersionRef = useRef(0);
+  const nextTestIdRef = useRef(2);
   const latestCompileRequestRef = useRef(0);
   const hasCompletedCompileRef = useRef(false);
   const autoCompileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -346,9 +365,74 @@ export default function EditorPage() {
     void runCompile();
   }
 
-  function handleRunTests() {
+  async function handleRunTests() {
+    if (isRunningTests) return;
     setActiveTab("tests");
-    setHasRunTests(true);
+    setIsRunningTests(true);
+    setTestRunError(null);
+    setTestRunResult(null);
+
+    try {
+      const currentCode = editorRef.current?.getValue() ?? code;
+      const result = await runCppTests(
+        currentCode,
+        testCases.map(({ name, stdin, expected_stdout }) => ({
+          name,
+          stdin,
+          expected_stdout,
+        })),
+      );
+      if (!isMountedRef.current) return;
+      setTestRunResult(result);
+    } catch (error) {
+      if (!isMountedRef.current) return;
+      setTestRunError(
+        error instanceof Error
+          ? error.message
+          : "The backend could not run the tests.",
+      );
+    } finally {
+      if (isMountedRef.current) {
+        setIsRunningTests(false);
+      }
+    }
+  }
+
+  function updateTestCase(
+    id: string,
+    field: "name" | "stdin" | "expected_stdout",
+    value: string,
+  ) {
+    setTestCases((current) =>
+      current.map((test) =>
+        test.id === id ? { ...test, [field]: value } : test,
+      ),
+    );
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function addTestCase() {
+    if (testCases.length >= MAX_TEST_CASES) return;
+    const sequence = nextTestIdRef.current;
+    nextTestIdRef.current += 1;
+    setTestCases((current) => [
+      ...current,
+      {
+        id: `test-${sequence}`,
+        name: `Test ${sequence}`,
+        stdin: "",
+        expected_stdout: "",
+      },
+    ]);
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function removeTestCase(id: string) {
+    setTestCases((current) => current.filter((test) => test.id !== id));
+    setTestRunResult(null);
+    setTestRunError(null);
   }
 
   async function handleCopy() {
@@ -453,10 +537,11 @@ export default function EditorPage() {
               </button>
               <button
                 type="button"
-                onClick={handleRunTests}
-                className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                onClick={() => void handleRunTests()}
+                disabled={isRunningTests || testCases.length === 0}
+                className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Run Tests
+                {isRunningTests ? "Running Tests..." : "Run Tests"}
               </button>
             </div>
           </div>
@@ -483,6 +568,8 @@ export default function EditorPage() {
                   issueHighlightTimerRef.current = null;
                 }
                 issueHighlightRef.current?.clear();
+                setTestRunResult(null);
+                setTestRunError(null);
                 if (hasCompletedCompileRef.current) {
                   setIsChecking(true);
                   setCheckError(null);
@@ -718,32 +805,238 @@ export default function EditorPage() {
                   </p>
                 ))}
 
-              {activeTab === "tests" &&
-                (hasRunTests ? (
-                  <div>
-                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      Mock test results
-                    </p>
-                    <ul className="mt-3 divide-y divide-slate-100">
-                      {MOCK_TESTS.map((test) => (
-                        <li key={test.name} className="flex items-center justify-between py-3 text-sm">
-                          <span className="font-medium text-slate-800">{test.name}</span>
-                          <span
-                            className={
-                              test.result === "Passed" ? "text-emerald-700" : "text-red-700"
-                            }
+              {activeTab === "tests" && (
+                <div>
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-slate-800">
+                        Explicit Tests
+                      </h3>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Runnable programs must include main().
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={addTestCase}
+                      disabled={
+                        isRunningTests || testCases.length >= MAX_TEST_CASES
+                      }
+                      className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Add Test
+                    </button>
+                  </div>
+
+                  <div className="mt-3 space-y-3">
+                    {testCases.map((test, index) => (
+                      <fieldset
+                        key={test.id}
+                        disabled={isRunningTests}
+                        className="rounded-md border border-slate-200 p-3"
+                      >
+                        <legend className="sr-only">
+                          Test case {index + 1}
+                        </legend>
+                        <div className="flex items-center gap-2">
+                          <label
+                            htmlFor={`${test.id}-name`}
+                            className="sr-only"
                           >
-                            {test.result}
-                          </span>
+                            Test name
+                          </label>
+                          <input
+                            id={`${test.id}-name`}
+                            value={test.name}
+                            maxLength={100}
+                            onChange={(event) =>
+                              updateTestCase(
+                                test.id,
+                                "name",
+                                event.target.value,
+                              )
+                            }
+                            className="min-w-0 flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-sm font-medium text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeTestCase(test.id)}
+                            className="rounded-md px-2 py-1.5 text-xs font-medium text-slate-500 hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                            aria-label={`Remove ${test.name || `test ${index + 1}`}`}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                        <label
+                          htmlFor={`${test.id}-stdin`}
+                          className="mt-3 block text-xs font-medium text-slate-600"
+                        >
+                          Standard input
+                        </label>
+                        <textarea
+                          id={`${test.id}-stdin`}
+                          value={test.stdin}
+                          maxLength={64 * 1024}
+                          rows={3}
+                          onChange={(event) =>
+                            updateTestCase(
+                              test.id,
+                              "stdin",
+                              event.target.value,
+                            )
+                          }
+                          className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                        />
+                        <label
+                          htmlFor={`${test.id}-expected`}
+                          className="mt-3 block text-xs font-medium text-slate-600"
+                        >
+                          Expected output
+                        </label>
+                        <textarea
+                          id={`${test.id}-expected`}
+                          value={test.expected_stdout}
+                          maxLength={64 * 1024}
+                          rows={3}
+                          onChange={(event) =>
+                            updateTestCase(
+                              test.id,
+                              "expected_stdout",
+                              event.target.value,
+                            )
+                          }
+                          className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                        />
+                      </fieldset>
+                    ))}
+                  </div>
+
+                  {testCases.length === 0 && (
+                    <p className="mt-3 text-sm leading-6 text-slate-600">
+                      Add at least one test before running the program.
+                    </p>
+                  )}
+                  {testCases.length >= MAX_TEST_CASES && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Maximum of {MAX_TEST_CASES} tests reached.
+                    </p>
+                  )}
+                  {isRunningTests && (
+                    <p
+                      role="status"
+                      aria-live="polite"
+                      className="mt-4 text-sm text-slate-600"
+                    >
+                      Compiling and running tests…
+                    </p>
+                  )}
+                  {testRunError && (
+                    <div
+                      role="alert"
+                      className="mt-4 border-l-2 border-rose-300 pl-3"
+                    >
+                      <p className="text-sm font-medium text-slate-800">
+                        Test runner unavailable
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-slate-600">
+                        {testRunError}
+                      </p>
+                    </div>
+                  )}
+                  {testRunResult?.compile_error && (
+                    <div
+                      role="alert"
+                      className="mt-4 rounded-md border border-rose-100 p-3"
+                    >
+                      <p className="text-sm font-medium text-slate-800">
+                        Tests could not run
+                      </p>
+                      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-5 text-slate-600">
+                        {testRunResult.compile_error}
+                      </pre>
+                    </div>
+                  )}
+                  {testRunResult && testRunResult.tests.length > 0 && (
+                    <ul className="mt-4 space-y-3" aria-label="Test results">
+                      {testRunResult.tests.map((result, index) => (
+                        <li
+                          key={`${result.name}-${index}`}
+                          className={`rounded-md border p-3 ${
+                            result.passed
+                              ? "border-emerald-100"
+                              : "border-rose-100"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="text-sm font-medium text-slate-800">
+                              <span
+                                className={
+                                  result.passed
+                                    ? "text-emerald-700"
+                                    : "text-rose-700"
+                                }
+                              >
+                                {result.passed ? "PASS" : "FAIL"}
+                              </span>
+                              {" — "}
+                              {result.name}
+                            </p>
+                            {!result.timed_out &&
+                              result.exit_code !== null && (
+                                <span className="text-xs tabular-nums text-slate-500">
+                                  Exit {result.exit_code}
+                                </span>
+                              )}
+                          </div>
+                          {result.timed_out ? (
+                            <p className="mt-2 text-xs font-medium text-rose-700">
+                              Timed out
+                            </p>
+                          ) : result.output_limited ? (
+                            <p className="mt-2 text-xs font-medium text-rose-700">
+                              Output limit exceeded
+                            </p>
+                          ) : result.match_type ===
+                            "whitespace_normalized" ? (
+                            <p className="mt-2 text-xs text-slate-500">
+                              Formatting differences ignored
+                            </p>
+                          ) : !result.passed ? (
+                            <div className="mt-3 grid gap-3">
+                              <div>
+                                <p className="text-xs font-medium text-slate-500">
+                                  Expected
+                                </p>
+                                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs leading-5 text-slate-800">
+                                  {result.expected_stdout || "(empty)"}
+                                </pre>
+                              </div>
+                              <div>
+                                <p className="text-xs font-medium text-slate-500">
+                                  Actual
+                                </p>
+                                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs leading-5 text-slate-800">
+                                  {result.actual_stdout || "(empty)"}
+                                </pre>
+                              </div>
+                            </div>
+                          ) : null}
+                          {result.stderr && (
+                            <details className="mt-3">
+                              <summary className="cursor-pointer text-xs font-medium text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900">
+                                Show runtime stderr
+                              </summary>
+                              <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+                                {result.stderr}
+                              </pre>
+                            </details>
+                          )}
                         </li>
                       ))}
                     </ul>
-                  </div>
-                ) : (
-                  <p className="text-sm leading-6 text-slate-600">
-                    Run tests when you are ready to check your solution.
-                  </p>
-                ))}
+                  )}
+                </div>
+              )}
             </div>
           </aside>
         </div>

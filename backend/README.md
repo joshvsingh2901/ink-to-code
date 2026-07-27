@@ -45,6 +45,28 @@ Each metadata object contains `file_id`, contiguous 1-based `order`, `category`,
 
 Images are limited to 10 MB each and 50 MB per category. The API validates and explicitly sorts metadata order before calling Gemini. Each validated page is sent as an in-memory PNG or JPEG byte part in the exact selected order. Programming-question pages are appended as a clearly separated context section. Confidence values are model-estimated review aids, not calibrated probabilities.
 
+## Local C++ test execution
+
+`POST /api/run-tests` accepts the current C++17 source and 1–10 explicit test
+cases. Each test provides a name, standard input, and exact expected standard
+output. Runnable tests require a complete program with `main()`; function-only
+source remains valid for `/api/compile` but cannot be executed without a future
+test harness.
+
+The test runner compiles with a fixed argument list, runs only after an explicit
+request, and uses a unique temporary directory that is deleted afterward. Each
+test has a two-second timeout. Standard output and standard error are each
+limited to 64 KiB; a process exceeding either limit is stopped and its output is
+reported as limited. Output comparison preserves the raw expected and actual
+text for display, but compares their whitespace-separated token sequences.
+Leading and trailing whitespace, repeated spaces, tabs, and line-break
+differences are ignored; token text, punctuation, capitalization, and order
+must still match exactly.
+
+This local subprocess isolation is for development only. It is not a
+production-grade sandbox; container or equivalent isolation is required before
+running arbitrary code for real users.
+
 ## Tests
 
 Tests mock the Gemini client and never make quota-consuming API calls:

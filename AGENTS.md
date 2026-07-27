@@ -284,3 +284,16 @@ The expected request should contain the current source code in structured JSON, 
 - Raw compiler output, including notes, remains available unchanged.
 - Do not use Gemini for compiler explanations.
 - Missing downstream errors are expected to appear naturally after the user edits and recompiles.
+
+## Editor compilation feedback
+
+- Manual Compile remains available at all times when no request is actively running.
+- After the first completed compile, source edits trigger debounced automatic compilation.
+- Compiler requests must be debounced rather than sent on every keystroke.
+- Previous diagnostic cards and their issue count remain visible while a new result is being checked.
+- Potentially stale Monaco compiler markers are cleared immediately after source edits.
+- Stale or out-of-order compile responses must never replace newer results.
+- Issue counts derive only from completed compiler results.
+- Automatic compilation compiles only and never executes the resulting program.
+- Gemini is not involved in compilation or automatic compilation.
+- Clicking a diagnostic temporarily highlights its source line without modifying source text.

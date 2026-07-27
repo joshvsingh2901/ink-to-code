@@ -6,16 +6,18 @@ import { useEffect, useRef, useState } from "react";
 import { useUploads } from "@/components/UploadProvider";
 import {
   compileCpp,
-  requestCompilerSuggestions,
   type CompileDiagnostic,
   type CompileResult,
-  type FixSuggestion,
 } from "@/lib/compiler";
 
 type SidebarTab = "compiler" | "tests";
 type PrimaryDiagnostic = CompileDiagnostic & {
   severity: "error" | "warning";
 };
+type EditorInstance = Parameters<OnMount>[0];
+type DecorationsCollection = ReturnType<
+  EditorInstance["createDecorationsCollection"]
+>;
 type IssueCategory =
   | "Identifier issue"
   | "Syntax issue"
@@ -28,6 +30,8 @@ type IssueCategory =
   | "Other issue";
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
+const AUTO_COMPILE_DEBOUNCE_MS = 900;
+const ISSUE_HIGHLIGHT_DURATION_MS = 1500;
 
 const MOCK_TESTS = [
   { name: "Test 1", result: "Passed" },
@@ -131,15 +135,26 @@ export default function EditorPage() {
   const [compileResult, setCompileResult] = useState<CompileResult | null>(null);
   const [compileError, setCompileError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
-  const [suggestions, setSuggestions] = useState<FixSuggestion[]>([]);
-  const [suggestionError, setSuggestionError] = useState<string | null>(null);
+  const [isChecking, setIsChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
   const [hasRunTests, setHasRunTests] = useState(false);
   const [isEdited, setIsEdited] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const initialCodeRef = useRef(reviewedCode ?? "");
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
+  const currentSourceRef = useRef(reviewedCode ?? "");
   const codeVersionRef = useRef(0);
+  const latestCompileRequestRef = useRef(0);
+  const hasCompletedCompileRef = useRef(false);
+  const autoCompileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const issueHighlightRef = useRef<DecorationsCollection | null>(null);
+  const issueHighlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const isMountedRef = useRef(true);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -150,13 +165,22 @@ export default function EditorPage() {
 
   useEffect(() => {
     return () => {
+      isMountedRef.current = false;
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      if (autoCompileTimerRef.current) {
+        clearTimeout(autoCompileTimerRef.current);
+      }
+      if (issueHighlightTimerRef.current) {
+        clearTimeout(issueHighlightTimerRef.current);
+      }
+      issueHighlightRef.current?.clear();
     };
   }, []);
 
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
+    issueHighlightRef.current = editor.createDecorationsCollection();
   };
 
   function clearCompilerMarkers() {
@@ -228,21 +252,47 @@ export default function EditorPage() {
     });
     editor.revealLineInCenter(location.line);
     editor.focus();
+
+    if (issueHighlightTimerRef.current) {
+      clearTimeout(issueHighlightTimerRef.current);
+    }
+    issueHighlightRef.current?.set([
+      {
+        range: {
+          startLineNumber: location.line,
+          startColumn: 1,
+          endLineNumber: location.line,
+          endColumn: 1,
+        },
+        options: {
+          isWholeLine: true,
+          className: "compiler-issue-line-highlight",
+        },
+      },
+    ]);
+    issueHighlightTimerRef.current = setTimeout(() => {
+      issueHighlightRef.current?.clear();
+      issueHighlightTimerRef.current = null;
+    }, ISSUE_HIGHLIGHT_DURATION_MS);
   }
 
-  function clearSuggestionState() {
-    setSuggestions([]);
-    setSuggestionError(null);
+  function cancelPendingAutoCompile() {
+    if (autoCompileTimerRef.current) {
+      clearTimeout(autoCompileTimerRef.current);
+      autoCompileTimerRef.current = null;
+    }
   }
 
   async function runCompile(sourceOverride?: string) {
-    if (isCompiling) return;
-
+    const requestId = latestCompileRequestRef.current + 1;
+    latestCompileRequestRef.current = requestId;
     clearCompilerMarkers();
-    clearSuggestionState();
     setActiveTab("compiler");
-    setCompileResult(null);
     setCompileError(null);
+    setCheckError(null);
+    if (hasCompletedCompileRef.current) {
+      setIsChecking(true);
+    }
     setIsCompiling(true);
     const submittedVersion = codeVersionRef.current;
 
@@ -250,110 +300,50 @@ export default function EditorPage() {
       const currentCode =
         sourceOverride ?? editorRef.current?.getValue() ?? code;
       const result = await compileCpp(currentCode);
-      if (submittedVersion !== codeVersionRef.current) return;
-
-      setCompileResult(result);
-      applyCompilerMarkers(result.diagnostics);
-      const visibleDiagnostics = result.diagnostics.filter(isPrimaryDiagnostic);
-      if (visibleDiagnostics.length > 0) {
-        setIsCompiling(false);
-        void loadSuggestions(
-          currentCode,
-          visibleDiagnostics,
-          submittedVersion,
-        );
+      if (
+        !isMountedRef.current ||
+        requestId !== latestCompileRequestRef.current ||
+        submittedVersion !== codeVersionRef.current
+      ) {
+        return;
       }
+
+      hasCompletedCompileRef.current = true;
+      setCompileResult(result);
+      setIsChecking(false);
+      setCheckError(null);
+      applyCompilerMarkers(result.diagnostics);
     } catch (error) {
-      if (submittedVersion !== codeVersionRef.current) return;
-      setCompileError(
+      if (
+        !isMountedRef.current ||
+        requestId !== latestCompileRequestRef.current ||
+        submittedVersion !== codeVersionRef.current
+      ) {
+        return;
+      }
+      const message =
         error instanceof Error
           ? error.message
-          : "The compiler backend could not complete the request.",
-      );
+          : "The compiler backend could not complete the request.";
+      if (hasCompletedCompileRef.current) {
+        setCheckError(message);
+        setIsChecking(false);
+      } else {
+        setCompileError(message);
+      }
     } finally {
-      setIsCompiling(false);
+      if (
+        isMountedRef.current &&
+        requestId === latestCompileRequestRef.current
+      ) {
+        setIsCompiling(false);
+      }
     }
   }
 
   function handleCompile() {
+    cancelPendingAutoCompile();
     void runCompile();
-  }
-
-  async function loadSuggestions(
-    source: string,
-    visibleDiagnostics: PrimaryDiagnostic[],
-    requestedVersion: number,
-  ) {
-    setSuggestions([]);
-    setSuggestionError(null);
-
-    try {
-      const result = await requestCompilerSuggestions(
-        source,
-        visibleDiagnostics,
-      );
-      if (requestedVersion !== codeVersionRef.current) return;
-      setSuggestions(result.suggestions);
-    } catch (error) {
-      if (requestedVersion !== codeVersionRef.current) return;
-      setSuggestionError(
-        error instanceof Error
-          ? error.message
-          : "Fix suggestions are unavailable. Compiler issues remain available.",
-      );
-    }
-  }
-
-  async function handleApplySuggestion(suggestion: FixSuggestion) {
-    const editor = editorRef.current;
-    const model = editor?.getModel();
-    if (!editor || !model || isCompiling) return;
-
-    const validLines =
-      suggestion.start_line <= suggestion.end_line &&
-      suggestion.start_line >= 1 &&
-      suggestion.end_line <= model.getLineCount();
-    const validColumns =
-      validLines &&
-      suggestion.start_column >= 1 &&
-      suggestion.end_column >= 1 &&
-      suggestion.start_column <=
-        model.getLineMaxColumn(suggestion.start_line) &&
-      suggestion.end_column <= model.getLineMaxColumn(suggestion.end_line) &&
-      (suggestion.start_line < suggestion.end_line ||
-        suggestion.start_column <= suggestion.end_column);
-
-    if (!validColumns) {
-      setSuggestions([]);
-      setSuggestionError(
-        "This suggestion is stale. Compile the current code again.",
-      );
-      return;
-    }
-
-    const editRange = {
-      startLineNumber: suggestion.start_line,
-      startColumn: suggestion.start_column,
-      endLineNumber: suggestion.end_line,
-      endColumn: suggestion.end_column,
-    };
-    if (model.getValueInRange(editRange) !== suggestion.original_text) {
-      setSuggestions([]);
-      setSuggestionError(
-        "The code has changed at this location. Compile again before applying a suggestion.",
-      );
-      return;
-    }
-
-    editor.executeEdits("compiler-suggestion", [
-      {
-        range: editRange,
-        text: suggestion.replacement_text,
-        forceMoveMarkers: true,
-      },
-    ]);
-    const updatedCode = editor.getValue();
-    await runCompile(updatedCode);
   }
 
   function handleRunTests() {
@@ -405,12 +395,15 @@ export default function EditorPage() {
 
   const primaryDiagnostics =
     compileResult?.diagnostics.filter(isPrimaryDiagnostic) ?? [];
-  const suggestionsByDiagnosticIndex = new Map(
-    suggestions.map((suggestion) => [
-      suggestion.diagnostic_index,
-      suggestion,
-    ]),
-  );
+  const isCleanCompileSuccess =
+    compileResult?.success === true &&
+    compileResult.exit_code === 0 &&
+    compileResult.diagnostics.length === 0;
+  const hasUnstructuredCompilerOutput =
+    Boolean(compileResult) &&
+    !isCleanCompileSuccess &&
+    primaryDiagnostics.length === 0 &&
+    Boolean(compileResult?.stderr.trim() || compileResult?.stdout.trim());
 
   return (
     <main className="min-h-screen bg-slate-100 p-3 sm:p-5">
@@ -480,11 +473,26 @@ export default function EditorPage() {
               value={code}
               onChange={(value) => {
                 const nextCode = value ?? "";
+                if (nextCode === currentSourceRef.current) return;
+                currentSourceRef.current = nextCode;
                 codeVersionRef.current += 1;
+                cancelPendingAutoCompile();
                 clearCompilerMarkers();
-                clearSuggestionState();
-                setCompileResult(null);
-                setCompileError(null);
+                if (issueHighlightTimerRef.current) {
+                  clearTimeout(issueHighlightTimerRef.current);
+                  issueHighlightTimerRef.current = null;
+                }
+                issueHighlightRef.current?.clear();
+                if (hasCompletedCompileRef.current) {
+                  setIsChecking(true);
+                  setCheckError(null);
+                  autoCompileTimerRef.current = setTimeout(() => {
+                    autoCompileTimerRef.current = null;
+                    void runCompile(nextCode);
+                  }, AUTO_COMPILE_DEBOUNCE_MS);
+                } else {
+                  setCompileError(null);
+                }
                 setCode(nextCode);
                 setReviewedCode(nextCode);
                 setIsEdited(nextCode !== initialCodeRef.current);
@@ -535,7 +543,7 @@ export default function EditorPage() {
               className="p-4"
             >
               {activeTab === "compiler" &&
-                (isCompiling ? (
+                (isCompiling && !compileResult ? (
                   <p className="text-sm leading-6 text-slate-600" aria-live="polite">
                     Compiling current editor contents...
                   </p>
@@ -549,19 +557,59 @@ export default function EditorPage() {
                     </p>
                   </div>
                 ) : compileResult ? (
-                  compileResult.success ? (
-                    <div role="status">
-                      <p className="flex items-center gap-2 text-sm font-medium text-slate-800">
-                        <span
-                          aria-hidden="true"
-                          className="h-2 w-2 rounded-full bg-emerald-500"
-                        />
-                        Compilation successful
-                      </p>
-                      <p className="mt-2 text-xs text-slate-500">
-                        Compiler exit code: {compileResult.exit_code}
-                      </p>
-                    </div>
+                  isCleanCompileSuccess ? (
+                    isChecking ? (
+                      <div role="status" aria-live="polite">
+                        <p className="text-sm font-medium text-slate-700">
+                          Checking…
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-slate-500">
+                          Running the C++17 compiler check.
+                        </p>
+                      </div>
+                    ) : checkError ? (
+                      <div
+                        role="alert"
+                        className="border-l-2 border-rose-300 pl-3"
+                      >
+                        <p className="text-sm font-medium text-slate-800">
+                          Latest check unavailable
+                        </p>
+                        <p className="mt-2 text-sm leading-6 text-slate-600">
+                          {checkError}
+                        </p>
+                      </div>
+                    ) : (
+                      <div role="status">
+                        <p className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                          <span
+                            aria-hidden="true"
+                            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-emerald-200 text-emerald-700"
+                          >
+                            <svg
+                              viewBox="0 0 20 20"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              className="h-3.5 w-3.5"
+                            >
+                              <path
+                                d="m5 10 3 3 7-7"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                            </svg>
+                          </span>
+                          Compilation successful
+                        </p>
+                        <p className="mt-3 text-sm text-slate-700">
+                          No compiler issues found.
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-slate-500">
+                          Your code passed the C++17 compiler check.
+                        </p>
+                      </div>
+                    )
                   ) : (
                     <div role="status">
                       {primaryDiagnostics.length > 0 ? (
@@ -575,12 +623,21 @@ export default function EditorPage() {
                                 {primaryDiagnostics.length}
                               </span>
                             </div>
+                            {isChecking && (
+                              <span
+                                aria-live="polite"
+                                className="text-xs text-slate-500"
+                              >
+                                Checking…
+                              </span>
+                            )}
                           </div>
-                          <ul className="mt-2 divide-y divide-slate-200 border-y border-slate-200">
+                          <ul
+                            className={`mt-2 divide-y divide-slate-200 border-y border-slate-200 transition-opacity ${
+                              isChecking ? "opacity-70" : ""
+                            }`}
+                          >
                             {primaryDiagnostics.map((diagnostic, index) => {
-                              const suggestion =
-                                suggestionsByDiagnosticIndex.get(index);
-
                               return (
                                 <li
                                   key={`${diagnostic.line}-${diagnostic.column}-${index}`}
@@ -613,60 +670,27 @@ export default function EditorPage() {
                                         </span>
                                       )}
                                     </button>
-                                    {suggestion && (
-                                      <div className="border-t border-rose-100 px-2 py-2.5">
-                                        <p className="text-xs font-medium text-slate-600">
-                                          Suggested correction
-                                        </p>
-                                        <div className="mt-1.5 flex min-w-0 items-center gap-2 overflow-hidden font-mono text-xs text-slate-800">
-                                          <code className="truncate rounded bg-slate-100 px-1.5 py-1">
-                                            {suggestion.original_text}
-                                          </code>
-                                          <span
-                                            aria-hidden="true"
-                                            className="text-slate-400"
-                                          >
-                                            →
-                                          </span>
-                                          <code className="truncate rounded bg-slate-100 px-1.5 py-1">
-                                            {suggestion.replacement_text}
-                                          </code>
-                                        </div>
-                                        <p className="mt-1.5 text-xs leading-5 text-slate-600">
-                                          {suggestion.explanation}
-                                        </p>
-                                        <div className="mt-2">
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              void handleApplySuggestion(
-                                                suggestion,
-                                              )
-                                            }
-                                            className="rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
-                                          >
-                                            Apply
-                                          </button>
-                                        </div>
-                                      </div>
-                                    )}
                                   </div>
                                 </li>
                               );
                             })}
                           </ul>
-                          {suggestionError && (
+                          {checkError && (
                             <p
                               role="status"
                               className="mt-2 text-xs leading-5 text-slate-600"
                             >
-                              {suggestionError}
+                              Latest check failed: {checkError}
                             </p>
                           )}
                         </>
-                      ) : (
+                      ) : hasUnstructuredCompilerOutput ? (
                         <p className="text-sm font-medium text-slate-700">
                           Compiler output needs review
+                        </p>
+                      ) : (
+                        <p className="text-sm font-medium text-slate-700">
+                          Compilation did not complete successfully.
                         </p>
                       )}
                       {(compileResult.stderr || compileResult.stdout) ? (

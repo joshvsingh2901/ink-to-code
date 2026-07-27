@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.api.compilation import router as compilation_router
-from app.api.compiler_suggestions import router as compiler_suggestions_router
 from app.api.transcription import router as transcription_router
 from app.config import get_settings
 from app.schemas.transcription import ErrorBody, ErrorResponse
@@ -29,7 +28,6 @@ app.add_middleware(
 )
 app.include_router(transcription_router)
 app.include_router(compilation_router)
-app.include_router(compiler_suggestions_router)
 
 
 @app.exception_handler(RequestValidationError)

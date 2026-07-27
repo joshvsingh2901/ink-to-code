@@ -36,7 +36,7 @@ def compile_cpp(
             source_path = temporary_path / "main.cpp"
             source_path.write_bytes(code.encode("utf-8"))
 
-            command = [compiler, "-std=c++17", "main.cpp", "-o", "program"]
+            command = [compiler, "-std=c++17", "-fsyntax-only", "main.cpp"]
             completed = subprocess.run(
                 command,
                 cwd=temporary_path,

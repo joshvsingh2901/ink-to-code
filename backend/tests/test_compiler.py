@@ -28,6 +28,31 @@ def test_valid_cpp_compiles_successfully():
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_valid_function_without_main_compiles_successfully():
+    result = compile_cpp(
+        """
+int findMax(int a, int b)
+{
+    int maxValue;
+    if (a > b)
+    {
+        maxValue = b;
+    }
+    else
+    {
+        maxValue = a;
+    }
+    return maxValue;
+}
+""".strip()
+    )
+
+    assert result.success is True
+    assert result.exit_code == 0
+    assert result.diagnostics == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
 def test_invalid_cpp_returns_normal_compiler_failure():
     result = compile_cpp("int main() {\n    return 0\n}")
     assert result.success is False
@@ -35,6 +60,32 @@ def test_invalid_cpp_returns_normal_compiler_failure():
     assert "error:" in result.stderr
     assert result.diagnostics
     assert result.diagnostics[0].severity == "error"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_function_without_main_and_with_syntax_error_returns_diagnostics():
+    result = compile_cpp("int findMax(int a, int b) {\n    return a > b ? a : b\n}")
+
+    assert result.success is False
+    assert result.exit_code != 0
+    assert result.diagnostics
+    assert any(
+        diagnostic.severity == "error" for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_undeclared_identifier_returns_diagnostics():
+    result = compile_cpp("int findMax(int a, int b) { return maxValue; }")
+
+    assert result.success is False
+    assert result.exit_code != 0
+    assert result.diagnostics
+    assert any(
+        diagnostic.severity == "error"
+        and "maxValue" in diagnostic.message
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_empty_source_is_rejected_without_compiling(monkeypatch):
@@ -106,9 +157,8 @@ def test_compiler_uses_safe_argument_list_and_exact_source(monkeypatch):
     assert invocation["command"] == [
         "g++",
         "-std=c++17",
+        "-fsyntax-only",
         "main.cpp",
-        "-o",
-        "program",
     ]
     assert invocation["kwargs"]["shell"] is False
     assert submitted not in invocation["command"]

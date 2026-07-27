@@ -14,22 +14,6 @@ export type CompileResult = {
   diagnostics: CompileDiagnostic[];
 };
 
-export type FixSuggestion = {
-  diagnostic_index: number;
-  source: "compiler";
-  start_line: number;
-  start_column: number;
-  end_line: number;
-  end_column: number;
-  original_text: string;
-  replacement_text: string;
-  explanation: string;
-};
-
-export type CompilerSuggestionResult = {
-  suggestions: FixSuggestion[];
-};
-
 type ApiError = { error?: { message?: string } };
 
 export class CompileRequestError extends Error {
@@ -64,33 +48,6 @@ function isCompileResult(value: unknown): value is CompileResult {
   );
 }
 
-function isFixSuggestion(value: unknown): value is FixSuggestion {
-  if (!value || typeof value !== "object") return false;
-  const suggestion = value as Partial<FixSuggestion>;
-  return (
-    Number.isInteger(suggestion.diagnostic_index) &&
-    suggestion.source === "compiler" &&
-    Number.isInteger(suggestion.start_line) &&
-    Number.isInteger(suggestion.start_column) &&
-    Number.isInteger(suggestion.end_line) &&
-    Number.isInteger(suggestion.end_column) &&
-    typeof suggestion.original_text === "string" &&
-    typeof suggestion.replacement_text === "string" &&
-    typeof suggestion.explanation === "string"
-  );
-}
-
-function isCompilerSuggestionResult(
-  value: unknown,
-): value is CompilerSuggestionResult {
-  if (!value || typeof value !== "object") return false;
-  const result = value as Partial<CompilerSuggestionResult>;
-  return (
-    Array.isArray(result.suggestions) &&
-    result.suggestions.every(isFixSuggestion)
-  );
-}
-
 function apiBaseUrl() {
   return process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 }
@@ -120,39 +77,6 @@ export async function compileCpp(code: string): Promise<CompileResult> {
     if (error instanceof CompileRequestError) throw error;
     throw new CompileRequestError(
       "The compiler backend is unavailable. Check the backend and retry.",
-    );
-  }
-}
-
-export async function requestCompilerSuggestions(
-  code: string,
-  diagnostics: CompileDiagnostic[],
-): Promise<CompilerSuggestionResult> {
-  try {
-    const response = await fetch(`${apiBaseUrl()}/api/compiler-suggestions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, language: "cpp", diagnostics }),
-    });
-    const body: unknown = await response.json().catch(() => null);
-
-    if (!response.ok) {
-      const apiError = body as ApiError | null;
-      throw new CompileRequestError(
-        apiError?.error?.message ??
-          "The backend could not provide fix suggestions.",
-      );
-    }
-    if (!isCompilerSuggestionResult(body)) {
-      throw new CompileRequestError(
-        "The backend returned invalid fix suggestions.",
-      );
-    }
-    return body;
-  } catch (error) {
-    if (error instanceof CompileRequestError) throw error;
-    throw new CompileRequestError(
-      "Fix suggestions are unavailable. Compiler issues remain available.",
     );
   }
 }

@@ -258,4 +258,29 @@ The expected request should contain the current source code in structured JSON, 
   "code": "#include <iostream>\nint main() { return 0; }",
   "language": "cpp"
 }
+```
 
+## Compiler fix suggestions
+
+- The C++ compiler remains the sole authority for error detection.
+- Users manually fix most compiler errors.
+- Automatic suggestions are limited to explicit, high-confidence compiler-provided token replacements.
+- A compiler suggestion must identify both the original token and replacement exactly, and the reported source range must match.
+- Do not use Gemini for compiler fixes; Gemini remains limited to handwriting transcription.
+- Do not automatically suggest structural token insertions such as braces, semicolons, parentheses, or brackets.
+- Never apply a fix without an explicit individual Apply action from the user.
+- Apply changes only the exact validated token and then recompiles the updated Monaco contents.
+- Do not add Dismiss or Resolve All.
+- Compilation issue counts always derive from the latest compiler result.
+- Manual source edits invalidate stale suggestions.
+
+## Compiler explanations
+
+- The C++ compiler remains the sole authority for error detection.
+- Beginner-friendly compiler explanations must be deterministic and conservative.
+- Explanations must preserve the original compiler message and must not invent errors, intended structure, or exact fixes.
+- A directly related compiler note may enrich an error explanation when the relationship is explicit.
+- NOTE diagnostics remain hidden from the main issue list.
+- Raw compiler output, including notes, remains available unchanged.
+- Do not use Gemini for compiler explanations.
+- Missing downstream errors are expected to appear naturally after the user edits and recompiles.

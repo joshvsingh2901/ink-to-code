@@ -134,26 +134,151 @@ def test_compiler_diagnostics_preserve_order_locations_and_messages():
             "column": 5,
             "severity": "warning",
             "message": "unused variable 'value' [-Wunused-variable]",
+            "explanation": None,
         },
         {
             "line": 6,
             "column": 9,
             "severity": "error",
             "message": "expected ';' before '}' token",
+            "explanation": "The compiler expected a semicolon near this location.",
         },
         {
             "line": 6,
             "column": 9,
             "severity": "note",
             "message": "to match this '('",
+            "explanation": None,
         },
         {
             "line": 8,
             "column": 1,
             "severity": "error",
             "message": "unexpected end of file",
+            "explanation": None,
         },
     ]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "use of undeclared identifier 'c'",
+            (
+                "`c` has not been declared or is not visible at this point in "
+                "the program."
+            ),
+        ),
+        (
+            "expected expression",
+            (
+                "The compiler could not understand the syntax at this location. "
+                "Check this line and the code immediately before it."
+            ),
+        ),
+        (
+            "expected '}'",
+            (
+                "A closing `}` is missing somewhere in the surrounding block "
+                "structure."
+            ),
+        ),
+        (
+            "unknown type name 'retum'",
+            "`retum` is not recognized as a type.",
+        ),
+        (
+            "expected ';' after expression",
+            "The compiler expected a semicolon near this location.",
+        ),
+        (
+            "expected ')' after expression",
+            "The compiler expected a closing `)` near this location.",
+        ),
+        (
+            "expected ']'",
+            "The compiler expected a closing `]` near this location.",
+        ),
+        (
+            "invalid operands to binary expression",
+            (
+                "The values or expressions used with this operator are not "
+                "compatible."
+            ),
+        ),
+        (
+            "redefinition of 'value'",
+            (
+                "This name has already been declared or defined in a "
+                "conflicting way."
+            ),
+        ),
+    ],
+)
+def test_supported_diagnostics_receive_conservative_explanations(
+    message: str,
+    expected: str,
+):
+    diagnostics = parse_compiler_diagnostics(
+        f"main.cpp:4:3: error: {message}"
+    )
+    assert diagnostics[0].message == message
+    assert diagnostics[0].explanation == expected
+
+
+def test_expected_expression_explanation_does_not_claim_an_exact_cause():
+    diagnostic = parse_compiler_diagnostics(
+        "main.cpp:7:5: error: expected expression"
+    )[0]
+    assert diagnostic.explanation is not None
+    assert "else" not in diagnostic.explanation.lower()
+    assert "add" not in diagnostic.explanation.lower()
+
+
+def test_matching_open_brace_note_enriches_only_the_related_brace_error():
+    stderr = "\n".join(
+        [
+            "main.cpp:13:1: error: expected '}'",
+            "main.cpp:2:12: note: to match this '{'",
+        ]
+    )
+    diagnostics = parse_compiler_diagnostics(stderr)
+
+    assert diagnostics[0].explanation == (
+        "A closing `}` is missing somewhere in the surrounding block structure. "
+        "The compiler is matching an opening `{` from line 2."
+    )
+    assert diagnostics[1].severity == "note"
+    assert diagnostics[1].explanation is None
+
+
+def test_unrelated_note_does_not_enrich_brace_explanation():
+    stderr = "\n".join(
+        [
+            "main.cpp:13:1: error: expected '}'",
+            "main.cpp:2:12: note: candidate function not viable",
+        ]
+    )
+    diagnostic = parse_compiler_diagnostics(stderr)[0]
+    assert diagnostic.explanation == (
+        "A closing `}` is missing somewhere in the surrounding block structure."
+    )
+
+
+def test_unknown_type_explanation_does_not_infer_return_keyword():
+    diagnostic = parse_compiler_diagnostics(
+        "main.cpp:8:5: error: unknown type name 'retum'"
+    )[0]
+    assert diagnostic.explanation == "`retum` is not recognized as a type."
+    assert "return" not in diagnostic.explanation
+
+
+def test_unsupported_message_has_no_explanation():
+    diagnostic = parse_compiler_diagnostics(
+        "main.cpp:3:1: error: something unusual happened"
+    )[0]
+    assert diagnostic.explanation is None
 
 
 def test_unrecognized_compiler_output_remains_available_as_raw_fallback(
@@ -175,6 +300,30 @@ def test_unrecognized_compiler_output_remains_available_as_raw_fallback(
     assert result.success is False
     assert result.stderr == raw_stderr
     assert result.diagnostics == []
+
+
+def test_explanations_do_not_change_raw_compiler_stderr(monkeypatch):
+    raw_stderr = "\n".join(
+        [
+            "main.cpp:13:1: error: expected '}'",
+            "main.cpp:2:12: note: to match this '{'",
+        ]
+    )
+
+    def diagnostic_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr=raw_stderr,
+        )
+
+    monkeypatch.setattr(compiler_service.subprocess, "run", diagnostic_runner)
+    result = compile_cpp("int main() {")
+
+    assert result.stderr == raw_stderr
+    assert len(result.diagnostics) == 2
+    assert result.diagnostics[1].severity == "note"
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")

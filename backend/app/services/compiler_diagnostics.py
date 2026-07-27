@@ -3,6 +3,7 @@
 import re
 
 from app.schemas.compilation import CompilerDiagnostic
+from app.services.compiler_explanations import add_compiler_explanations
 
 
 _DIAGNOSTIC_PATTERN = re.compile(
@@ -32,4 +33,4 @@ def parse_compiler_diagnostics(stderr: str) -> list[CompilerDiagnostic]:
             )
         )
 
-    return diagnostics
+    return add_compiler_explanations(diagnostics)

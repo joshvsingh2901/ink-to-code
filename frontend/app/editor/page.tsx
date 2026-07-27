@@ -6,8 +6,10 @@ import { useEffect, useRef, useState } from "react";
 import { useUploads } from "@/components/UploadProvider";
 import {
   compileCpp,
+  requestCompilerSuggestions,
   type CompileDiagnostic,
   type CompileResult,
+  type FixSuggestion,
 } from "@/lib/compiler";
 
 type SidebarTab = "compiler" | "tests";
@@ -129,6 +131,8 @@ export default function EditorPage() {
   const [compileResult, setCompileResult] = useState<CompileResult | null>(null);
   const [compileError, setCompileError] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
+  const [suggestions, setSuggestions] = useState<FixSuggestion[]>([]);
+  const [suggestionError, setSuggestionError] = useState<string | null>(null);
   const [hasRunTests, setHasRunTests] = useState(false);
   const [isEdited, setIsEdited] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
@@ -226,10 +230,16 @@ export default function EditorPage() {
     editor.focus();
   }
 
-  async function handleCompile() {
+  function clearSuggestionState() {
+    setSuggestions([]);
+    setSuggestionError(null);
+  }
+
+  async function runCompile(sourceOverride?: string) {
     if (isCompiling) return;
 
     clearCompilerMarkers();
+    clearSuggestionState();
     setActiveTab("compiler");
     setCompileResult(null);
     setCompileError(null);
@@ -237,12 +247,22 @@ export default function EditorPage() {
     const submittedVersion = codeVersionRef.current;
 
     try {
-      const currentCode = editorRef.current?.getValue() ?? code;
+      const currentCode =
+        sourceOverride ?? editorRef.current?.getValue() ?? code;
       const result = await compileCpp(currentCode);
       if (submittedVersion !== codeVersionRef.current) return;
 
       setCompileResult(result);
       applyCompilerMarkers(result.diagnostics);
+      const visibleDiagnostics = result.diagnostics.filter(isPrimaryDiagnostic);
+      if (visibleDiagnostics.length > 0) {
+        setIsCompiling(false);
+        void loadSuggestions(
+          currentCode,
+          visibleDiagnostics,
+          submittedVersion,
+        );
+      }
     } catch (error) {
       if (submittedVersion !== codeVersionRef.current) return;
       setCompileError(
@@ -253,6 +273,87 @@ export default function EditorPage() {
     } finally {
       setIsCompiling(false);
     }
+  }
+
+  function handleCompile() {
+    void runCompile();
+  }
+
+  async function loadSuggestions(
+    source: string,
+    visibleDiagnostics: PrimaryDiagnostic[],
+    requestedVersion: number,
+  ) {
+    setSuggestions([]);
+    setSuggestionError(null);
+
+    try {
+      const result = await requestCompilerSuggestions(
+        source,
+        visibleDiagnostics,
+      );
+      if (requestedVersion !== codeVersionRef.current) return;
+      setSuggestions(result.suggestions);
+    } catch (error) {
+      if (requestedVersion !== codeVersionRef.current) return;
+      setSuggestionError(
+        error instanceof Error
+          ? error.message
+          : "Fix suggestions are unavailable. Compiler issues remain available.",
+      );
+    }
+  }
+
+  async function handleApplySuggestion(suggestion: FixSuggestion) {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || isCompiling) return;
+
+    const validLines =
+      suggestion.start_line <= suggestion.end_line &&
+      suggestion.start_line >= 1 &&
+      suggestion.end_line <= model.getLineCount();
+    const validColumns =
+      validLines &&
+      suggestion.start_column >= 1 &&
+      suggestion.end_column >= 1 &&
+      suggestion.start_column <=
+        model.getLineMaxColumn(suggestion.start_line) &&
+      suggestion.end_column <= model.getLineMaxColumn(suggestion.end_line) &&
+      (suggestion.start_line < suggestion.end_line ||
+        suggestion.start_column <= suggestion.end_column);
+
+    if (!validColumns) {
+      setSuggestions([]);
+      setSuggestionError(
+        "This suggestion is stale. Compile the current code again.",
+      );
+      return;
+    }
+
+    const editRange = {
+      startLineNumber: suggestion.start_line,
+      startColumn: suggestion.start_column,
+      endLineNumber: suggestion.end_line,
+      endColumn: suggestion.end_column,
+    };
+    if (model.getValueInRange(editRange) !== suggestion.original_text) {
+      setSuggestions([]);
+      setSuggestionError(
+        "The code has changed at this location. Compile again before applying a suggestion.",
+      );
+      return;
+    }
+
+    editor.executeEdits("compiler-suggestion", [
+      {
+        range: editRange,
+        text: suggestion.replacement_text,
+        forceMoveMarkers: true,
+      },
+    ]);
+    const updatedCode = editor.getValue();
+    await runCompile(updatedCode);
   }
 
   function handleRunTests() {
@@ -304,6 +405,12 @@ export default function EditorPage() {
 
   const primaryDiagnostics =
     compileResult?.diagnostics.filter(isPrimaryDiagnostic) ?? [];
+  const suggestionsByDiagnosticIndex = new Map(
+    suggestions.map((suggestion) => [
+      suggestion.diagnostic_index,
+      suggestion,
+    ]),
+  );
 
   return (
     <main className="min-h-screen bg-slate-100 p-3 sm:p-5">
@@ -375,6 +482,7 @@ export default function EditorPage() {
                 const nextCode = value ?? "";
                 codeVersionRef.current += 1;
                 clearCompilerMarkers();
+                clearSuggestionState();
                 setCompileResult(null);
                 setCompileError(null);
                 setCode(nextCode);
@@ -458,41 +566,103 @@ export default function EditorPage() {
                     <div role="status">
                       {primaryDiagnostics.length > 0 ? (
                         <>
-                          <div className="flex items-center gap-2">
-                            <h3 className="text-sm font-medium text-slate-800">
-                              Compilation Issues
-                            </h3>
-                            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium tabular-nums text-slate-600">
-                              {primaryDiagnostics.length}
-                            </span>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <h3 className="text-sm font-medium text-slate-800">
+                                Compilation Issues
+                              </h3>
+                              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium tabular-nums text-slate-600">
+                                {primaryDiagnostics.length}
+                              </span>
+                            </div>
                           </div>
                           <ul className="mt-2 divide-y divide-slate-200 border-y border-slate-200">
-                            {primaryDiagnostics.map((diagnostic, index) => (
-                              <li
-                                key={`${diagnostic.line}-${diagnostic.column}-${index}`}
-                                className="py-2 first:pt-0 last:pb-0"
-                              >
-                                <button
-                                  type="button"
-                                  onClick={() => focusDiagnostic(diagnostic)}
-                                  className="w-full cursor-pointer rounded-md border border-rose-100 bg-white px-2 py-2.5 text-left transition-colors hover:border-rose-200 hover:bg-slate-50 focus-visible:relative focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
-                                  aria-label={`Go to ${diagnostic.severity} on line ${diagnostic.line}, column ${diagnostic.column}: ${diagnostic.message}`}
+                            {primaryDiagnostics.map((diagnostic, index) => {
+                              const suggestion =
+                                suggestionsByDiagnosticIndex.get(index);
+
+                              return (
+                                <li
+                                  key={`${diagnostic.line}-${diagnostic.column}-${index}`}
+                                  className="py-2 first:pt-0 last:pb-0"
                                 >
-                                  <span className="flex items-center justify-between gap-3">
-                                    <span className="text-xs font-medium text-slate-700">
-                                      {getIssueCategory(diagnostic)}
-                                    </span>
-                                    <span className="shrink-0 text-xs tabular-nums text-slate-500">
-                                      Line {diagnostic.line}
-                                    </span>
-                                  </span>
-                                  <span className="mt-1.5 block break-words font-mono text-xs leading-5 text-slate-800">
-                                    {diagnostic.message}
-                                  </span>
-                                </button>
-                              </li>
-                            ))}
+                                  <div className="rounded-md border border-rose-100 bg-white">
+                                    <button
+                                      type="button"
+                                      onClick={() => focusDiagnostic(diagnostic)}
+                                      className="w-full cursor-pointer rounded-md px-2 py-2.5 text-left transition-colors hover:bg-slate-50 focus-visible:relative focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                                      aria-label={`Go to ${diagnostic.severity} on line ${diagnostic.line}, column ${diagnostic.column}: ${diagnostic.message}`}
+                                    >
+                                      <span className="flex items-center justify-between gap-3">
+                                        <span className="text-xs font-medium text-slate-700">
+                                          {getIssueCategory(diagnostic)}
+                                        </span>
+                                        <span className="shrink-0 text-xs tabular-nums text-slate-500">
+                                          Line {diagnostic.line}
+                                        </span>
+                                      </span>
+                                      <span className="mt-1.5 block break-words font-mono text-xs leading-5 text-slate-800">
+                                        {diagnostic.message}
+                                      </span>
+                                      {diagnostic.explanation && (
+                                        <span className="mt-2 block text-xs leading-5 text-slate-500">
+                                          <span className="sr-only">
+                                            Explanation:{" "}
+                                          </span>
+                                          {diagnostic.explanation}
+                                        </span>
+                                      )}
+                                    </button>
+                                    {suggestion && (
+                                      <div className="border-t border-rose-100 px-2 py-2.5">
+                                        <p className="text-xs font-medium text-slate-600">
+                                          Suggested correction
+                                        </p>
+                                        <div className="mt-1.5 flex min-w-0 items-center gap-2 overflow-hidden font-mono text-xs text-slate-800">
+                                          <code className="truncate rounded bg-slate-100 px-1.5 py-1">
+                                            {suggestion.original_text}
+                                          </code>
+                                          <span
+                                            aria-hidden="true"
+                                            className="text-slate-400"
+                                          >
+                                            →
+                                          </span>
+                                          <code className="truncate rounded bg-slate-100 px-1.5 py-1">
+                                            {suggestion.replacement_text}
+                                          </code>
+                                        </div>
+                                        <p className="mt-1.5 text-xs leading-5 text-slate-600">
+                                          {suggestion.explanation}
+                                        </p>
+                                        <div className="mt-2">
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              void handleApplySuggestion(
+                                                suggestion,
+                                              )
+                                            }
+                                            className="rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                                          >
+                                            Apply
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </li>
+                              );
+                            })}
                           </ul>
+                          {suggestionError && (
+                            <p
+                              role="status"
+                              className="mt-2 text-xs leading-5 text-slate-600"
+                            >
+                              {suggestionError}
+                            </p>
+                          )}
                         </>
                       ) : (
                         <p className="text-sm font-medium text-slate-700">

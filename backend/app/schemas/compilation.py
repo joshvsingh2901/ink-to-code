@@ -13,6 +13,7 @@ class CompilerDiagnostic(BaseModel):
     column: int = Field(ge=1)
     severity: Literal["error", "warning", "note"]
     message: str
+    explanation: str | None = None
 
 
 class CompileResponse(BaseModel):

@@ -4,33 +4,9 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { useUploads } from "@/components/UploadProvider";
+import { compileCpp, type CompileResult } from "@/lib/compiler";
 
 type SidebarTab = "compiler" | "tests";
-
-type MockCompilerError = {
-  line: number;
-  column: number;
-  title: string;
-  explanation: string;
-  message: string;
-};
-
-const MOCK_COMPILER_ERRORS: MockCompilerError[] = [
-  {
-    line: 6,
-    column: 10,
-    title: "Missing semicolon",
-    explanation: "The declaration needs a semicolon before the next statement.",
-    message: "error: expected ';' after declaration",
-  },
-  {
-    line: 8,
-    column: 5,
-    title: "Undeclared identifier: count",
-    explanation: "The name 'count' is not declared in this scope.",
-    message: "error: use of undeclared identifier 'count'",
-  },
-];
 
 const MOCK_TESTS = [
   { name: "Test 1", result: "Passed" },
@@ -55,13 +31,14 @@ export default function EditorPage() {
   const [code, setCode] = useState(reviewedCode ?? "");
   const [filename, setFilename] = useState("solution.cpp");
   const [activeTab, setActiveTab] = useState<SidebarTab>("compiler");
-  const [hasCompiled, setHasCompiled] = useState(false);
+  const [compileResult, setCompileResult] = useState<CompileResult | null>(null);
+  const [compileError, setCompileError] = useState<string | null>(null);
+  const [isCompiling, setIsCompiling] = useState(false);
   const [hasRunTests, setHasRunTests] = useState(false);
   const [isEdited, setIsEdited] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const initialCodeRef = useRef(reviewedCode ?? "");
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
-  const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -76,45 +53,30 @@ export default function EditorPage() {
     };
   }, []);
 
-  const handleEditorMount: OnMount = (editor, monaco) => {
+  const handleEditorMount: OnMount = (editor) => {
     editorRef.current = editor;
-    monacoRef.current = monaco;
   };
 
-  function applyMockMarkers() {
-    const editor = editorRef.current;
-    const monaco = monacoRef.current;
-    const model = editor?.getModel();
-    if (!model || !monaco) return;
+  async function handleCompile() {
+    if (isCompiling) return;
 
-    monaco.editor.setModelMarkers(model, "inktocode-mock-compiler", []);
-    monaco.editor.setModelMarkers(
-      model,
-      "inktocode-mock-compiler",
-      MOCK_COMPILER_ERRORS.map((error) => ({
-        startLineNumber: error.line,
-        startColumn: error.column,
-        endLineNumber: error.line,
-        endColumn: error.column + 1,
-        severity: monaco.MarkerSeverity.Error,
-        message: error.message,
-      })),
-    );
-  }
-
-  function handleCompile() {
     setActiveTab("compiler");
-    setHasCompiled(true);
-    applyMockMarkers();
-  }
+    setCompileResult(null);
+    setCompileError(null);
+    setIsCompiling(true);
 
-  function focusCompilerError(error: MockCompilerError) {
-    const editor = editorRef.current;
-    if (!editor) return;
-
-    editor.revealLineInCenter(error.line);
-    editor.setPosition({ lineNumber: error.line, column: error.column });
-    editor.focus();
+    try {
+      const currentCode = editorRef.current?.getValue() ?? code;
+      setCompileResult(await compileCpp(currentCode));
+    } catch (error) {
+      setCompileError(
+        error instanceof Error
+          ? error.message
+          : "The compiler backend could not complete the request.",
+      );
+    } finally {
+      setIsCompiling(false);
+    }
   }
 
   function handleRunTests() {
@@ -205,9 +167,10 @@ export default function EditorPage() {
               <button
                 type="button"
                 onClick={handleCompile}
-                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-semibold text-white hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                disabled={isCompiling}
+                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-semibold text-white hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Compile
+                {isCompiling ? "Compiling..." : "Compile"}
               </button>
               <button
                 type="button"
@@ -281,35 +244,44 @@ export default function EditorPage() {
               className="p-4"
             >
               {activeTab === "compiler" &&
-                (hasCompiled ? (
-                  <div>
-                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      Mock compiler result
+                (isCompiling ? (
+                  <p className="text-sm leading-6 text-slate-600" aria-live="polite">
+                    Compiling current editor contents...
+                  </p>
+                ) : compileError ? (
+                  <div role="alert">
+                    <p className="text-sm font-semibold text-red-700">
+                      Compiler backend error
                     </p>
-                    <div className="mt-3 space-y-3">
-                      {MOCK_COMPILER_ERRORS.map((error) => (
-                        <button
-                          key={`${error.line}-${error.title}`}
-                          type="button"
-                          onClick={() => focusCompilerError(error)}
-                          className="w-full rounded-lg border border-slate-200 p-3 text-left hover:border-slate-300 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
-                        >
-                          <span className="text-xs font-semibold text-slate-500">
-                            Line {error.line}
-                          </span>
-                          <span className="mt-1 block text-sm font-semibold text-slate-900">
-                            {error.title}
-                          </span>
-                          <span className="mt-1 block text-sm text-slate-600">
-                            {error.explanation}
-                          </span>
-                          <code className="mt-2 block break-words text-xs text-red-700">
-                            {error.message}
-                          </code>
-                        </button>
-                      ))}
-                    </div>
+                    <p className="mt-2 text-sm leading-6 text-slate-600">
+                      {compileError}
+                    </p>
                   </div>
+                ) : compileResult ? (
+                  compileResult.success ? (
+                    <div role="status">
+                      <p className="text-sm font-semibold text-emerald-700">
+                        Compilation successful.
+                      </p>
+                      <p className="mt-2 text-xs text-slate-500">
+                        Compiler exit code: {compileResult.exit_code}
+                      </p>
+                    </div>
+                  ) : (
+                    <div role="status">
+                      <p className="text-sm font-semibold text-red-700">
+                        Compilation failed.
+                      </p>
+                      <pre className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100">
+                        {compileResult.stderr ||
+                          compileResult.stdout ||
+                          "The compiler returned no diagnostic output."}
+                      </pre>
+                      <p className="mt-2 text-xs text-slate-500">
+                        Compiler exit code: {compileResult.exit_code}
+                      </p>
+                    </div>
+                  )
                 ) : (
                   <p className="text-sm leading-6 text-slate-600">
                     Compile your code to view compiler errors.

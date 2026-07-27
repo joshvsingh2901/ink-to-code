@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import type { UploadState } from "@/components/ImageUploadCard";
+import type { TranscriptionResult } from "@/lib/transcription";
 
 type UploadContextValue = {
   codeUpload: UploadState;
@@ -16,7 +17,9 @@ type UploadContextValue = {
   questionUpload: UploadState;
   setQuestionUpload: (upload: UploadState) => void;
   reviewedCode: string | null;
-  setReviewedCode: (code: string) => void;
+  setReviewedCode: (code: string | null) => void;
+  transcriptionResult: TranscriptionResult | null;
+  setTranscriptionResult: (result: TranscriptionResult | null) => void;
   registerPreviewUrls: (pages: { previewUrl: string }[]) => void;
   revokePreviewUrls: (pages: { previewUrl: string }[]) => void;
 };
@@ -33,6 +36,8 @@ export default function UploadProvider({ children }: { children: ReactNode }) {
     pages: [],
   });
   const [reviewedCode, setReviewedCode] = useState<string | null>(null);
+  const [transcriptionResult, setTranscriptionResult] =
+    useState<TranscriptionResult | null>(null);
   const objectUrlsRef = useRef(new Set<string>());
 
   useEffect(() => {
@@ -64,6 +69,8 @@ export default function UploadProvider({ children }: { children: ReactNode }) {
         setQuestionUpload,
         reviewedCode,
         setReviewedCode,
+        transcriptionResult,
+        setTranscriptionResult,
         registerPreviewUrls,
         revokePreviewUrls,
       }}

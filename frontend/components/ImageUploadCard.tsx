@@ -13,8 +13,9 @@ const MAX_PAGE_COUNT = 5;
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 const MAX_SECTION_SIZE = 50 * 1024 * 1024;
 const MAX_PDF_SIZE = 50 * 1024 * 1024;
-const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg"];
-const ACCEPTED_FILE_TYPES = ".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf";
+const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/jpg"];
+const ACCEPTED_FILE_TYPES =
+  ".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,image/jpg,application/pdf";
 
 export type ImagePage = {
   id: string;

@@ -4,9 +4,28 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { useUploads } from "@/components/UploadProvider";
-import { compileCpp, type CompileResult } from "@/lib/compiler";
+import {
+  compileCpp,
+  type CompileDiagnostic,
+  type CompileResult,
+} from "@/lib/compiler";
 
 type SidebarTab = "compiler" | "tests";
+type PrimaryDiagnostic = CompileDiagnostic & {
+  severity: "error" | "warning";
+};
+type IssueCategory =
+  | "Identifier issue"
+  | "Syntax issue"
+  | "Brace issue"
+  | "Semicolon issue"
+  | "Type issue"
+  | "Declaration issue"
+  | "Operator issue"
+  | "Warning"
+  | "Other issue";
+
+const COMPILER_MARKER_OWNER = "inktocode-compiler";
 
 const MOCK_TESTS = [
   { name: "Test 1", result: "Passed" },
@@ -25,6 +44,82 @@ function sanitizeFilename(filename: string) {
   return `${safeBase || "solution"}.cpp`;
 }
 
+function isPrimaryDiagnostic(
+  diagnostic: CompileDiagnostic,
+): diagnostic is PrimaryDiagnostic {
+  return diagnostic.severity === "error" || diagnostic.severity === "warning";
+}
+
+function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
+  if (diagnostic.severity === "warning") return "Warning";
+
+  const message = diagnostic.message.toLowerCase();
+
+  if (
+    message.includes("expected ';'") ||
+    message.includes("expected ‘;’") ||
+    message.includes("semicolon")
+  ) {
+    return "Semicolon issue";
+  }
+  if (
+    message.includes("expected '}'") ||
+    message.includes("expected ‘}’") ||
+    message.includes("expected '{'") ||
+    message.includes("expected ‘{’") ||
+    message.includes("unmatched brace") ||
+    message.includes("missing brace")
+  ) {
+    return "Brace issue";
+  }
+  if (
+    message.includes("undeclared identifier") ||
+    message.includes("use of undeclared") ||
+    message.includes("was not declared in this scope") ||
+    message.includes("unknown identifier")
+  ) {
+    return "Identifier issue";
+  }
+  if (
+    message.includes("invalid operands") ||
+    message.includes("invalid operand") ||
+    message.includes("no match for 'operator") ||
+    message.includes("no match for ‘operator") ||
+    message.includes("overloaded operator")
+  ) {
+    return "Operator issue";
+  }
+  if (
+    message.includes("unknown type name") ||
+    message.includes("does not name a type") ||
+    message.includes("invalid conversion") ||
+    message.includes("cannot convert") ||
+    message.includes("incompatible type") ||
+    message.includes("incomplete type")
+  ) {
+    return "Type issue";
+  }
+  if (
+    message.includes("redefinition") ||
+    message.includes("redeclaration") ||
+    message.includes("conflicting declaration") ||
+    message.includes("previous declaration")
+  ) {
+    return "Declaration issue";
+  }
+  if (
+    message.includes("syntax error") ||
+    message.includes("parse error") ||
+    message.includes("expected expression") ||
+    message.includes("expected primary-expression") ||
+    message.startsWith("expected ")
+  ) {
+    return "Syntax issue";
+  }
+
+  return "Other issue";
+}
+
 export default function EditorPage() {
   const router = useRouter();
   const { reviewedCode, setReviewedCode } = useUploads();
@@ -39,6 +134,8 @@ export default function EditorPage() {
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const initialCodeRef = useRef(reviewedCode ?? "");
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
+  const codeVersionRef = useRef(0);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -53,22 +150,101 @@ export default function EditorPage() {
     };
   }, []);
 
-  const handleEditorMount: OnMount = (editor) => {
+  const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
+    monacoRef.current = monaco;
   };
+
+  function clearCompilerMarkers() {
+    const model = editorRef.current?.getModel();
+    if (model && monacoRef.current) {
+      monacoRef.current.editor.setModelMarkers(
+        model,
+        COMPILER_MARKER_OWNER,
+        [],
+      );
+    }
+  }
+
+  function getSafeLocation(diagnostic: CompileDiagnostic) {
+    const model = editorRef.current?.getModel();
+    if (!model) return null;
+
+    const line = Math.min(
+      Math.max(Math.trunc(diagnostic.line), 1),
+      model.getLineCount(),
+    );
+    const maxColumn = model.getLineMaxColumn(line);
+    const column = Math.min(
+      Math.max(Math.trunc(diagnostic.column), 1),
+      maxColumn,
+    );
+    return { line, column };
+  }
+
+  function applyCompilerMarkers(diagnostics: CompileDiagnostic[]) {
+    const model = editorRef.current?.getModel();
+    const monaco = monacoRef.current;
+    if (!model || !monaco) return;
+
+    const severityByType = {
+      error: monaco.MarkerSeverity.Error,
+      warning: monaco.MarkerSeverity.Warning,
+    };
+
+    monaco.editor.setModelMarkers(
+      model,
+      COMPILER_MARKER_OWNER,
+      diagnostics.filter(isPrimaryDiagnostic).flatMap((diagnostic) => {
+        const location = getSafeLocation(diagnostic);
+        if (!location) return [];
+
+        return [
+          {
+            startLineNumber: location.line,
+            startColumn: location.column,
+            endLineNumber: location.line,
+            endColumn: location.column,
+            message: diagnostic.message,
+            severity: severityByType[diagnostic.severity],
+          },
+        ];
+      }),
+    );
+  }
+
+  function focusDiagnostic(diagnostic: CompileDiagnostic) {
+    const editor = editorRef.current;
+    const location = getSafeLocation(diagnostic);
+    if (!editor || !location) return;
+
+    editor.setPosition({
+      lineNumber: location.line,
+      column: location.column,
+    });
+    editor.revealLineInCenter(location.line);
+    editor.focus();
+  }
 
   async function handleCompile() {
     if (isCompiling) return;
 
+    clearCompilerMarkers();
     setActiveTab("compiler");
     setCompileResult(null);
     setCompileError(null);
     setIsCompiling(true);
+    const submittedVersion = codeVersionRef.current;
 
     try {
       const currentCode = editorRef.current?.getValue() ?? code;
-      setCompileResult(await compileCpp(currentCode));
+      const result = await compileCpp(currentCode);
+      if (submittedVersion !== codeVersionRef.current) return;
+
+      setCompileResult(result);
+      applyCompilerMarkers(result.diagnostics);
     } catch (error) {
+      if (submittedVersion !== codeVersionRef.current) return;
       setCompileError(
         error instanceof Error
           ? error.message
@@ -125,6 +301,9 @@ export default function EditorPage() {
       </main>
     );
   }
+
+  const primaryDiagnostics =
+    compileResult?.diagnostics.filter(isPrimaryDiagnostic) ?? [];
 
   return (
     <main className="min-h-screen bg-slate-100 p-3 sm:p-5">
@@ -194,6 +373,10 @@ export default function EditorPage() {
               value={code}
               onChange={(value) => {
                 const nextCode = value ?? "";
+                codeVersionRef.current += 1;
+                clearCompilerMarkers();
+                setCompileResult(null);
+                setCompileError(null);
                 setCode(nextCode);
                 setReviewedCode(nextCode);
                 setIsEdited(nextCode !== initialCodeRef.current);
@@ -249,9 +432,9 @@ export default function EditorPage() {
                     Compiling current editor contents...
                   </p>
                 ) : compileError ? (
-                  <div role="alert">
-                    <p className="text-sm font-semibold text-red-700">
-                      Compiler backend error
+                  <div role="alert" className="border-l-2 border-rose-300 pl-3">
+                    <p className="text-sm font-medium text-slate-800">
+                      Compiler unavailable
                     </p>
                     <p className="mt-2 text-sm leading-6 text-slate-600">
                       {compileError}
@@ -260,8 +443,12 @@ export default function EditorPage() {
                 ) : compileResult ? (
                   compileResult.success ? (
                     <div role="status">
-                      <p className="text-sm font-semibold text-emerald-700">
-                        Compilation successful.
+                      <p className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                        <span
+                          aria-hidden="true"
+                          className="h-2 w-2 rounded-full bg-emerald-500"
+                        />
+                        Compilation successful
                       </p>
                       <p className="mt-2 text-xs text-slate-500">
                         Compiler exit code: {compileResult.exit_code}
@@ -269,14 +456,63 @@ export default function EditorPage() {
                     </div>
                   ) : (
                     <div role="status">
-                      <p className="text-sm font-semibold text-red-700">
-                        Compilation failed.
-                      </p>
-                      <pre className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100">
-                        {compileResult.stderr ||
-                          compileResult.stdout ||
-                          "The compiler returned no diagnostic output."}
-                      </pre>
+                      {primaryDiagnostics.length > 0 ? (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <h3 className="text-sm font-medium text-slate-800">
+                              Compilation Issues
+                            </h3>
+                            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium tabular-nums text-slate-600">
+                              {primaryDiagnostics.length}
+                            </span>
+                          </div>
+                          <ul className="mt-2 divide-y divide-slate-200 border-y border-slate-200">
+                            {primaryDiagnostics.map((diagnostic, index) => (
+                              <li
+                                key={`${diagnostic.line}-${diagnostic.column}-${index}`}
+                                className="py-2 first:pt-0 last:pb-0"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => focusDiagnostic(diagnostic)}
+                                  className="w-full cursor-pointer rounded-md border border-rose-100 bg-white px-2 py-2.5 text-left transition-colors hover:border-rose-200 hover:bg-slate-50 focus-visible:relative focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                                  aria-label={`Go to ${diagnostic.severity} on line ${diagnostic.line}, column ${diagnostic.column}: ${diagnostic.message}`}
+                                >
+                                  <span className="flex items-center justify-between gap-3">
+                                    <span className="text-xs font-medium text-slate-700">
+                                      {getIssueCategory(diagnostic)}
+                                    </span>
+                                    <span className="shrink-0 text-xs tabular-nums text-slate-500">
+                                      Line {diagnostic.line}
+                                    </span>
+                                  </span>
+                                  <span className="mt-1.5 block break-words font-mono text-xs leading-5 text-slate-800">
+                                    {diagnostic.message}
+                                  </span>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        </>
+                      ) : (
+                        <p className="text-sm font-medium text-slate-700">
+                          Compiler output needs review
+                        </p>
+                      )}
+                      {(compileResult.stderr || compileResult.stdout) ? (
+                        <details className="mt-3">
+                          <summary className="cursor-pointer text-xs font-semibold text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900">
+                            Show raw compiler output
+                          </summary>
+                          <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100">
+                            {compileResult.stderr || compileResult.stdout}
+                          </pre>
+                        </details>
+                      ) : (
+                        <p className="mt-3 text-sm text-slate-600">
+                          The compiler returned no diagnostic output.
+                        </p>
+                      )}
                       <p className="mt-2 text-xs text-slate-500">
                         Compiler exit code: {compileResult.exit_code}
                       </p>

@@ -1,8 +1,16 @@
+export type CompileDiagnostic = {
+  line: number;
+  column: number;
+  severity: "error" | "warning" | "note";
+  message: string;
+};
+
 export type CompileResult = {
   success: boolean;
   stdout: string;
   stderr: string;
   exit_code: number;
+  diagnostics: CompileDiagnostic[];
 };
 
 type ApiError = { error?: { message?: string } };
@@ -17,11 +25,23 @@ export class CompileRequestError extends Error {
 function isCompileResult(value: unknown): value is CompileResult {
   if (!value || typeof value !== "object") return false;
   const result = value as Partial<CompileResult>;
+  const hasValidDiagnostics =
+    Array.isArray(result.diagnostics) &&
+    result.diagnostics.every(
+      (diagnostic) =>
+        diagnostic !== null &&
+        typeof diagnostic === "object" &&
+        typeof diagnostic.line === "number" &&
+        typeof diagnostic.column === "number" &&
+        ["error", "warning", "note"].includes(diagnostic.severity) &&
+        typeof diagnostic.message === "string",
+    );
   return (
     typeof result.success === "boolean" &&
     typeof result.stdout === "string" &&
     typeof result.stderr === "string" &&
-    typeof result.exit_code === "number"
+    typeof result.exit_code === "number" &&
+    hasValidDiagnostics
   );
 }
 

@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 from app.schemas.compilation import CompileResponse
+from app.services.compiler_diagnostics import parse_compiler_diagnostics
 
 COMPILER_EXECUTABLE = "g++"
 COMPILE_TIMEOUT_SECONDS = 10
@@ -46,11 +47,15 @@ def compile_cpp(
                 shell=False,
             )
 
+            stdout = _limit_output(completed.stdout)
+            stderr = _limit_output(completed.stderr)
+            success = completed.returncode == 0
             return CompileResponse(
-                success=completed.returncode == 0,
-                stdout=_limit_output(completed.stdout),
-                stderr=_limit_output(completed.stderr),
+                success=success,
+                stdout=stdout,
+                stderr=stderr,
                 exit_code=completed.returncode,
+                diagnostics=[] if success else parse_compiler_diagnostics(stderr),
             )
     except FileNotFoundError as error:
         raise CompilerServiceError(

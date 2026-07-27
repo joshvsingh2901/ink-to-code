@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from app.main import app
 from app.services import compiler as compiler_service
 from app.services.compiler import CompilerServiceError, compile_cpp
+from app.services.compiler_diagnostics import parse_compiler_diagnostics
 
 
 async def api_request(payload: dict[str, str]):
@@ -23,6 +24,7 @@ def test_valid_cpp_compiles_successfully():
     result = compile_cpp("int main() { return 0; }")
     assert result.success is True
     assert result.exit_code == 0
+    assert result.diagnostics == []
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
@@ -31,6 +33,8 @@ def test_invalid_cpp_returns_normal_compiler_failure():
     assert result.success is False
     assert result.exit_code != 0
     assert "error:" in result.stderr
+    assert result.diagnostics
+    assert result.diagnostics[0].severity == "error"
 
 
 def test_empty_source_is_rejected_without_compiling(monkeypatch):
@@ -109,6 +113,68 @@ def test_compiler_uses_safe_argument_list_and_exact_source(monkeypatch):
     assert invocation["kwargs"]["shell"] is False
     assert submitted not in invocation["command"]
     assert invocation["source"] == submitted.encode("utf-8")
+    assert result.diagnostics == []
+
+
+def test_compiler_diagnostics_preserve_order_locations_and_messages():
+    stderr = "\n".join(
+        [
+            "main.cpp:3:5: warning: unused variable 'value' [-Wunused-variable]",
+            "main.cpp:6:9: error: expected ';' before '}' token",
+            "main.cpp:6:9: note: to match this '('",
+            "main.cpp:8:1: fatal error: unexpected end of file",
+        ]
+    )
+
+    diagnostics = parse_compiler_diagnostics(stderr)
+
+    assert [diagnostic.model_dump() for diagnostic in diagnostics] == [
+        {
+            "line": 3,
+            "column": 5,
+            "severity": "warning",
+            "message": "unused variable 'value' [-Wunused-variable]",
+        },
+        {
+            "line": 6,
+            "column": 9,
+            "severity": "error",
+            "message": "expected ';' before '}' token",
+        },
+        {
+            "line": 6,
+            "column": 9,
+            "severity": "note",
+            "message": "to match this '('",
+        },
+        {
+            "line": 8,
+            "column": 1,
+            "severity": "error",
+            "message": "unexpected end of file",
+        },
+    ]
+
+
+def test_unrecognized_compiler_output_remains_available_as_raw_fallback(
+    monkeypatch,
+):
+    raw_stderr = "The compiler stopped without a source location."
+
+    def raw_output_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr=raw_stderr,
+        )
+
+    monkeypatch.setattr(compiler_service.subprocess, "run", raw_output_runner)
+    result = compile_cpp("int main() {}")
+
+    assert result.success is False
+    assert result.stderr == raw_stderr
+    assert result.diagnostics == []
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")

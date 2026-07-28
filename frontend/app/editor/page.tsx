@@ -12,6 +12,8 @@ import {
 import {
   analyzeTestMode,
   runCppTests,
+  type FunctionCombinedTestResult,
+  type FunctionDescriptor,
   type FunctionMutationTestResult,
   type FunctionOutputTestResult,
   type FunctionTestResult,
@@ -46,6 +48,7 @@ type EditableTestCase = {
   arguments: string[];
   expected_return: string;
   expected_final_arguments: Record<string, string>;
+  check_stdout: boolean;
 };
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
@@ -61,7 +64,24 @@ const INITIAL_TEST_CASE: EditableTestCase = {
   arguments: [],
   expected_return: "",
   expected_final_arguments: {},
+  check_stdout: false,
 };
+
+function mutableParameters(functionDescriptor: FunctionDescriptor) {
+  return functionDescriptor.parameters.filter(
+    (parameter) =>
+      parameter.type_metadata.passing === "mutable_reference" ||
+      parameter.type_metadata.passing === "scalar_pointer" ||
+      parameter.type_metadata.passing === "array_pointer",
+  );
+}
+
+function defaultOutputCheck(functionDescriptor: FunctionDescriptor | null) {
+  return (
+    functionDescriptor?.return_type_metadata.kind === "void" &&
+    mutableParameters(functionDescriptor).length === 0
+  );
+}
 
 function sanitizeFilename(filename: string) {
   const withoutExtension = filename.replace(/\.cpp$/i, "");
@@ -84,9 +104,10 @@ function isFunctionResult(
     | ProgramTestResult
     | FunctionTestResult
     | FunctionOutputTestResult
-    | FunctionMutationTestResult,
+    | FunctionMutationTestResult
+    | FunctionCombinedTestResult,
 ): result is FunctionTestResult | FunctionOutputTestResult {
-  return "arguments" in result;
+  return "arguments" in result && !("mutation_results" in result);
 }
 
 function isFunctionReturnResult(
@@ -100,9 +121,21 @@ function isFunctionMutationResult(
     | ProgramTestResult
     | FunctionTestResult
     | FunctionOutputTestResult
-    | FunctionMutationTestResult,
+    | FunctionMutationTestResult
+    | FunctionCombinedTestResult,
 ): result is FunctionMutationTestResult {
   return "actual_final_arguments" in result;
+}
+
+function isFunctionCombinedResult(
+  result:
+    | ProgramTestResult
+    | FunctionTestResult
+    | FunctionOutputTestResult
+    | FunctionMutationTestResult
+    | FunctionCombinedTestResult,
+): result is FunctionCombinedTestResult {
+  return "mutation_results" in result;
 }
 
 function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
@@ -290,6 +323,10 @@ export default function EditorPage() {
                   nextId === previousId
                     ? test.expected_final_arguments
                     : {},
+                check_stdout:
+                  nextId === previousId
+                    ? test.check_stdout
+                    : defaultOutputCheck(nextFunction),
               })),
             );
           } else {
@@ -516,11 +553,11 @@ export default function EditorPage() {
 
     try {
       const currentCode = editorRef.current?.getValue() ?? code;
-      const mutableParameter = selectedFunction?.parameters.find(
+      const mutableParameters = selectedFunction?.parameters.filter(
         (parameter) =>
           parameter.type_metadata.passing === "mutable_reference" ||
-          (parameter.type_metadata.passing === "array_pointer" &&
-            selectedFunction.return_type_metadata.kind === "void"),
+          parameter.type_metadata.passing === "scalar_pointer" ||
+          parameter.type_metadata.passing === "array_pointer",
       );
       const request =
         testMode.mode === "function"
@@ -530,47 +567,30 @@ export default function EditorPage() {
               language: "cpp" as const,
               target_function: selectedFunction!.id,
               comparison_mode: comparisonMode,
-              tests:
-                mutableParameter
-                  ? testCases.map(
-                      ({
-                        name,
-                        arguments: argumentValues,
-                        expected_final_arguments,
-                      }) => ({
-                        name,
-                        arguments: argumentValues,
-                        expected_final_arguments: {
-                          [mutableParameter.name]:
-                            expected_final_arguments[
-                              mutableParameter.name
+              tests: testCases.map((test) => ({
+                name: test.name,
+                arguments: test.arguments,
+                check_stdout: test.check_stdout,
+                ...(selectedFunction!.return_type_metadata.kind !== "void"
+                  ? { expected_return: test.expected_return }
+                  : {}),
+                ...(test.check_stdout
+                  ? { expected_stdout: test.expected_stdout }
+                  : {}),
+                ...(mutableParameters?.length
+                  ? {
+                      expected_mutations: mutableParameters.map(
+                        (parameter) => ({
+                          parameter_id: parameter.name,
+                          expected_final_value:
+                            test.expected_final_arguments[
+                              parameter.name
                             ] ?? "",
-                        },
-                      }),
-                    )
-                  : selectedFunction!.return_type_metadata.kind === "void"
-                  ? testCases.map(
-                      ({
-                        name,
-                        arguments: argumentValues,
-                        expected_stdout,
-                      }) => ({
-                        name,
-                        arguments: argumentValues,
-                        expected_stdout,
-                      }),
-                    )
-                  : testCases.map(
-                      ({
-                        name,
-                        arguments: argumentValues,
-                        expected_return,
-                      }) => ({
-                        name,
-                        arguments: argumentValues,
-                        expected_return,
-                      }),
-                    ),
+                        }),
+                      ),
+                    }
+                  : {}),
+              })),
             }
           : {
               mode: "program" as const,
@@ -652,6 +672,7 @@ export default function EditorPage() {
             : [],
         expected_return: "",
         expected_final_arguments: {},
+        check_stdout: defaultOutputCheck(selectedFunction),
       },
     ]);
     setTestRunResult(null);
@@ -677,6 +698,7 @@ export default function EditorPage() {
         expected_return: "",
         expected_stdout: "",
         expected_final_arguments: {},
+        check_stdout: defaultOutputCheck(nextFunction),
       })),
     );
     setTestRunResult(null);
@@ -713,6 +735,16 @@ export default function EditorPage() {
               },
             }
           : test,
+      ),
+    );
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function updateOutputCheck(id: string, checked: boolean) {
+    setTestCases((current) =>
+      current.map((test) =>
+        test.id === id ? { ...test, check_stdout: checked } : test,
       ),
     );
     setTestRunResult(null);
@@ -769,11 +801,11 @@ export default function EditorPage() {
           (candidate) => candidate.id === selectedFunctionId,
         ) ?? null)
       : null;
-  const mutableParameter = selectedFunction?.parameters.find(
+  const mutableParameters = selectedFunction?.parameters.filter(
     (parameter) =>
       parameter.type_metadata.passing === "mutable_reference" ||
-      (parameter.type_metadata.passing === "array_pointer" &&
-        selectedFunction.return_type_metadata.kind === "void"),
+      parameter.type_metadata.passing === "scalar_pointer" ||
+      parameter.type_metadata.passing === "array_pointer",
   );
   const isCleanCompileSuccess =
     compileResult?.success === true &&
@@ -1303,8 +1335,10 @@ export default function EditorPage() {
                                       </span>
                                     </label>
                                     <div className="mt-1 min-w-0">
-                                      {parameter.name ===
-                                        mutableParameter?.name && (
+                                      {mutableParameters?.some(
+                                        (candidate) =>
+                                          candidate.name === parameter.name,
+                                      ) && (
                                         <p className="mb-1 text-[11px] font-medium text-slate-500">
                                           Initial value
                                         </p>
@@ -1356,81 +1390,8 @@ export default function EditorPage() {
                                 </p>
                               )}
                             </div>
-                            {mutableParameter && (
-                              <>
-                                <p className="mt-3 text-xs font-medium text-slate-600">
-                                  Expected mutations
-                                </p>
-                                <div className="mt-1.5 space-y-2">
-                                  {selectedFunction.parameters.map(
-                                    (parameter, parameterIndex) =>
-                                      parameter.name ===
-                                      mutableParameter.name ? (
-                                        <div
-                                          key={`${test.id}-expected-${parameter.name}`}
-                                          className="min-w-0"
-                                        >
-                                          <label
-                                            htmlFor={`${test.id}-expected-final-${parameterIndex}`}
-                                            className="block min-w-0 text-xs font-medium text-slate-600"
-                                          >
-                                            <span className="block">
-                                              {parameter.name}
-                                            </span>
-                                            <span className="mt-0.5 block text-[11px] font-normal text-slate-500">
-                                              Expected final value
-                                            </span>
-                                          </label>
-                                          <input
-                                            id={`${test.id}-expected-final-${parameterIndex}`}
-                                            value={
-                                              test
-                                                .expected_final_arguments[
-                                                parameter.name
-                                              ] ?? ""
-                                            }
-                                            maxLength={1_000}
-                                            onChange={(event) =>
-                                              updateExpectedFinalArgument(
-                                                test.id,
-                                                parameter.name,
-                                                event.target.value,
-                                              )
-                                            }
-                                            className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                          />
-                                        </div>
-                                      ) : null,
-                                  )}
-                                </div>
-                              </>
-                            )}
-                            {mutableParameter ? null :
-                            selectedFunction.return_type_metadata.kind ===
-                            "void" ? (
-                              <>
-                                <label
-                                  htmlFor={`${test.id}-expected-output`}
-                                  className="mt-3 block text-xs font-medium text-slate-600"
-                                >
-                                  Expected output
-                                </label>
-                                <textarea
-                                  id={`${test.id}-expected-output`}
-                                  value={test.expected_stdout}
-                                  maxLength={64 * 1024}
-                                  rows={3}
-                                  onChange={(event) =>
-                                    updateTestCase(
-                                      test.id,
-                                      "expected_stdout",
-                                      event.target.value,
-                                    )
-                                  }
-                                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                />
-                              </>
-                            ) : (
+                            {selectedFunction.return_type_metadata.kind !==
+                              "void" && (
                               <>
                                 <label
                                   htmlFor={`${test.id}-expected-return`}
@@ -1473,6 +1434,96 @@ export default function EditorPage() {
                                       : "Enter values like [1, 2, 3]"}
                                   </p>
                                 )}
+                              </>
+                            )}
+                            <label className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-600">
+                              <input
+                                type="checkbox"
+                                checked={test.check_stdout}
+                                onChange={(event) =>
+                                  updateOutputCheck(
+                                    test.id,
+                                    event.target.checked,
+                                  )
+                                }
+                                className="size-3.5 rounded border-slate-300 text-slate-800 focus:ring-slate-300"
+                              />
+                              Check function output
+                            </label>
+                            {test.check_stdout && (
+                              <>
+                                <label
+                                  htmlFor={`${test.id}-expected-output`}
+                                  className="mt-2 block text-xs font-medium text-slate-600"
+                                >
+                                  Expected output
+                                </label>
+                                <textarea
+                                  id={`${test.id}-expected-output`}
+                                  value={test.expected_stdout}
+                                  maxLength={64 * 1024}
+                                  rows={3}
+                                  onChange={(event) =>
+                                    updateTestCase(
+                                      test.id,
+                                      "expected_stdout",
+                                      event.target.value,
+                                    )
+                                  }
+                                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                />
+                              </>
+                            )}
+                            {mutableParameters &&
+                              mutableParameters.length > 0 && (
+                              <>
+                                <p className="mt-3 text-xs font-medium text-slate-600">
+                                  Expected mutations
+                                </p>
+                                <div className="mt-1.5 space-y-2">
+                                  {mutableParameters.map((parameter) => {
+                                    const parameterIndex =
+                                      selectedFunction.parameters.findIndex(
+                                        (candidate) =>
+                                          candidate.name === parameter.name,
+                                      );
+                                    return (
+                                      <div
+                                        key={`${test.id}-expected-${parameter.name}`}
+                                        className="min-w-0"
+                                      >
+                                        <label
+                                          htmlFor={`${test.id}-expected-final-${parameterIndex}`}
+                                          className="block min-w-0 text-xs font-medium text-slate-600"
+                                        >
+                                          <span className="block">
+                                            {parameter.name}
+                                          </span>
+                                          <span className="mt-0.5 block text-[11px] font-normal text-slate-500">
+                                            Expected final value
+                                          </span>
+                                        </label>
+                                        <input
+                                          id={`${test.id}-expected-final-${parameterIndex}`}
+                                          value={
+                                            test.expected_final_arguments[
+                                              parameter.name
+                                            ] ?? ""
+                                          }
+                                          maxLength={1_000}
+                                          onChange={(event) =>
+                                            updateExpectedFinalArgument(
+                                              test.id,
+                                              parameter.name,
+                                              event.target.value,
+                                            )
+                                          }
+                                          className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                        />
+                                      </div>
+                                    );
+                                  })}
+                                </div>
                               </>
                             )}
                           </>
@@ -1619,6 +1670,126 @@ export default function EditorPage() {
                                 </span>
                               )}
                           </div>
+                          {isFunctionCombinedResult(result) && (
+                            <div className="mt-3 space-y-3">
+                              {result.return_result && (
+                                <div>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-xs font-medium text-slate-500">
+                                      Return value
+                                    </p>
+                                    <span
+                                      className={`text-[11px] font-medium ${
+                                        result.return_result.passed
+                                          ? "text-emerald-700"
+                                          : "text-rose-700"
+                                      }`}
+                                    >
+                                      {result.return_result.passed
+                                        ? "PASS"
+                                        : "FAIL"}
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                    <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                                      Expected:{" "}
+                                      {result.return_result.expected ||
+                                        "(empty)"}
+                                    </pre>
+                                    <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                                      Actual:{" "}
+                                      {result.return_result.actual || "(empty)"}
+                                    </pre>
+                                  </div>
+                                  {result.stdout_result?.match_type ===
+                                    "whitespace_normalized" && (
+                                    <p className="mt-1 text-[11px] text-slate-500">
+                                      Formatting differences ignored
+                                    </p>
+                                  )}
+                                  {result.stdout_result?.match_type ===
+                                    "formatting_mismatch" && (
+                                    <p className="mt-1 text-[11px] text-slate-600">
+                                      Output values match, but formatting
+                                      differs.
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                              {result.stdout_result && (
+                                <div>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-xs font-medium text-slate-500">
+                                      Function output
+                                    </p>
+                                    <span
+                                      className={`text-[11px] font-medium ${
+                                        result.stdout_result.passed
+                                          ? "text-emerald-700"
+                                          : "text-rose-700"
+                                      }`}
+                                    >
+                                      {result.stdout_result.passed
+                                        ? "PASS"
+                                        : "FAIL"}
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                    <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                                      Expected:{" "}
+                                      {result.stdout_result.expected ||
+                                        "(empty)"}
+                                    </pre>
+                                    <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                                      Actual:{" "}
+                                      {result.stdout_result.actual || "(empty)"}
+                                    </pre>
+                                  </div>
+                                </div>
+                              )}
+                              {result.mutation_results.length > 0 && (
+                                <div>
+                                  <p className="text-xs font-medium text-slate-500">
+                                    Mutations
+                                  </p>
+                                  <div className="mt-1 space-y-2">
+                                    {result.mutation_results.map(
+                                      (mutation) => (
+                                        <dl
+                                          key={mutation.parameter}
+                                          className="font-mono text-xs text-slate-700"
+                                        >
+                                          <dt className="font-semibold">
+                                            {mutation.parameter}
+                                            <span
+                                              className={`ml-2 text-[11px] font-sans font-medium ${
+                                                mutation.passed
+                                                  ? "text-emerald-700"
+                                                  : "text-rose-700"
+                                              }`}
+                                            >
+                                              {mutation.passed
+                                                ? "PASS"
+                                                : "FAIL"}
+                                            </span>
+                                          </dt>
+                                          <dd>Initial: {mutation.initial}</dd>
+                                          <dd>
+                                            Expected final:{" "}
+                                            {mutation.expected_final}
+                                          </dd>
+                                          <dd>
+                                            Actual final:{" "}
+                                            {mutation.actual_final}
+                                          </dd>
+                                        </dl>
+                                      ),
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
                           {isFunctionMutationResult(result) && (
                             <div className="mt-3 space-y-2">
                               {Object.entries(
@@ -1731,6 +1902,7 @@ export default function EditorPage() {
                             !result.output_limited &&
                             !result.passed &&
                             !isFunctionMutationResult(result) &&
+                            !isFunctionCombinedResult(result) &&
                             !isFunctionResult(result) && (
                             <div className="mt-3 grid gap-3">
                               <div>

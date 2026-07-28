@@ -16,6 +16,7 @@ class ValueType:
         "value",
         "const_reference",
         "mutable_reference",
+        "scalar_pointer",
         "array_pointer",
     ] = "value"
     size_parameter_name: str | None = None
@@ -28,6 +29,8 @@ class ValueType:
             return f"{self.element_type}[]"
         if self.kind == "scalar":
             base = self.scalar_type or self.display_type
+            if self.passing == "scalar_pointer":
+                return f"{base}*"
             if self.passing == "mutable_reference":
                 return f"{base}&"
             return (
@@ -114,6 +117,11 @@ _SCALAR_REFERENCE_TYPE = re.compile(
     r"(?P<prefix_const>const\s+)?"
     r"(?P<base>long\s+long|long|int|double|bool)\s*"
     r"(?P<suffix_const>const\s*)?(?P<modifier>&&?)"
+)
+_SCALAR_POINTER_TYPE = re.compile(
+    r"(?P<prefix_const>const\s+)?"
+    r"(?P<base>long\s+long|long|int|double|bool)\s*"
+    r"(?P<suffix_const>const\s*)?(?P<modifier>\*+)"
 )
 _ARRAY_PARAMETER = re.compile(
     r"(?P<element>long\s+long|long|int|double|bool|char)\s*"
@@ -223,6 +231,27 @@ def _parse_value_type(
         )
     if "*&" in normalized or "* &" in normalized:
         return None, "References to pointers are unsupported."
+    scalar_pointer = _SCALAR_POINTER_TYPE.fullmatch(normalized)
+    if scalar_pointer is not None:
+        if not allow_reference:
+            return None, "Pointer return values are unsupported."
+        if scalar_pointer.group("modifier") != "*":
+            return None, "Pointer-to-pointer parameters are unsupported."
+        if (
+            scalar_pointer.group("prefix_const")
+            or scalar_pointer.group("suffix_const")
+        ):
+            return None, "Const scalar pointer parameters are unsupported."
+        scalar_type = " ".join(scalar_pointer.group("base").split())
+        return (
+            ValueType(
+                kind="scalar",
+                display_type=f"{scalar_type}*",
+                scalar_type=scalar_type,
+                passing="scalar_pointer",
+            ),
+            None,
+        )
     scalar_reference = _SCALAR_REFERENCE_TYPE.fullmatch(normalized)
     if scalar_reference is not None:
         if not allow_reference:
@@ -276,7 +305,19 @@ def _parse_value_type(
             or string_match.group("suffix_const")
         )
         if modifier == "*":
-            return None, "String pointer parameters and returns are unsupported."
+            if not allow_reference:
+                return None, "Pointer return values are unsupported."
+            if is_const:
+                return None, "Const scalar pointer parameters are unsupported."
+            return (
+                ValueType(
+                    kind="scalar",
+                    display_type=f"{STRING_TYPE}*",
+                    scalar_type=STRING_TYPE,
+                    passing="scalar_pointer",
+                ),
+                None,
+            )
         if modifier == "&":
             if not allow_reference:
                 return None, "String return values must be returned by value."
@@ -408,18 +449,29 @@ def _parse_parameters(
                 return None, "Pointer-to-pointer parameters are unsupported."
             if brackets and brackets.count("[") != 1:
                 return None, "Multidimensional arrays are unsupported."
-            parsed.append(
-                FunctionParameter(
-                    name=(
-                        array_match.group("pointer_name")
-                        or array_match.group("array_name")
-                    ),
-                    value_type=ValueType(
+            parameter_name = (
+                array_match.group("pointer_name")
+                or array_match.group("array_name")
+            )
+            value_type = (
+                ValueType(
+                    kind="scalar",
+                    display_type=f"{element_type}*",
+                    scalar_type=element_type,
+                    passing="scalar_pointer",
+                )
+                if pointers
+                else ValueType(
                         kind="array",
                         display_type=f"{element_type}[]",
                         element_type=element_type,
                         passing="array_pointer",
-                    ),
+                )
+            )
+            parsed.append(
+                FunctionParameter(
+                    name=parameter_name,
+                    value_type=value_type,
                 )
             )
             continue
@@ -443,30 +495,37 @@ def _parse_parameters(
             )
         )
 
-    mutable_parameters = [
-        parameter
-        for parameter in parsed
-        if parameter.value_type.passing == "mutable_reference"
-    ]
-    if len(mutable_parameters) > 1:
-        return (
-            None,
-            "Functions with multiple mutable reference parameters are "
-            "unsupported.",
-        )
-
     linked = list(parsed)
     for index, parameter in enumerate(parsed):
-        if parameter.value_type.kind != "array":
+        is_array_declaration = parameter.value_type.kind == "array"
+        is_numeric_pointer = (
+            parameter.value_type.passing == "scalar_pointer"
+            and parameter.value_type.scalar_type in SUPPORTED_SCALAR_TYPES
+        )
+        if not is_array_declaration and not is_numeric_pointer:
             continue
+        next_array_index = next(
+            (
+                candidate_index
+                for candidate_index in range(index + 1, len(parsed))
+                if (
+                    parsed[candidate_index].value_type.kind == "array"
+                    or parsed[candidate_index].value_type.passing
+                    == "scalar_pointer"
+                )
+            ),
+            len(parsed),
+        )
         candidates = [
             candidate
-            for candidate in parsed[index + 1 :]
+            for candidate in parsed[index + 1 : next_array_index]
             if candidate.name.lower() in _SIZE_PARAMETER_NAMES
             and candidate.value_type.kind == "scalar"
             and candidate.value_type.scalar_type in _INTEGRAL_TYPES
         ]
         if not candidates:
+            if is_numeric_pointer:
+                continue
             return (
                 None,
                 f"Array parameter {parameter.name} requires a later integral "
@@ -478,14 +537,52 @@ def _parse_parameters(
                 f"Array parameter {parameter.name} has an ambiguous size "
                 "parameter.",
             )
+        size_parameter = candidates[0]
         linked[index] = replace(
             parameter,
-            value_type=replace(
-                parameter.value_type,
-                size_parameter_name=candidates[0].name,
+            value_type=ValueType(
+                kind="array",
+                display_type=f"{parameter.value_type.scalar_type}[]"
+                if is_numeric_pointer
+                else parameter.value_type.display_type,
+                element_type=(
+                    parameter.value_type.scalar_type
+                    if is_numeric_pointer
+                    else parameter.value_type.element_type
+                ),
+                passing="array_pointer",
+                size_parameter_name=size_parameter.name,
             ),
         )
     return tuple(linked), None
+
+
+def _scalar_pointer_uses_unsupported_arithmetic(
+    candidate: re.Match[str],
+    masked_source: str,
+    parameter_name: str,
+) -> bool:
+    body_start = candidate.end()
+    depth = 1
+    body_end = body_start
+    while body_end < len(masked_source) and depth:
+        if masked_source[body_end] == "{":
+            depth += 1
+        elif masked_source[body_end] == "}":
+            depth -= 1
+        body_end += 1
+    body = masked_source[body_start:body_end]
+    name = re.escape(parameter_name)
+    direct_name = rf"(?<![\w*]){name}\b"
+    return any(
+        re.search(pattern, body)
+        for pattern in (
+            rf"{direct_name}\s*\[",
+            rf"{direct_name}\s*(?:\+\+|--|\+=|-=)",
+            rf"(?:\+\+|--)\s*{direct_name}",
+            rf"{direct_name}\s*[+-]\s*(?=\w|\d|\()",
+        )
+    )
 
 
 def _parse_candidate(
@@ -519,18 +616,20 @@ def _parse_candidate(
     )
     if parameters is None:
         return None, error
-    if (
-        return_value_type.kind != "void"
-        and any(
-            parameter.value_type.passing == "mutable_reference"
-            for parameter in parameters
-        )
-    ):
-        return (
-            None,
-            "Non-void functions with mutable reference parameters are "
-            "unsupported.",
-        )
+    for parameter in parameters:
+        if (
+            parameter.value_type.passing == "scalar_pointer"
+            and _scalar_pointer_uses_unsupported_arithmetic(
+                candidate,
+                masked_source,
+                parameter.name,
+            )
+        ):
+            return (
+                None,
+                f"Scalar pointer arithmetic is unsupported for "
+                f"{parameter.name}.",
+            )
     return (
         FunctionSignature(
             name=candidate.group("name"),

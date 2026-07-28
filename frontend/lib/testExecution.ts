@@ -13,6 +13,7 @@ export type FunctionTypeMetadata = {
     | "value"
     | "const_reference"
     | "mutable_reference"
+    | "scalar_pointer"
     | "array_pointer";
   size_parameter_name: string | null;
 };
@@ -53,7 +54,19 @@ export type FunctionOutputTestInput = {
 export type FunctionMutationTestInput = {
   name: string;
   arguments: string[];
-  expected_final_arguments: Record<string, string>;
+  expected_mutations: Array<{
+    parameter_id: string;
+    expected_final_value: string;
+  }>;
+};
+
+export type FunctionCombinedTestInput = {
+  name: string;
+  arguments: string[];
+  expected_return?: string;
+  check_stdout: boolean;
+  expected_stdout?: string;
+  expected_mutations?: FunctionMutationTestInput["expected_mutations"];
 };
 
 type ResultBase = {
@@ -93,6 +106,26 @@ export type FunctionMutationTestResult = ResultBase & {
   actual_final_arguments: Record<string, string>;
 };
 
+export type FunctionChannelResult = {
+  expected: string;
+  actual: string;
+  passed: boolean;
+  match_type: ResultBase["match_type"];
+};
+
+export type FunctionCombinedTestResult = ResultBase & {
+  arguments: string[];
+  return_result: FunctionChannelResult | null;
+  stdout_result: FunctionChannelResult | null;
+  mutation_results: Array<{
+    parameter: string;
+    initial: string;
+    expected_final: string;
+    actual_final: string;
+    passed: boolean;
+  }>;
+};
+
 export type RunTestsResult = {
   mode: "program" | "function" | "unsupported";
   success: boolean;
@@ -103,6 +136,7 @@ export type RunTestsResult = {
   tests: Array<
     ProgramTestResult | FunctionTestResult | FunctionOutputTestResult
     | FunctionMutationTestResult
+    | FunctionCombinedTestResult
   >;
 };
 
@@ -120,11 +154,7 @@ export type RunTestsRequest =
       language: "cpp";
       target_function: string;
       comparison_mode: "whitespace_tolerant" | "exact";
-      tests: Array<
-        FunctionTestInput
-        | FunctionOutputTestInput
-        | FunctionMutationTestInput
-      >;
+      tests: FunctionCombinedTestInput[];
     };
 
 type ApiError = { error?: { message?: string } };
@@ -173,6 +203,7 @@ function isFunctionTypeMetadata(
       "value",
       "const_reference",
       "mutable_reference",
+      "scalar_pointer",
       "array_pointer",
     ].includes(
       metadata.passing ?? "",
@@ -211,7 +242,8 @@ function isTestResult(
   | ProgramTestResult
   | FunctionTestResult
   | FunctionOutputTestResult
-  | FunctionMutationTestResult {
+  | FunctionMutationTestResult
+  | FunctionCombinedTestResult {
   if (!isResultBase(value)) return false;
   const result = value as Partial<ProgramTestResult & FunctionTestResult>;
   const programResult =
@@ -232,11 +264,43 @@ function isTestResult(
     isStringRecord(mutation.initial_arguments) &&
     isStringRecord(mutation.expected_final_arguments) &&
     isStringRecord(mutation.actual_final_arguments);
+  const combined = value as Partial<FunctionCombinedTestResult>;
+  const combinedResult =
+    Array.isArray(combined.arguments) &&
+    (combined.return_result === null ||
+      isFunctionChannelResult(combined.return_result)) &&
+    (combined.stdout_result === null ||
+      isFunctionChannelResult(combined.stdout_result)) &&
+    Array.isArray(combined.mutation_results) &&
+    combined.mutation_results.every(
+      (item) =>
+        item !== null &&
+        typeof item === "object" &&
+        typeof item.parameter === "string" &&
+        typeof item.initial === "string" &&
+        typeof item.expected_final === "string" &&
+        typeof item.actual_final === "string" &&
+        typeof item.passed === "boolean",
+    );
   return (
     programResult ||
     functionResult ||
     functionOutputResult ||
-    mutationResult
+    mutationResult ||
+    combinedResult
+  );
+}
+
+function isFunctionChannelResult(
+  value: unknown,
+): value is FunctionChannelResult {
+  if (!value || typeof value !== "object") return false;
+  const channel = value as Partial<FunctionChannelResult>;
+  return (
+    typeof channel.expected === "string" &&
+    typeof channel.actual === "string" &&
+    typeof channel.passed === "boolean" &&
+    isMatchType(channel.match_type)
   );
 }
 

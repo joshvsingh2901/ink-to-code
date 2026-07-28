@@ -407,8 +407,7 @@ The expected request should contain the current source code in structured JSON, 
 - The generated harness must inspect mutable arguments after the function call.
 - The user’s Monaco source must never be modified.
 - Const references remain read-only inputs.
-- Pointer mutation, multiple mutable outputs, and returned references are not
-  part of this stage.
+- Pointer mutation and returned references are not part of this stage.
 
 ## Vector and array mutation testing
 
@@ -418,4 +417,39 @@ The expected request should contain the current source code in structured JSON, 
 - Tests provide initial values and expected final values.
 - The generated harness must serialize mutated arguments after the function call.
 - The Monaco source must never be modified.
-- Pointer ownership, returned pointers, multidimensional arrays, and multiple mutable outputs remain unsupported.
+- Pointer ownership, returned pointers, and multidimensional arrays remain
+  unsupported.
+
+## Multiple mutable output testing
+
+- Function-mode tests may support multiple mutable arguments.
+- Each mutable argument must have an initial value and expected final value.
+- Supported mutable arguments may include existing scalar references, vector references, and mutable C-style arrays.
+- All function inputs must appear first in parameter order.
+- Expected mutations must appear afterward in a separate section.
+- The generated harness must capture every mutable argument after the function call.
+- A test passes only when every expected mutation matches.
+- Combined return values, stdout, and multiple mutations must not be silently ignored.
+- The Monaco source must never be modified.
+
+## Combined result-channel testing
+
+- Function-mode tests may validate more than one result channel from the same call.
+- Supported result channels are return value, captured stdout, and mutated arguments.
+- A test passes only when every active expected result channel matches.
+- The generated harness must capture all active result channels deterministically.
+- No return value, stdout, or mutation may be silently ignored.
+- Test inputs appear first, followed by expected return/output and expected mutations in separate sections.
+- Existing timeout, output-limit, cleanup, and source-preservation rules remain unchanged.
+
+## Scalar pointer testing
+
+- Function-mode tests may treat supported scalar pointer parameters as one mutable scalar value rather than as arrays.
+- Scalar-pointer mode must only be used when the pointer is not paired with an array-size parameter.
+- Numeric pointer spelling paired with exactly one recognized later integral size parameter remains array-backed; bracket spelling is always array-backed.
+- A supported one-level pointer without such a size pairing is scalar-pointer mode.
+- Supported scalar pointee types match the existing scalar reference types.
+- Each mutable scalar pointer has an initial value and expected final value.
+- The harness must allocate safe local storage and pass its address to the function.
+- Null-pointer testing, pointer ownership, returned pointers, pointer arithmetic, and pointer-to-pointer parameters remain unsupported.
+- Ambiguous pointers must be rejected rather than guessed.

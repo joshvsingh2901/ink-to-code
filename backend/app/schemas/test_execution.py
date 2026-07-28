@@ -12,6 +12,7 @@ class FunctionTypeResponse(BaseModel):
         "value",
         "const_reference",
         "mutable_reference",
+        "scalar_pointer",
         "array_pointer",
     ]
     size_parameter_name: str | None = None
@@ -49,30 +50,54 @@ class ProgramTestCase(BaseModel):
     expected_stdout: str = Field(max_length=64 * 1024)
 
 
+class FunctionMutationExpectation(BaseModel):
+    parameter_id: str = Field(min_length=1, max_length=100)
+    expected_final_value: str = Field(max_length=1_000)
+
+
 class FunctionTestCase(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     arguments: list[str] = Field(max_length=20)
     expected_return: str | None = Field(default=None, max_length=1_000)
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
+    check_stdout: bool | None = None
     expected_final_arguments: dict[str, str] | None = Field(
         default=None,
         max_length=1,
     )
+    expected_mutations: list[FunctionMutationExpectation] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=20,
+    )
 
     @model_validator(mode="after")
     def validate_expected_value(self) -> "FunctionTestCase":
-        supplied = sum(
-            value is not None
-            for value in (
-                self.expected_return,
-                self.expected_stdout,
-                self.expected_final_arguments,
-            )
+        mutation_supplied = (
+            self.expected_final_arguments is not None
+            or self.expected_mutations is not None
         )
-        if supplied != 1:
-            raise ValueError(
-                "Provide exactly one expected result channel."
+        if not any(
+            (
+                self.expected_return is not None,
+                self.expected_stdout is not None,
+                mutation_supplied,
             )
+        ):
+            raise ValueError("Provide at least one expected result channel.")
+        if self.check_stdout is False and self.expected_stdout is not None:
+            raise ValueError(
+                "Expected stdout requires function-output checking."
+            )
+        if self.check_stdout is True and self.expected_stdout is None:
+            raise ValueError(
+                "Function-output checking requires expected stdout."
+            )
+        if (
+            self.expected_final_arguments is not None
+            and self.expected_mutations is not None
+        ):
+            raise ValueError("Provide only one mutation expectation format.")
         if self.expected_final_arguments is not None and any(
             not name or len(name) > 100 or len(value) > 1_000
             for name, value in self.expected_final_arguments.items()
@@ -169,6 +194,42 @@ class FunctionMutationTestResult(BaseModel):
     match_type: Literal["exact", "mismatch"]
 
 
+class FunctionChannelResult(BaseModel):
+    expected: str
+    actual: str
+    passed: bool
+    match_type: Literal[
+        "exact",
+        "whitespace_normalized",
+        "formatting_mismatch",
+        "mismatch",
+    ]
+
+
+class FunctionMutationChannelResult(BaseModel):
+    parameter: str
+    initial: str
+    expected_final: str
+    actual_final: str
+    passed: bool
+
+
+class FunctionCombinedTestResult(BaseModel):
+    name: str
+    passed: bool
+    arguments: list[str]
+    return_result: FunctionChannelResult | None = None
+    stdout_result: FunctionChannelResult | None = None
+    mutation_results: list[FunctionMutationChannelResult] = Field(
+        default_factory=list
+    )
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    output_limited: bool
+    match_type: Literal["exact", "mismatch"]
+
+
 class RunTestsResponse(BaseModel):
     mode: Literal["program", "function", "unsupported"]
     success: bool
@@ -180,5 +241,6 @@ class RunTestsResponse(BaseModel):
         FunctionTestResult
         | FunctionOutputTestResult
         | FunctionMutationTestResult
+        | FunctionCombinedTestResult
         | ProgramTestResult
     ]

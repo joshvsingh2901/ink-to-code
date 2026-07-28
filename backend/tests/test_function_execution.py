@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.main import app
 from app.schemas.test_execution import (
+    FunctionMutationExpectation,
     FunctionRunTestsRequest,
     FunctionTestCase,
     ProgramRunTestsRequest,
@@ -65,6 +66,76 @@ def mutation_request(
     )
 
 
+def multiple_mutation_request(
+    code: str,
+    *,
+    arguments: list[str],
+    expected_mutations: list[tuple[str, str]],
+) -> FunctionRunTestsRequest:
+    analysis = analyze_test_mode(code)
+    assert len(analysis.functions) == 1
+    return FunctionRunTestsRequest(
+        mode="function",
+        code=code,
+        language="cpp",
+        target_function=analysis.functions[0].id,
+        tests=[
+            FunctionTestCase(
+                name="Test 1",
+                arguments=arguments,
+                expected_mutations=[
+                    FunctionMutationExpectation(
+                        parameter_id=parameter_id,
+                        expected_final_value=expected_value,
+                    )
+                    for parameter_id, expected_value in expected_mutations
+                ],
+            )
+        ],
+    )
+
+
+def combined_request(
+    code: str,
+    *,
+    arguments: list[str],
+    expected_return: str | None = None,
+    expected_stdout: str | None = None,
+    check_stdout: bool = False,
+    expected_mutations: list[tuple[str, str]] | None = None,
+    comparison_mode: str = "whitespace_tolerant",
+) -> FunctionRunTestsRequest:
+    analysis = analyze_test_mode(code)
+    assert len(analysis.functions) == 1
+    return FunctionRunTestsRequest(
+        mode="function",
+        code=code,
+        language="cpp",
+        target_function=analysis.functions[0].id,
+        comparison_mode=comparison_mode,
+        tests=[
+            FunctionTestCase(
+                name="Combined test",
+                arguments=arguments,
+                expected_return=expected_return,
+                expected_stdout=expected_stdout,
+                check_stdout=check_stdout,
+                expected_mutations=(
+                    [
+                        FunctionMutationExpectation(
+                            parameter_id=name,
+                            expected_final_value=value,
+                        )
+                        for name, value in expected_mutations
+                    ]
+                    if expected_mutations is not None
+                    else None
+                ),
+            )
+        ],
+    )
+
+
 async def api_request(path: str, payload: object):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -112,6 +183,7 @@ def test_unsupported_functions_are_excluded_when_supported_targets_exist():
 
     assert analysis.mode == "function"
     assert [function.id for function in analysis.functions] == [
+        "pointerValue(int*)->int",
         "identity(int)->int"
     ]
 
@@ -310,30 +382,6 @@ def test_invalid_argument_values_are_rejected(
     assert result.input_error
     assert expected_message in result.input_error
     assert result.tests == []
-
-
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        (
-            "int first(int *arr) { return arr[0]; }",
-            "requires a later integral size parameter",
-        ),
-        (
-            "int identity(int &value) { return value; }",
-            "Non-void functions with mutable reference",
-        ),
-    ],
-)
-def test_unsupported_or_ambiguous_signatures_are_rejected(
-    source: str,
-    expected: str,
-):
-    analysis = analyze_test_mode(source)
-
-    assert analysis.mode == "unsupported"
-    assert analysis.message
-    assert expected in analysis.message
 
 
 def test_source_with_main_remains_program_mode():
@@ -706,10 +754,6 @@ def test_invalid_expected_vector_is_rejected_before_compilation(monkeypatch):
             "Unsupported vector",
         ),
         (
-            "int size(std::vector<int>& values) { return 0; }",
-            "Non-void functions with mutable reference",
-        ),
-        (
             "int size(std::vector<int>* values) { return 0; }",
             "Vector pointer",
         ),
@@ -1027,24 +1071,16 @@ std::string welcome(std::string name) { return shout(greet(name)); }
     ("source", "message"),
     [
         (
-            "int size(std::string& value) { return value.size(); }",
-            "Non-void functions with mutable reference",
-        ),
-        (
-            "int size(std::string* value) { return value->size(); }",
-            "String pointer",
-        ),
-            (
-                "int size(char* value) { return 0; }",
-                "Character arrays and pointers",
+            "int size(char* value) { return 0; }",
+            "Character arrays and pointers",
         ),
         (
             "int size(const char* value) { return 0; }",
             "Unsupported type",
         ),
-            (
-                "int size(char value[]) { return 0; }",
-                "Character arrays and pointers",
+        (
+            "int size(char value[]) { return 0; }",
+            "Character arrays and pointers",
         ),
     ],
 )
@@ -1631,10 +1667,6 @@ int average(int values[], int size)
             "ambiguous size parameter",
         ),
         (
-            "int f(int* values, int x, int y) { return 0; }",
-            "requires a later integral size parameter",
-        ),
-        (
             "int f(int** values, int size) { return 0; }",
             "Pointer-to-pointer",
         ),
@@ -1963,10 +1995,6 @@ def test_mutable_reference_with_scalar_and_helper_executes():
     ("source", "message"),
     [
         (
-            "void swapValues(int& left, int& right) {}",
-            "multiple mutable reference",
-        ),
-        (
             "void change(int*& value) {}",
             "References to pointers",
         ),
@@ -1981,10 +2009,6 @@ def test_mutable_reference_with_scalar_and_helper_executes():
         (
             "int& value(int input) { static int result; return result; }",
             "reference return",
-        ),
-        (
-            "int change(int& value) { return ++value; }",
-            "Non-void functions with mutable reference",
         ),
     ],
 )
@@ -2033,7 +2057,7 @@ def test_invalid_reference_values_are_rejected_before_compilation(
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
-def test_mutable_reference_stdout_is_not_silently_ignored():
+def test_mutable_reference_stdout_is_ignored_when_output_check_is_disabled():
     result = run_test_request(
         mutation_request(
             "#include <iostream>\n"
@@ -2043,8 +2067,7 @@ def test_mutable_reference_stdout_is_not_silently_ignored():
         )
     )
 
-    assert result.success is False
-    assert "do not support function stdout" in result.tests[0].stderr
+    assert result.success is True
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
@@ -2269,13 +2292,697 @@ def test_malformed_expected_collection_mutation_is_rejected_before_compile(
     assert invoked is False
 
 
-def test_multiple_collection_mutation_outputs_are_rejected():
-    analysis = analyze_test_mode(
-        "#include <vector>\n"
-        "void change(std::vector<int>& left, "
-        "std::vector<int>& right) {}"
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_two_scalar_mutations_are_captured_and_compared():
+    result = run_test_request(
+        multiple_mutation_request(
+            "void swapValues(int& left, int& right) "
+            "{ int temporary = left; left = right; right = temporary; }",
+            arguments=["4", "9"],
+            expected_mutations=[("left", "9"), ("right", "4")],
+        )
     )
 
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "left": "9",
+        "right": "4",
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_three_scalar_mutations_with_ordinary_inputs_execute():
+    result = run_test_request(
+        multiple_mutation_request(
+            "void divideValues(int value, int divisor, int& quotient, "
+            "int& remainder, bool& exact) "
+            "{ quotient = value / divisor; remainder = value % divisor; "
+            "exact = remainder == 0; }",
+            arguments=["17", "5", "0", "0", "true"],
+            expected_mutations=[
+                ("quotient", "3"),
+                ("remainder", "2"),
+                ("exact", "false"),
+            ],
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_scalar_and_string_mutations_execute_together():
+    result = run_test_request(
+        multiple_mutation_request(
+            "#include <string>\n"
+            "void updateUser(int& score, std::string& label) "
+            '{ score += 5; label += "-updated"; }',
+            arguments=["10", "user"],
+            expected_mutations=[
+                ("score", "15"),
+                ("label", "user-updated"),
+            ],
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_two_vector_mutations_execute_together():
+    result = run_test_request(
+        multiple_mutation_request(
+            "#include <vector>\n"
+            "void swapVectors(std::vector<int>& first, "
+            "std::vector<int>& second) { first.swap(second); }",
+            arguments=["[1, 2]", "[3, 4]"],
+            expected_mutations=[
+                ("first", "[3, 4]"),
+                ("second", "[1, 2]"),
+            ],
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_scalar_and_vector_mutations_execute_together():
+    result = run_test_request(
+        multiple_mutation_request(
+            "#include <vector>\n"
+            "void update(int& count, std::vector<int>& values) "
+            "{ ++count; for (int& value : values) ++value; }",
+            arguments=["2", "[1, 2]"],
+            expected_mutations=[
+                ("count", "3"),
+                ("values", "[2, 3]"),
+            ],
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_two_arrays_use_their_unambiguous_adjacent_sizes():
+    source = (
+        "void swapFirst(int first[], int size, int second[], int count) "
+        "{ int temporary = first[0]; first[0] = second[0]; "
+        "second[0] = temporary; }"
+    )
+    analysis = analyze_test_mode(source)
+    assert analysis.mode == "function"
+    assert [
+        parameter.value_type.size_parameter_name
+        for parameter in analysis.functions[0].parameters
+        if parameter.value_type.kind == "array"
+    ] == ["size", "count"]
+
+    result = run_test_request(
+        multiple_mutation_request(
+            source,
+            arguments=["[1, 2]", "2", "[8, 9, 10]", "2"],
+            expected_mutations=[
+                ("first", "[8, 2]"),
+                ("second", "[1, 9]"),
+            ],
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_one_mutation_mismatch_fails_the_whole_test():
+    result = run_test_request(
+        multiple_mutation_request(
+            "void swapValues(int& left, int& right) "
+            "{ int temporary = left; left = right; right = temporary; }",
+            arguments=["4", "9"],
+            expected_mutations=[("left", "9"), ("right", "5")],
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].actual_final_arguments == {
+        "left": "9",
+        "right": "4",
+    }
+
+
+@pytest.mark.parametrize(
+    ("expectations", "message"),
+    [
+        ([("left", "2")], "Every mutable parameter"),
+        (
+            [("left", "2"), ("right", "1"), ("value", "3")],
+            "Every mutable parameter",
+        ),
+        (
+            [("left", "2"), ("right", "1"), ("stale", "3")],
+            "Every mutable parameter",
+        ),
+        (
+            [("left", "2"), ("left", "2"), ("right", "1")],
+            "duplicate mutation parameter",
+        ),
+    ],
+)
+def test_invalid_multiple_mutation_identifiers_are_rejected_before_compile(
+    expectations: list[tuple[str, str]],
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        multiple_mutation_request(
+            "void swapValues(int& left, int& right, int value) {}",
+            arguments=["1", "2", "3"],
+            expected_mutations=expectations,
+        )
+    )
+
+    assert result.input_error
+    assert message in result.input_error
+    assert invoked is False
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("expected_return", "expected_mutation", "success"),
+    [("12", "6", True), ("11", "6", False), ("12", "7", False)],
+)
+def test_return_and_mutation_channels(
+    expected_return: str,
+    expected_mutation: str,
+    success: bool,
+):
+    result = run_test_request(
+        combined_request(
+            "int increase(int& value) { ++value; return value * 2; }",
+            arguments=["5"],
+            expected_return=expected_return,
+            expected_mutations=[("value", expected_mutation)],
+        )
+    )
+
+    assert result.success is success
+    combined = result.tests[0]
+    assert combined.return_result.passed is (expected_return == "12")
+    assert combined.mutation_results[0].passed is (
+        expected_mutation == "6"
+    )
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_stdout_and_mutation_channels_pass():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            "void updateAndPrint(int& value) "
+            "{ ++value; std::cout << value; }",
+            arguments=["5"],
+            expected_stdout="6",
+            check_stdout=True,
+            expected_mutations=[("value", "6")],
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].stdout_result.passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_return_and_stdout_channels_are_isolated():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            "int calculate(int value) "
+            '{ std::cout << "__INKTOCODE_MUTATION_RESULT__"; '
+            "return value * 2; }",
+            arguments=["5"],
+            expected_return="10",
+            expected_stdout="__INKTOCODE_MUTATION_RESULT__",
+            check_stdout=True,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].return_result.actual == "10"
+    assert result.tests[0].stdout_result.actual == (
+        "__INKTOCODE_MUTATION_RESULT__"
+    )
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_all_three_channels_report_independent_failures():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            "int process(int& value) "
+            "{ value += 2; std::cout << value; return value * 3; }",
+            arguments=["4"],
+            expected_return="18",
+            expected_stdout="7",
+            check_stdout=True,
+            expected_mutations=[("value", "6")],
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is False
+    assert combined.return_result.passed is True
+    assert combined.stdout_result.passed is False
+    assert combined.mutation_results[0].passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_all_three_channels_pass():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            "int process(int& value) "
+            "{ value += 2; std::cout << value; return value * 3; }",
+            arguments=["4"],
+            expected_return="18",
+            expected_stdout="6",
+            check_stdout=True,
+            expected_mutations=[("value", "6")],
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is True
+    assert combined.return_result.passed is True
+    assert combined.stdout_result.passed is True
+    assert combined.mutation_results[0].passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_return_failure_does_not_hide_passing_stdout():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            'int calculate() { std::cout << "ready"; return 10; }',
+            arguments=[],
+            expected_return="11",
+            expected_stdout="ready",
+            check_stdout=True,
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is False
+    assert combined.return_result.passed is False
+    assert combined.stdout_result.passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_multiple_mutations_can_be_combined_with_return():
+    result = run_test_request(
+        combined_request(
+            "int adjust(int& left, int& right) "
+            "{ ++left; right += 2; return left + right; }",
+            arguments=["1", "2"],
+            expected_return="6",
+            expected_mutations=[("left", "2"), ("right", "4")],
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is True
+    assert combined.return_result.passed is True
+    assert [item.parameter for item in combined.mutation_results] == [
+        "left",
+        "right",
+    ]
+    assert all(item.passed for item in combined.mutation_results)
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_multiple_mutations_can_be_combined_with_stdout():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            "void adjust(int& left, int& right) "
+            "{ ++left; right += 2; std::cout << left + right; }",
+            arguments=["1", "2"],
+            expected_stdout="6",
+            check_stdout=True,
+            expected_mutations=[("left", "2"), ("right", "4")],
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is True
+    assert combined.stdout_result.passed is True
+    assert all(item.passed for item in combined.mutation_results)
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("comparison_mode", "expected", "passed"),
+    [
+        ("whitespace_tolerant", "hello world", True),
+        ("exact", "hello world", False),
+    ],
+)
+def test_combined_stdout_uses_selected_comparison_mode(
+    comparison_mode: str,
+    expected: str,
+    passed: bool,
+):
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            'int output() { std::cout << "hello  world\\n"; return 1; }',
+            arguments=[],
+            expected_return="1",
+            expected_stdout=expected,
+            check_stdout=True,
+            comparison_mode=comparison_mode,
+        )
+    )
+
+    assert result.tests[0].stdout_result.passed is passed
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_disabled_output_check_captures_but_ignores_stdout():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            'int output() { std::cout << "ignored"; return 1; }',
+            arguments=[],
+            expected_return="1",
+            check_stdout=False,
+        )
+    )
+
+    assert result.success is True
+
+
+def test_void_expected_return_and_missing_nonvoid_return_are_rejected():
+    void_result = run_test_request(
+        combined_request(
+            "void output() {}",
+            arguments=[],
+            expected_return="1",
+        )
+    )
+    nonvoid_result = run_test_request(
+        combined_request(
+            'int output() { return 1; }',
+            arguments=[],
+            expected_stdout="",
+            check_stdout=True,
+        )
+    )
+
+    assert "void function" in (void_result.input_error or "")
+    assert "expected return" in (nonvoid_result.input_error or "")
+
+
+def test_output_check_requires_stdout_only_when_enabled():
+    disabled = FunctionTestCase(
+        name="Disabled output check",
+        arguments=[],
+        expected_return="1",
+        check_stdout=False,
+    )
+
+    assert disabled.expected_stdout is None
+    with pytest.raises(
+        ValueError,
+        match="Function-output checking requires expected stdout",
+    ):
+        FunctionTestCase(
+            name="Enabled output check",
+            arguments=[],
+            expected_return="1",
+            check_stdout=True,
+        )
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_timeout_before_metadata_completion_is_reported():
+    result = run_test_request(
+        combined_request(
+            "int spin() { while (true) {} return 1; }",
+            arguments=[],
+            expected_return="1",
+        ),
+        test_timeout_seconds=0.05,
+    )
+
+    assert result.tests[0].timed_out is True
+    assert "metadata was incomplete" in result.tests[0].stderr
+
+
+def test_scalar_pointer_metadata_and_whitespace_spellings():
+    analysis = analyze_test_mode(
+        "#include <string>\n"
+        "void update(int * score, long long* total, "
+        "std::string * label) {}"
+    )
+
+    assert analysis.mode == "function"
+    parameters = analysis.functions[0].parameters
+    assert [
+        (
+            parameter.value_type.kind,
+            parameter.value_type.display_type,
+            parameter.value_type.scalar_type,
+            parameter.value_type.passing,
+        )
+        for parameter in parameters
+    ] == [
+        ("scalar", "int*", "int", "scalar_pointer"),
+        ("scalar", "long long*", "long long", "scalar_pointer"),
+        ("scalar", "std::string*", "std::string", "scalar_pointer"),
+    ]
+
+
+def test_unqualified_string_pointer_requires_valid_namespace_use():
+    supported = analyze_test_mode(
+        "#include <string>\nusing namespace std;\n"
+        "void update(string* value) {}"
+    )
+    unsupported = analyze_test_mode(
+        "#include <string>\nvoid update(string* value) {}"
+    )
+
+    assert supported.mode == "function"
+    assert (
+        supported.functions[0].parameters[0].value_type.scalar_type
+        == "std::string"
+    )
+    assert unsupported.mode == "unsupported"
+    assert "using namespace std" in (unsupported.message or "")
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("source", "initial", "expected"),
+    [
+        ("void update(int* value) { ++*value; }", "5", "6"),
+        (
+            "void update(long long* value) { *value += 2; }",
+            "9223372036854775800",
+            "9223372036854775802",
+        ),
+        ("void update(double* value) { *value *= 2; }", "1.25", "2.5"),
+        ("void update(bool* value) { *value = !*value; }", "false", "true"),
+    ],
+)
+def test_numeric_scalar_pointer_mutations(
+    source: str,
+    initial: str,
+    expected: str,
+):
+    result = run_test_request(
+        combined_request(
+            source,
+            arguments=[initial],
+            expected_mutations=[("value", expected)],
+        )
+    )
+
+    assert result.success is True
+    mutation = result.tests[0]
+    assert mutation.actual_final_arguments == {"value": expected}
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_string_scalar_pointer_mutation():
+    result = run_test_request(
+        combined_request(
+            "#include <string>\n"
+            'void update(std::string* value) { *value += "-updated"; }',
+            arguments=["user"],
+            expected_mutations=[("value", "user-updated")],
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "value": "user-updated"
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_scalar_pointer_with_ordinary_parameter_and_two_pointers():
+    result = run_test_request(
+        combined_request(
+            "void calculate(int amount, int* quotient, int* remainder) "
+            "{ *quotient += amount; *remainder -= amount; }",
+            arguments=["3", "7", "5"],
+            expected_mutations=[("quotient", "10"), ("remainder", "2")],
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "quotient": "10",
+        "remainder": "2",
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_scalar_pointer_combines_with_reference_and_vector_mutations():
+    result = run_test_request(
+        combined_request(
+            "#include <vector>\n"
+            "void update(int* pointer, int& reference, "
+            "std::vector<int>& values) "
+            "{ ++*pointer; reference += 2; values.push_back(3); }",
+            arguments=["1", "2", "[1, 2]"],
+            expected_mutations=[
+                ("pointer", "2"),
+                ("reference", "4"),
+                ("values", "[1, 2, 3]"),
+            ],
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "pointer": "2",
+        "reference": "4",
+        "values": "[1, 2, 3]",
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_scalar_pointer_combines_with_return_and_checked_stdout():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n"
+            "int update(int* value) "
+            "{ *value += 2; std::cout << *value; return *value * 3; }",
+            arguments=["4"],
+            expected_return="18",
+            expected_stdout="6",
+            check_stdout=True,
+            expected_mutations=[("value", "6")],
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is True
+    assert combined.return_result.passed is True
+    assert combined.stdout_result.passed is True
+    assert combined.mutation_results[0].passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_incorrect_scalar_pointer_mutation_fails():
+    result = run_test_request(
+        combined_request(
+            "void update(int* value) { ++*value; }",
+            arguments=["5"],
+            expected_mutations=[("value", "7")],
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].actual_final_arguments == {"value": "6"}
+
+
+@pytest.mark.parametrize(
+    ("initial", "expected", "message"),
+    [
+        ("", "6", "must be a signed decimal int value"),
+        ("5", "", "must be a signed decimal int value"),
+        ("nullptr", "6", "must be a signed decimal int value"),
+    ],
+)
+def test_invalid_scalar_pointer_values_are_rejected_before_compilation(
+    initial: str,
+    expected: str,
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        combined_request(
+            "void update(int* value) {}",
+            arguments=[initial],
+            expected_mutations=[("value", expected)],
+        )
+    )
+
+    assert message in (result.input_error or "")
+    assert invoked is False
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("void update(int** value) {}", "Pointer-to-pointer"),
+        ("void update(int*& value) {}", "References to pointers"),
+        ("void update(const int* value) {}", "Const scalar pointer"),
+        ("void update(int const* value) {}", "Const scalar pointer"),
+        (
+            "#include <string>\nvoid update(const std::string* value) {}",
+            "Const scalar pointer",
+        ),
+        ("void update(Custom* value) {}", "Unsupported type"),
+        ("void update(int* value) { value++; }", "pointer arithmetic"),
+        ("void update(int* value) { value[0] = 1; }", "pointer arithmetic"),
+        ("int* update(int* value) { return value; }", "Pointer return"),
+    ],
+)
+def test_unsupported_scalar_pointer_signatures_are_clear(
+    source: str,
+    message: str,
+):
+    analysis = analyze_test_mode(source)
+
     assert analysis.mode == "unsupported"
-    assert analysis.message
-    assert "multiple mutable reference" in analysis.message
+    assert message in (analysis.message or "")
+
+
+def test_numeric_pointer_with_size_remains_array_backed():
+    analysis = analyze_test_mode(
+        "void reverseArray(int* values, int size) {}"
+    )
+
+    assert analysis.mode == "function"
+    value_type = analysis.functions[0].parameters[0].value_type
+    assert value_type.kind == "array"
+    assert value_type.passing == "array_pointer"
+    assert value_type.size_parameter_name == "size"

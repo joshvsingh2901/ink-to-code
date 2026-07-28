@@ -10,7 +10,11 @@ from pathlib import Path
 
 from app.schemas.test_execution import (
     FunctionResponse,
+    FunctionChannelResult,
+    FunctionCombinedTestResult,
+    FunctionMutationChannelResult,
     FunctionRunTestsRequest,
+    FunctionTestCase,
     FunctionMutationTestResult,
     FunctionOutputTestResult,
     FunctionTestResult,
@@ -38,7 +42,6 @@ TEST_TIMEOUT_SECONDS = 2
 TEST_OUTPUT_LIMIT_BYTES = 64 * 1024
 OUTPUT_LIMIT_MESSAGE = "\n[Output limited to 64 KiB.]"
 DOUBLE_OUTPUT_PRECISION = 17
-MUTATION_RESULT_MARKER = "__INKTOCODE_MUTATION_RESULT__"
 _INTEGER_VALUE = re.compile(r"[+-]?\d+")
 _DOUBLE_VALUE = re.compile(
     r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?"
@@ -52,6 +55,8 @@ class ProcessOutput:
     exit_code: int | None
     timed_out: bool
     output_limited: bool
+    function_stdout: str = ""
+    result_metadata: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,7 @@ class HarnessArgument:
     expression: str
     declarations: tuple[str, ...] = ()
     array_element_count: int | None = None
+    mutation_expression: str | None = None
 
 
 def _limit_bytes(output: bytes) -> tuple[str, bool]:
@@ -68,6 +74,13 @@ def _limit_bytes(output: bytes) -> tuple[str, bool]:
         content + OUTPUT_LIMIT_MESSAGE if limited else content,
         limited,
     )
+
+
+def _file_exceeds_limit(path: Path) -> bool:
+    try:
+        return path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
+    except FileNotFoundError:
+        return False
 
 
 def _classify_output_match(expected: str, actual: str) -> str:
@@ -93,6 +106,23 @@ def _classify_program_output_match(
     if normalized_expected.split() == normalized_actual.split():
         return "formatting_mismatch"
     return "mismatch"
+
+
+def _expected_mutations(test: FunctionTestCase) -> dict[str, str] | None:
+    if test.expected_mutations is not None:
+        names = [
+            expectation.parameter_id
+            for expectation in test.expected_mutations
+        ]
+        if len(names) != len(set(names)):
+            raise ValueError(
+                f"{test.name} contains a duplicate mutation parameter."
+            )
+        return {
+            expectation.parameter_id: expectation.expected_final_value
+            for expectation in test.expected_mutations
+        }
+    return test.expected_final_arguments
 
 
 def _function_response(signature: FunctionSignature) -> FunctionResponse:
@@ -133,6 +163,11 @@ def _run_process(
     stdin_path = working_directory / "test-input.txt"
     stdout_path = working_directory / "test-stdout.txt"
     stderr_path = working_directory / "test-stderr.txt"
+    function_stdout_path = working_directory / "function-stdout.txt"
+    result_path = working_directory / "function-result.json"
+    result_temp_path = working_directory / "function-result.json.tmp"
+    result_path.unlink(missing_ok=True)
+    function_stdout_path.unlink(missing_ok=True)
     stdin_path.write_bytes(stdin.encode("utf-8"))
     timed_out = False
     output_limited = False
@@ -160,6 +195,15 @@ def _run_process(
             if (
                 stdout_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
                 or stderr_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
+                or (
+                    _file_exceeds_limit(function_stdout_path)
+                )
+                or (
+                    _file_exceeds_limit(result_temp_path)
+                )
+                or (
+                    _file_exceeds_limit(result_path)
+                )
             ):
                 output_limited = True
                 process.kill()
@@ -178,12 +222,32 @@ def _run_process(
             stderr_file.read(TEST_OUTPUT_LIMIT_BYTES + 1)
         )
 
+    function_stdout = ""
+    if function_stdout_path.exists():
+        function_stdout, function_limited = _limit_bytes(
+            function_stdout_path.read_bytes()[: TEST_OUTPUT_LIMIT_BYTES + 1]
+        )
+        output_limited = output_limited or function_limited
+    metadata_limited = (
+        (result_path.exists() and result_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES)
+        or (
+            result_temp_path.exists()
+            and result_temp_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
+        )
+    )
+    output_limited = output_limited or metadata_limited
     return ProcessOutput(
         stdout=stdout,
         stderr=stderr,
         exit_code=None if timed_out else exit_code,
         timed_out=timed_out,
         output_limited=output_limited or stdout_limited or stderr_limited,
+        function_stdout=function_stdout,
+        result_metadata=(
+            result_path.read_text(encoding="utf-8", errors="replace")
+            if result_path.exists() and not metadata_limited
+            else None
+        ),
     )
 
 
@@ -363,7 +427,7 @@ def _prepare_argument(
     test_index: int,
     parameter_index: int,
 ) -> HarnessArgument:
-    if value_type.passing == "mutable_reference":
+    if value_type.passing in {"mutable_reference", "scalar_pointer"}:
         storage_name = (
             f"inktocode_mutable_{test_index}_{parameter_index}_storage"
         )
@@ -376,10 +440,15 @@ def _prepare_argument(
             literal = _safe_literal(value_type.scalar_type, raw_value, label)
             storage_type = value_type.scalar_type
         return HarnessArgument(
-            expression=storage_name,
+            expression=(
+                f"&{storage_name}"
+                if value_type.passing == "scalar_pointer"
+                else storage_name
+            ),
             declarations=(
                 f"{storage_type} {storage_name} = {literal};",
             ),
+            mutation_expression=storage_name,
         )
     if value_type.kind != "array":
         return HarnessArgument(
@@ -411,6 +480,7 @@ def _prepare_argument(
         expression=storage_name,
         declarations=(declaration,),
         array_element_count=len(elements),
+        mutation_expression=storage_name,
     )
 
 
@@ -557,17 +627,14 @@ def _build_function_harness(
     code: str,
     function: FunctionSignature,
     arguments_by_test: list[list[HarnessArgument]],
-    mutation_parameter_name: str | None,
+    mutation_parameter_names: tuple[str, ...],
 ) -> str:
     cases: list[str] = []
-    mutable_parameter = next(
-        (
-            (parameter_index, parameter)
-            for parameter_index, parameter in enumerate(function.parameters)
-            if parameter.name == mutation_parameter_name
-        ),
-        None,
-    )
+    mutable_parameters = [
+        (parameter_index, parameter)
+        for parameter_index, parameter in enumerate(function.parameters)
+        if parameter.name in mutation_parameter_names
+    ]
     for index, arguments in enumerate(arguments_by_test):
         declarations = " ".join(
             declaration
@@ -578,14 +645,20 @@ def _build_function_harness(
             f"{function.name}("
             f"{', '.join(argument.expression for argument in arguments)})"
         )
-        if mutable_parameter is not None:
-            mutable_index, parameter = mutable_parameter
-            mutable_expression = arguments[mutable_index].expression
+        serialized_mutations: list[str] = []
+        for mutation_index, (mutable_index, parameter) in enumerate(
+            mutable_parameters
+        ):
+            mutable_expression = (
+                arguments[mutable_index].mutation_expression
+                or arguments[mutable_index].expression
+            )
             if parameter.value_type.kind in {"vector", "array"}:
                 element_type = parameter.value_type.element_type
                 if element_type is None:
                     raise ValueError(
-                        f"Mutable parameter {parameter.name} has no element type."
+                        f"Mutable parameter {parameter.name} "
+                        "has no element type."
                     )
                 if parameter.value_type.kind == "vector":
                     length_expression = f"{mutable_expression}.size()"
@@ -613,37 +686,89 @@ def _build_function_harness(
                 )
             elif parameter.value_type.scalar_type == STRING_TYPE:
                 serialized_value = (
-                    f"inktocode_write_quoted_string({mutable_expression});"
+                    "inktocode_write_quoted_string"
+                    f"({mutable_expression});"
                 )
             elif parameter.value_type.scalar_type == "bool":
                 serialized_value = (
-                    f"std::cout << std::boolalpha << {mutable_expression};"
+                    "std::cout << std::boolalpha "
+                    f"<< {mutable_expression};"
                 )
             elif parameter.value_type.scalar_type == "double":
                 serialized_value = (
                     "std::cout << std::setprecision"
-                    f"({DOUBLE_OUTPUT_PRECISION}) << {mutable_expression};"
+                    f"({DOUBLE_OUTPUT_PRECISION}) "
+                    f"<< {mutable_expression};"
                 )
             else:
-                serialized_value = f"std::cout << {mutable_expression};"
-            output = (
-                f"{call}; "
-                f'std::cout << "{MUTATION_RESULT_MARKER}"; '
+                serialized_value = (
+                    f"std::cout << {mutable_expression};"
+                )
+            separator = (
+                'std::cout << ","; ' if mutation_index else ""
+            )
+            serialized_mutations.append(
+                f'{separator}std::cout << "\\"{parameter.name}\\":"; '
                 f"{serialized_value}"
             )
-        elif function.return_value_type.kind == "void":
-            output = f"{call};"
-        elif function.return_value_type.kind == "vector":
-            output = _vector_output(function, call)
-        elif function.return_type == "bool":
-            output = f"std::cout << std::boolalpha << {call};"
-        elif function.return_type == "double":
-            output = (
-                f"std::cout << std::setprecision({DOUBLE_OUTPUT_PRECISION}) "
-                f"<< {call};"
-            )
+        if function.return_value_type.kind == "void":
+            call_statement = f"{call};"
+            serialized_return = 'std::cout << "null";'
         else:
-            output = f"std::cout << {call};"
+            call_statement = f"auto inktocode_return_value = {call};"
+            if function.return_value_type.kind == "vector":
+                element_type = function.return_value_type.element_type
+                if element_type is None:
+                    raise ValueError("Return vector has no element type.")
+                serialized_return = _collection_output(
+                    "inktocode_return_value",
+                    element_type,
+                    "inktocode_return_value.size()",
+                )
+            elif function.return_value_type.scalar_type == STRING_TYPE:
+                serialized_return = (
+                    "inktocode_write_quoted_string"
+                    "(inktocode_return_value);"
+                )
+            elif function.return_value_type.scalar_type == "bool":
+                serialized_return = (
+                    "std::cout << std::boolalpha "
+                    "<< inktocode_return_value;"
+                )
+            elif function.return_value_type.scalar_type == "double":
+                serialized_return = (
+                    "std::cout << std::setprecision"
+                    f"({DOUBLE_OUTPUT_PRECISION}) "
+                    "<< inktocode_return_value;"
+                )
+            else:
+                serialized_return = (
+                    "std::cout << inktocode_return_value;"
+                )
+        output = " ".join(
+            [
+                'std::ofstream inktocode_user_output("function-stdout.txt", '
+                "std::ios::binary | std::ios::trunc);",
+                "std::streambuf* inktocode_original_output = "
+                "std::cout.rdbuf(inktocode_user_output.rdbuf());",
+                call_statement,
+                "std::cout.rdbuf(inktocode_original_output);",
+                "inktocode_user_output.close();",
+                'std::ofstream inktocode_metadata("function-result.json.tmp", '
+                "std::ios::binary | std::ios::trunc);",
+                "std::streambuf* inktocode_original_metadata = "
+                "std::cout.rdbuf(inktocode_metadata.rdbuf());",
+                'std::cout << "{\\"return\\":";',
+                serialized_return,
+                'std::cout << ",\\"mutations\\":{";',
+                " ".join(serialized_mutations),
+                'std::cout << "}}";',
+                "std::cout.rdbuf(inktocode_original_metadata);",
+                "inktocode_metadata.close();",
+                'std::rename("function-result.json.tmp", '
+                '"function-result.json");',
+            ]
+        )
         cases.append(
             f"case {index}: {{ {declarations} {output} return 0; }}"
         )
@@ -663,6 +788,8 @@ def _build_function_harness(
         ]
     )
     return (
+        "#include <cstdio>\n"
+        "#include <fstream>\n"
         "#include <iomanip>\n"
         "#include <iostream>\n\n"
         "#include <string>\n"
@@ -715,32 +842,58 @@ def _program_results(
     return results
 
 
+def _metadata_value(value_type: ValueType, value: object) -> str:
+    if value_type.kind in {"vector", "array"}:
+        return (
+            json.dumps(value, ensure_ascii=False)
+            if isinstance(value, list)
+            else ""
+        )
+    if value_type.scalar_type == STRING_TYPE:
+        return value if isinstance(value, str) else ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _typed_match(value_type: ValueType, expected: str, actual: str) -> str:
+    if value_type.kind in {"vector", "array"}:
+        return (
+            "mismatch"
+            if _classify_vector_match(value_type, expected, actual)
+            == "mismatch"
+            else "exact"
+        )
+    return "exact" if expected == actual else "mismatch"
+
+
 def _function_results(
     executable: Path,
     working_directory: Path,
     request: FunctionRunTestsRequest,
     function: FunctionSignature,
-    mutation_parameter_name: str | None,
+    mutation_parameter_names: tuple[str, ...],
     *,
     timeout_seconds: float,
 ) -> list[
     FunctionTestResult
     | FunctionOutputTestResult
     | FunctionMutationTestResult
+    | FunctionCombinedTestResult
 ]:
     results: list[
         FunctionTestResult
         | FunctionOutputTestResult
         | FunctionMutationTestResult
+        | FunctionCombinedTestResult
     ] = []
-    mutable_parameter = next(
-        (
-            parameter
-            for parameter in function.parameters
-            if parameter.name == mutation_parameter_name
-        ),
-        None,
-    )
+    mutable_parameters = [
+        parameter
+        for parameter in function.parameters
+        if parameter.name in mutation_parameter_names
+    ]
     for index, test in enumerate(request.tests):
         output = _run_process(
             executable,
@@ -748,57 +901,155 @@ def _function_results(
             f"{index}\n",
             timeout_seconds=timeout_seconds,
         )
-        if mutable_parameter is not None:
-            expected_values = test.expected_final_arguments
-            if expected_values is None:
-                raise ValueError(
-                    "Mutable-reference tests require an expected final value."
-                )
-            expected_value = expected_values[mutable_parameter.name]
-            function_output, marker, serialized_value = output.stdout.rpartition(
-                MUTATION_RESULT_MARKER
+        metadata: dict[str, object] | None = None
+        if output.result_metadata is not None:
+            try:
+                decoded_metadata = json.loads(output.result_metadata)
+            except json.JSONDecodeError:
+                decoded_metadata = None
+            if isinstance(decoded_metadata, dict):
+                metadata = decoded_metadata
+        stderr = output.stderr
+        if metadata is None:
+            stderr = (
+                f"{stderr}\n" if stderr else ""
+            ) + "Function result metadata was incomplete."
+
+        supplied_expected_values = _expected_mutations(test) or {}
+        expected_values = {
+            parameter.name: supplied_expected_values.get(parameter.name, "")
+            for parameter in mutable_parameters
+        }
+        raw_mutations = (
+            metadata.get("mutations") if metadata is not None else None
+        )
+        actual_values: dict[str, str] = {}
+        mutation_channel_results: list[
+            FunctionMutationChannelResult
+        ] = []
+        for parameter in mutable_parameters:
+            raw_value = (
+                raw_mutations.get(parameter.name)
+                if isinstance(raw_mutations, dict)
+                else None
             )
-            actual_value = serialized_value if marker else output.stdout
-            if mutable_parameter.value_type.kind in {"vector", "array"}:
-                collection_match = _classify_vector_match(
-                    mutable_parameter.value_type,
-                    expected_value,
+            actual_value = _metadata_value(parameter.value_type, raw_value)
+            mutation_passed = (
+                _typed_match(
+                    parameter.value_type,
+                    expected_values[parameter.name],
                     actual_value,
                 )
-                match_type = (
-                    "mismatch"
-                    if collection_match == "mismatch"
-                    else "exact"
-                )
-            elif mutable_parameter.value_type.scalar_type == STRING_TYPE:
-                try:
-                    decoded_value = json.loads(actual_value)
-                except (json.JSONDecodeError, TypeError):
-                    decoded_value = None
-                if isinstance(decoded_value, str):
-                    actual_value = decoded_value
-                match_type = (
-                    "exact" if expected_value == actual_value else "mismatch"
-                )
-            else:
-                match_type = (
-                    "exact" if expected_value == actual_value else "mismatch"
-                )
-            passed = (
-                not output.timed_out
-                and not output.output_limited
-                and output.exit_code == 0
-                and bool(marker)
-                and not function_output
-                and match_type == "exact"
+                != "mismatch"
             )
-            stderr = output.stderr
-            if marker and function_output:
-                stderr = (
-                    f"{stderr}\n" if stderr else ""
-                ) + (
-                    "Mutable-reference tests do not support function stdout."
+            parameter_index = next(
+                parameter_index
+                for parameter_index, candidate in enumerate(
+                    function.parameters
                 )
+                if candidate.name == parameter.name
+            )
+            actual_values[parameter.name] = actual_value
+            mutation_channel_results.append(
+                FunctionMutationChannelResult(
+                    parameter=parameter.name,
+                    initial=test.arguments[parameter_index],
+                    expected_final=expected_values[parameter.name],
+                    actual_final=actual_value,
+                    passed=mutation_passed,
+                )
+            )
+
+        return_channel: FunctionChannelResult | None = None
+        if test.expected_return is not None:
+            actual_return = _metadata_value(
+                function.return_value_type,
+                metadata.get("return") if metadata is not None else None,
+            )
+            return_match = _typed_match(
+                function.return_value_type,
+                test.expected_return,
+                actual_return,
+            )
+            return_channel = FunctionChannelResult(
+                expected=test.expected_return,
+                actual=actual_return,
+                passed=return_match != "mismatch",
+                match_type=return_match,
+            )
+
+        check_stdout = (
+            test.check_stdout
+            if test.check_stdout is not None
+            else test.expected_stdout is not None
+        )
+        stdout_channel: FunctionChannelResult | None = None
+        if check_stdout and test.expected_stdout is not None:
+            stdout_match = _classify_program_output_match(
+                test.expected_stdout,
+                output.function_stdout,
+                request.comparison_mode,
+            )
+            stdout_channel = FunctionChannelResult(
+                expected=test.expected_stdout,
+                actual=output.function_stdout,
+                passed=stdout_match
+                not in {"formatting_mismatch", "mismatch"},
+                match_type=stdout_match,
+            )
+
+        runtime_ok = (
+            not output.timed_out
+            and not output.output_limited
+            and output.exit_code == 0
+            and metadata is not None
+        )
+        active_channels = sum(
+            (
+                return_channel is not None,
+                stdout_channel is not None,
+                bool(mutation_channel_results),
+            )
+        )
+        if active_channels > 1:
+            all_channels_pass = all(
+                channel.passed
+                for channel in (return_channel, stdout_channel)
+                if channel is not None
+            ) and all(
+                channel.passed for channel in mutation_channel_results
+            )
+            passed = runtime_ok and all_channels_pass
+            results.append(
+                FunctionCombinedTestResult(
+                    name=test.name,
+                    passed=passed,
+                    arguments=test.arguments,
+                    return_result=return_channel,
+                    stdout_result=stdout_channel,
+                    mutation_results=mutation_channel_results,
+                    stderr=stderr,
+                    exit_code=output.exit_code,
+                    timed_out=output.timed_out,
+                    output_limited=output.output_limited,
+                    match_type="exact" if passed else "mismatch",
+                )
+            )
+            continue
+        if mutable_parameters:
+            if not supplied_expected_values:
+                raise ValueError(
+                    "Mutation tests require expected final values."
+                )
+            match_type = (
+                "exact"
+                if all(
+                    channel.passed
+                    for channel in mutation_channel_results
+                )
+                else "mismatch"
+            )
+            passed = runtime_ok and match_type == "exact"
             results.append(
                 FunctionMutationTestResult(
                     name=test.name,
@@ -812,9 +1063,7 @@ def _function_results(
                         )
                     },
                     expected_final_arguments=expected_values,
-                    actual_final_arguments={
-                        mutable_parameter.name: actual_value
-                    },
+                    actual_final_arguments=actual_values,
                     stderr=stderr,
                     exit_code=output.exit_code,
                     timed_out=output.timed_out,
@@ -829,13 +1078,11 @@ def _function_results(
                 raise ValueError("Void function tests require expected_stdout.")
             match_type = _classify_program_output_match(
                 expected_stdout,
-                output.stdout,
+                output.function_stdout,
                 request.comparison_mode,
             )
             passed = (
-                not output.timed_out
-                and not output.output_limited
-                and output.exit_code == 0
+                runtime_ok
                 and match_type not in {"formatting_mismatch", "mismatch"}
             )
             results.append(
@@ -844,8 +1091,8 @@ def _function_results(
                     passed=passed,
                     arguments=test.arguments,
                     expected_stdout=expected_stdout,
-                    actual_stdout=output.stdout,
-                    stderr=output.stderr,
+                    actual_stdout=output.function_stdout,
+                    stderr=stderr,
                     exit_code=output.exit_code,
                     timed_out=output.timed_out,
                     output_limited=output.output_limited,
@@ -857,38 +1104,23 @@ def _function_results(
         expected_return = test.expected_return
         if expected_return is None:
             raise ValueError("Non-void function tests require expected_return.")
+        actual_return = (
+            return_channel.actual if return_channel is not None else ""
+        )
         match_type = (
-            _classify_vector_match(
-                function.return_value_type,
-                expected_return,
-                output.stdout,
-            )
-            if function.return_value_type.kind == "vector"
-            else (
-                "exact"
-                if expected_return == output.stdout
-                else "mismatch"
-            )
-            if function.return_value_type.scalar_type == STRING_TYPE
-            else _classify_output_match(
-                expected_return,
-                output.stdout,
-            )
+            return_channel.match_type
+            if return_channel is not None
+            else "mismatch"
         )
-        passed = (
-            not output.timed_out
-            and not output.output_limited
-            and output.exit_code == 0
-            and match_type != "mismatch"
-        )
+        passed = runtime_ok and match_type != "mismatch"
         results.append(
             FunctionTestResult(
                 name=test.name,
                 passed=passed,
                 arguments=test.arguments,
                 expected_return=expected_return,
-                actual_return=output.stdout,
-                stderr=output.stderr,
+                actual_return=actual_return,
+                stderr=stderr,
                 exit_code=output.exit_code,
                 timed_out=output.timed_out,
                 output_limited=output.output_limited,
@@ -928,7 +1160,7 @@ def run_test_request(
 
     arguments_by_test: list[list[HarnessArgument]] = []
     function = None
-    mutation_parameter_name: str | None = None
+    mutation_parameter_names: tuple[str, ...] = ()
     if isinstance(request, FunctionRunTestsRequest):
         function = next(
             (
@@ -952,12 +1184,15 @@ def run_test_request(
             parameter
             for parameter in function.parameters
             if parameter.value_type.passing
-            in {"mutable_reference", "array_pointer"}
+            in {"mutable_reference", "scalar_pointer", "array_pointer"}
         ]
         mutation_tests = [
             test
             for test in request.tests
-            if test.expected_final_arguments is not None
+            if (
+                test.expected_final_arguments is not None
+                or test.expected_mutations is not None
+            )
         ]
         if mutation_tests:
             if len(mutation_tests) != len(request.tests):
@@ -971,58 +1206,42 @@ def run_test_request(
                     function=_function_response(function),
                     tests=[],
                 )
-            mutation_names = {
-                name
-                for test in mutation_tests
-                for name in (test.expected_final_arguments or {})
+            try:
+                expectation_maps = [
+                    _expected_mutations(test) or {}
+                    for test in mutation_tests
+                ]
+            except ValueError as error:
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    input_error=str(error),
+                    function=_function_response(function),
+                    tests=[],
+                )
+            mutable_names = {
+                parameter.name
+                for parameter in mutation_capable_parameters
             }
-            if len(mutation_names) != 1:
-                return RunTestsResponse(
-                    mode="function",
-                    success=False,
-                    input_error=(
-                        "Mutation tests require exactly one mutable output."
-                    ),
-                    function=_function_response(function),
-                    tests=[],
-                )
-            mutation_parameter_name = next(iter(mutation_names))
-            if len(mutation_capable_parameters) != 1:
-                return RunTestsResponse(
-                    mode="function",
-                    success=False,
-                    unsupported_error=(
-                        "Functions with multiple mutable outputs are "
-                        "unsupported."
-                    ),
-                    function=_function_response(function),
-                    tests=[],
-                )
-            if (
-                mutation_capable_parameters[0].name
-                != mutation_parameter_name
+            if any(
+                set(expectations) != mutable_names
+                for expectations in expectation_maps
             ):
                 return RunTestsResponse(
                     mode="function",
                     success=False,
                     input_error=(
-                        "The expected mutation does not match the selected "
-                        "function."
+                        "Every mutable parameter must have exactly one "
+                        "expected final value, and immutable parameters "
+                        "cannot have mutation expectations."
                     ),
                     function=_function_response(function),
                     tests=[],
                 )
-            if function.return_value_type.kind != "void":
-                return RunTestsResponse(
-                    mode="function",
-                    success=False,
-                    unsupported_error=(
-                        "Return-value and mutation checks cannot be combined "
-                        "in this stage."
-                    ),
-                    function=_function_response(function),
-                    tests=[],
-                )
+            mutation_parameter_names = tuple(
+                parameter.name
+                for parameter in mutation_capable_parameters
+            )
         for test_index, test in enumerate(request.tests):
             if len(test.arguments) != len(function.parameters):
                 return RunTestsResponse(
@@ -1037,36 +1256,22 @@ def run_test_request(
                 )
             try:
                 is_void = function.return_value_type.kind == "void"
-                required_mutable_parameter = next(
-                    (
-                        parameter
-                        for parameter in function.parameters
-                        if parameter.value_type.passing
-                        == "mutable_reference"
-                    ),
-                    None,
-                )
+                required_mutable_parameters = [
+                    parameter
+                    for parameter in function.parameters
+                    if parameter.value_type.passing
+                    in {"mutable_reference", "scalar_pointer"}
+                ]
                 if (
-                    required_mutable_parameter is not None
-                    and test.expected_final_arguments is None
+                    required_mutable_parameters
+                    and not mutation_parameter_names
                 ):
                     raise ValueError(
-                        f"{test.name} must provide the expected final value "
-                        f"for {required_mutable_parameter.name}."
+                        f"{test.name} must provide expected final values for "
+                        "every mutable parameter."
                     )
                 if (
-                    mutation_parameter_name is not None
-                    and (
-                        test.expected_stdout is not None
-                        or test.expected_return is not None
-                    )
-                ):
-                    raise ValueError(
-                        f"{test.name} must use only the mutable-reference "
-                        "expected final value."
-                    )
-                if (
-                    mutation_parameter_name is None
+                    not mutation_parameter_names
                     and is_void
                     and test.expected_stdout is None
                 ):
@@ -1075,13 +1280,17 @@ def run_test_request(
                         "the selected void function."
                     )
                 if (
-                    mutation_parameter_name is None
-                    and not is_void
+                    not is_void
                     and test.expected_return is None
                 ):
                     raise ValueError(
                         f"{test.name} must provide an expected return value "
                         "for the selected non-void function."
+                    )
+                if is_void and test.expected_return is not None:
+                    raise ValueError(
+                        f"{test.name} cannot provide an expected return "
+                        "for a void function."
                     )
                 prepared_arguments = [
                     _prepare_argument(
@@ -1099,39 +1308,36 @@ def run_test_request(
                         )
                     )
                 ]
-                if mutation_parameter_name is not None:
-                    mutable_parameter = next(
+                if mutation_parameter_names:
+                    expected_values = _expected_mutations(test) or {}
+                    mutable_parameters = [
                         parameter
                         for parameter in function.parameters
-                        if parameter.name == mutation_parameter_name
-                    )
-                    expected_values = test.expected_final_arguments or {}
-                    if set(expected_values) != {mutable_parameter.name}:
-                        raise ValueError(
-                            f"{test.name} must provide exactly one expected "
-                            f"final value for {mutable_parameter.name}."
+                        if parameter.name in mutation_parameter_names
+                    ]
+                    for mutable_parameter in mutable_parameters:
+                        expected_value = expected_values[
+                            mutable_parameter.name
+                        ]
+                        label = (
+                            f"{test.name} expected final "
+                            f"{mutable_parameter.name}"
                         )
-                    if mutable_parameter.value_type.kind in {
-                        "vector",
-                        "array",
-                    }:
-                        _typed_vector_values(
-                            mutable_parameter.value_type,
-                            expected_values[mutable_parameter.name],
-                            (
-                                f"{test.name} expected final "
-                                f"{mutable_parameter.name}"
-                            ),
-                        )
-                    else:
-                        _safe_value_literal(
-                            mutable_parameter.value_type,
-                            expected_values[mutable_parameter.name],
-                            (
-                                f"{test.name} expected final "
-                                f"{mutable_parameter.name}"
-                            ),
-                        )
+                        if mutable_parameter.value_type.kind in {
+                            "vector",
+                            "array",
+                        }:
+                            _typed_vector_values(
+                                mutable_parameter.value_type,
+                                expected_value,
+                                label,
+                            )
+                        else:
+                            _safe_value_literal(
+                                mutable_parameter.value_type,
+                                expected_value,
+                                label,
+                            )
                 parameter_indexes = {
                     parameter.name: index
                     for index, parameter in enumerate(function.parameters)
@@ -1193,7 +1399,7 @@ def run_test_request(
                     request.code,
                     function,
                     arguments_by_test,
-                    mutation_parameter_name,
+                    mutation_parameter_names,
                 )
                 if isinstance(request, FunctionRunTestsRequest)
                 and function is not None
@@ -1236,7 +1442,7 @@ def run_test_request(
                 working_directory,
                 request,
                 function,
-                mutation_parameter_name,
+                mutation_parameter_names,
                 timeout_seconds=test_timeout_seconds,
             )
             return RunTestsResponse(

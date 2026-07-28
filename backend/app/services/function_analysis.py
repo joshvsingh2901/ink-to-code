@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 SUPPORTED_SCALAR_TYPES = {"int", "long", "long long", "double", "bool"}
@@ -8,16 +8,19 @@ STRING_TYPE = "std::string"
 
 @dataclass(frozen=True)
 class ValueType:
-    kind: Literal["scalar", "vector", "void"]
+    kind: Literal["scalar", "vector", "array", "void"]
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
-    passing: Literal["value", "const_reference"] = "value"
+    passing: Literal["value", "const_reference", "array_pointer"] = "value"
+    size_parameter_name: str | None = None
 
     @property
     def canonical_type(self) -> str:
         if self.kind == "void":
             return "void"
+        if self.kind == "array":
+            return f"{self.element_type}[]"
         if self.kind == "scalar":
             base = self.scalar_type or self.display_type
             return (
@@ -82,6 +85,7 @@ _FUNCTION_DEFINITION = re.compile(
     r"(?P<return_type>"
     r"(?:const\s+)?(?:std::)?vector\s*<[^<>]+>\s*(?:const\s*)?[&*]?"
     r"|(?:const\s+)?(?:std::)?string\s*(?:const\s*)?[&*]?"
+    r"|(?:long\s+long|long|int|double|bool|char)\s*\*+"
     r"|[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*"
     r")\s+(?P<name>[A-Za-z_]\w*)\s*"
     r"\((?P<parameters>[^()]*)\)\s*(?:noexcept\s*)?\{",
@@ -89,6 +93,16 @@ _FUNCTION_DEFINITION = re.compile(
 _PARAMETER_DECLARATION = re.compile(
     r"(?P<type>.+?)\s+(?P<name>[A-Za-z_]\w*)"
 )
+_ARRAY_PARAMETER = re.compile(
+    r"(?P<element>long\s+long|long|int|double|bool|char)\s*"
+    r"(?:"
+    r"(?P<pointers>\*+)\s*(?P<pointer_name>[A-Za-z_]\w*)"
+    r"|(?P<array_name>[A-Za-z_]\w*)\s*"
+    r"(?P<brackets>(?:\[\s*\])+)"
+    r")"
+)
+_SIZE_PARAMETER_NAMES = {"size", "count", "length", "n", "len"}
+_INTEGRAL_TYPES = {"int", "long", "long long"}
 _VECTOR_TYPE = re.compile(
     r"(?P<prefix_const>const\s+)?"
     r"(?P<qualified>std::)?vector\s*<\s*(?P<element>[^<>]+)\s*>\s*"
@@ -305,6 +319,32 @@ def _parse_parameters(
         parameter = " ".join(raw_parameter.split())
         if not parameter or "=" in parameter or "..." in parameter:
             return None, "Default and variadic parameters are unsupported."
+        array_match = _ARRAY_PARAMETER.fullmatch(parameter)
+        if array_match is not None:
+            element_type = " ".join(array_match.group("element").split())
+            if element_type == "char":
+                return None, "Character arrays and pointers are unsupported."
+            pointers = array_match.group("pointers")
+            brackets = array_match.group("brackets")
+            if pointers and pointers != "*":
+                return None, "Pointer-to-pointer parameters are unsupported."
+            if brackets and brackets.count("[") != 1:
+                return None, "Multidimensional arrays are unsupported."
+            parsed.append(
+                FunctionParameter(
+                    name=(
+                        array_match.group("pointer_name")
+                        or array_match.group("array_name")
+                    ),
+                    value_type=ValueType(
+                        kind="array",
+                        display_type=f"{element_type}[]",
+                        element_type=element_type,
+                        passing="array_pointer",
+                    ),
+                )
+            )
+            continue
         match = _PARAMETER_DECLARATION.fullmatch(parameter)
         if match is None:
             return None, f"This parameter is not supported: {parameter}."
@@ -321,7 +361,38 @@ def _parse_parameters(
                 value_type=value_type,
             )
         )
-    return tuple(parsed), None
+
+    linked = list(parsed)
+    for index, parameter in enumerate(parsed):
+        if parameter.value_type.kind != "array":
+            continue
+        candidates = [
+            candidate
+            for candidate in parsed[index + 1 :]
+            if candidate.name.lower() in _SIZE_PARAMETER_NAMES
+            and candidate.value_type.kind == "scalar"
+            and candidate.value_type.scalar_type in _INTEGRAL_TYPES
+        ]
+        if not candidates:
+            return (
+                None,
+                f"Array parameter {parameter.name} requires a later integral "
+                "size parameter named size, count, length, n, or len.",
+            )
+        if len(candidates) > 1:
+            return (
+                None,
+                f"Array parameter {parameter.name} has an ambiguous size "
+                "parameter.",
+            )
+        linked[index] = replace(
+            parameter,
+            value_type=replace(
+                parameter.value_type,
+                size_parameter_name=candidates[0].name,
+            ),
+        )
+    return tuple(linked), None
 
 
 def _parse_candidate(
@@ -346,6 +417,8 @@ def _parse_candidate(
                 display_type="void",
             )
         else:
+            if "*" in candidate.group("return_type"):
+                return None, "Pointer return values are unsupported."
             return None, error
     parameters, error = _parse_parameters(
         candidate.group("parameters"),

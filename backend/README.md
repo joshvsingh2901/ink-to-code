@@ -78,6 +78,21 @@ to safe literals before harness generation. Results use canonical
 numeric tolerance. Nested vectors, unsupported element types, vector pointers,
 non-const references, and mutation-through-void signatures are not supported.
 
+Function tests support one-dimensional numeric C-style array parameters written
+as `T values[]` or `T* values`, where `T` is `int`, `long`, `long long`,
+`double`, or `bool`. Each array must have exactly one later integral size
+parameter named `size`, `count`, `length`, `len`, or `n`; missing or ambiguous
+relationships are rejected instead of guessed. Array inputs use the same
+numeric list syntax as vectors. The supplied size must be non-negative and may
+not exceed the number of provided elements, though it may be smaller.
+
+The temporary harness creates validated local array storage and passes it to the
+unchanged target function. Empty input (`[]`) uses a one-element
+value-initialized backing array while the explicit size remains zero, avoiding
+non-standard zero-length arrays. Pointer-to-pointer and returned-pointer types,
+multidimensional arrays, character arrays, arbitrary expressions, and
+mutation-result checking are not supported.
+
 Function mode supports `std::string` and one-dimensional
 `std::vector<std::string>` parameters by value or const reference, with returns
 by value. A scalar string field is the complete string value and does not

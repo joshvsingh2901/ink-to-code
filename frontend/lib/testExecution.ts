@@ -5,11 +5,12 @@ export type FunctionParameter = {
 };
 
 export type FunctionTypeMetadata = {
-  kind: "scalar" | "vector" | "void";
+  kind: "scalar" | "vector" | "array" | "void";
   display_type: string;
   scalar_type: string | null;
   element_type: string | null;
-  passing: "value" | "const_reference";
+  passing: "value" | "const_reference" | "array_pointer";
+  size_parameter_name: string | null;
 };
 
 export type FunctionDescriptor = {
@@ -141,13 +142,17 @@ function isFunctionTypeMetadata(
   if (!value || typeof value !== "object") return false;
   const metadata = value as Partial<FunctionTypeMetadata>;
   return (
-    ["scalar", "vector", "void"].includes(metadata.kind ?? "") &&
+    ["scalar", "vector", "array", "void"].includes(metadata.kind ?? "") &&
     typeof metadata.display_type === "string" &&
     (metadata.scalar_type === null ||
       typeof metadata.scalar_type === "string") &&
     (metadata.element_type === null ||
       typeof metadata.element_type === "string") &&
-    ["value", "const_reference"].includes(metadata.passing ?? "")
+    ["value", "const_reference", "array_pointer"].includes(
+      metadata.passing ?? "",
+    ) &&
+    (metadata.size_parameter_name === null ||
+      typeof metadata.size_parameter_name === "string")
   );
 }
 

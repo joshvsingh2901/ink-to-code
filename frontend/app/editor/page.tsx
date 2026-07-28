@@ -1240,7 +1240,9 @@ export default function EditorPage() {
                                         maxLength={1_000}
                                         placeholder={
                                           parameter.type_metadata.kind ===
-                                          "vector"
+                                            "vector" ||
+                                          parameter.type_metadata.kind ===
+                                            "array"
                                             ? parameter.type_metadata
                                                 .element_type === "std::string"
                                               ? '["hello", "world"]'
@@ -1256,8 +1258,10 @@ export default function EditorPage() {
                                         }
                                         className="w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
                                       />
-                                      {parameter.type_metadata.kind ===
-                                        "vector" && (
+                                      {(parameter.type_metadata.kind ===
+                                        "vector" ||
+                                        parameter.type_metadata.kind ===
+                                          "array") && (
                                         <p className="mt-1 text-[11px] text-slate-500">
                                           {parameter.type_metadata
                                             .element_type === "std::string"

@@ -384,3 +384,15 @@ The expected request should contain the current source code in structured JSON, 
 - Existing output-comparison modes apply to captured function output.
 - `void` functions that mutate arguments without producing output are not supported in this stage.
 - Non-const reference mutation, pointer mutation, and array mutation remain separate future stages.
+
+## C-style array testing
+
+- Function-mode tests may support one-dimensional numeric C-style arrays.
+- Supported declarations include `T arr[]` and `T* arr` when explicitly treated as array input.
+- Array tests require an explicit size parameter.
+- Supported element types are `int`, `long`, `long long`, `double`, and `bool`.
+- Array values are data, never arbitrary C++ expressions.
+- Generated harness code must create temporary local arrays safely.
+- Array-return pointers, pointer ownership, dynamic allocation, pointer-to-pointer types, and multidimensional arrays are not supported yet.
+- Array mutation checking is not part of this stage.
+- Existing program, scalar, string, vector, and void-output testing must remain unchanged.

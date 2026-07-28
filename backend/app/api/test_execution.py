@@ -44,6 +44,9 @@ async def analyze_source_mode(
                             scalar_type=parameter.value_type.scalar_type,
                             element_type=parameter.value_type.element_type,
                             passing=parameter.value_type.passing,
+                            size_parameter_name=(
+                                parameter.value_type.size_parameter_name
+                            ),
                         ),
                     )
                     for parameter in function.parameters
@@ -55,6 +58,9 @@ async def analyze_source_mode(
                     scalar_type=function.return_value_type.scalar_type,
                     element_type=function.return_value_type.element_type,
                     passing=function.return_value_type.passing,
+                    size_parameter_name=(
+                        function.return_value_type.size_parameter_name
+                    ),
                 ),
             )
             for function in analysis.functions

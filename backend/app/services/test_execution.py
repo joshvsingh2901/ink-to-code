@@ -52,6 +52,13 @@ class ProcessOutput:
     output_limited: bool
 
 
+@dataclass(frozen=True)
+class HarnessArgument:
+    expression: str
+    declarations: tuple[str, ...] = ()
+    array_element_count: int | None = None
+
+
 def _limit_bytes(output: bytes) -> tuple[str, bool]:
     limited = len(output) > TEST_OUTPUT_LIMIT_BYTES
     content = output[:TEST_OUTPUT_LIMIT_BYTES].decode("utf-8", errors="replace")
@@ -94,6 +101,7 @@ def _function_response(signature: FunctionSignature) -> FunctionResponse:
             scalar_type=value_type.scalar_type,
             element_type=value_type.element_type,
             passing=value_type.passing,
+            size_parameter_name=value_type.size_parameter_name,
         )
 
     return FunctionResponse(
@@ -280,7 +288,12 @@ def _parse_string_vector(raw_value: str, label: str) -> list[str]:
     return parsed
 
 
-def _split_vector_input(raw_value: str, label: str) -> list[str]:
+def _split_vector_input(
+    raw_value: str,
+    label: str,
+    *,
+    collection_name: str = "vector",
+) -> list[str]:
     value = raw_value.strip()
     if not value:
         raise ValueError(f"{label} must contain values or use [] for empty.")
@@ -301,7 +314,9 @@ def _split_vector_input(raw_value: str, label: str) -> list[str]:
     if "," in value:
         elements = [element.strip() for element in value.split(",")]
         if any(not element for element in elements):
-            raise ValueError(f"{label} contains an empty vector element.")
+            raise ValueError(
+                f"{label} contains an empty {collection_name} element."
+            )
         return elements
     return value.split()
 
@@ -336,6 +351,47 @@ def _safe_value_literal(
     if value_type.scalar_type is None:
         raise ValueError(f"{label} uses an unsupported scalar type.")
     return _safe_literal(value_type.scalar_type, raw_value, label)
+
+
+def _prepare_argument(
+    value_type: ValueType,
+    raw_value: str,
+    label: str,
+    *,
+    test_index: int,
+    parameter_index: int,
+) -> HarnessArgument:
+    if value_type.kind != "array":
+        return HarnessArgument(
+            expression=_safe_value_literal(value_type, raw_value, label)
+        )
+
+    element_type = value_type.element_type
+    if element_type is None:
+        raise ValueError(f"{label} uses an unsupported array type.")
+    elements = _split_vector_input(
+        raw_value,
+        label,
+        collection_name="array",
+    )
+    literals = [
+        _safe_literal(element_type, element, f"{label} element {index + 1}")
+        for index, element in enumerate(elements)
+    ]
+    storage_name = (
+        f"inktocode_array_{test_index}_{parameter_index}_storage"
+    )
+    declaration = (
+        f"{element_type} {storage_name}[] = "
+        f"{{{', '.join(literals)}}};"
+        if literals
+        else f"{element_type} {storage_name}[1] = {{}};"
+    )
+    return HarnessArgument(
+        expression=storage_name,
+        declarations=(declaration,),
+        array_element_count=len(elements),
+    )
 
 
 def _typed_vector_values(
@@ -445,11 +501,19 @@ def _string_serializer_source() -> str:
 def _build_function_harness(
     code: str,
     function: FunctionSignature,
-    argument_literals: list[list[str]],
+    arguments_by_test: list[list[HarnessArgument]],
 ) -> str:
     cases: list[str] = []
-    for index, literals in enumerate(argument_literals):
-        call = f"{function.name}({', '.join(literals)})"
+    for index, arguments in enumerate(arguments_by_test):
+        declarations = " ".join(
+            declaration
+            for argument in arguments
+            for declaration in argument.declarations
+        )
+        call = (
+            f"{function.name}("
+            f"{', '.join(argument.expression for argument in arguments)})"
+        )
         if function.return_value_type.kind == "void":
             output = f"{call};"
         elif function.return_value_type.kind == "vector":
@@ -463,7 +527,9 @@ def _build_function_harness(
             )
         else:
             output = f"std::cout << {call};"
-        cases.append(f"case {index}: {{ {output} return 0; }}")
+        cases.append(
+            f"case {index}: {{ {declarations} {output} return 0; }}"
+        )
 
     generated_main = "\n".join(
         [
@@ -651,7 +717,7 @@ def run_test_request(
             tests=[],
         )
 
-    argument_literals: list[list[str]] = []
+    arguments_by_test: list[list[HarnessArgument]] = []
     function = None
     if isinstance(request, FunctionRunTestsRequest):
         function = next(
@@ -672,7 +738,7 @@ def run_test_request(
                 ),
                 tests=[],
             )
-        for test in request.tests:
+        for test_index, test in enumerate(request.tests):
             if len(test.arguments) != len(function.parameters):
                 return RunTestsResponse(
                     mode="function",
@@ -696,18 +762,58 @@ def run_test_request(
                         f"{test.name} must provide an expected return value "
                         "for the selected non-void function."
                     )
-                literals = [
-                    _safe_value_literal(
+                prepared_arguments = [
+                    _prepare_argument(
                         parameter.value_type,
                         argument,
                         f"{test.name} argument {parameter.name}",
+                        test_index=test_index,
+                        parameter_index=parameter_index,
                     )
-                    for parameter, argument in zip(
-                        function.parameters,
-                        test.arguments,
-                        strict=True,
+                    for parameter_index, (parameter, argument) in enumerate(
+                        zip(
+                            function.parameters,
+                            test.arguments,
+                            strict=True,
+                        )
                     )
                 ]
+                parameter_indexes = {
+                    parameter.name: index
+                    for index, parameter in enumerate(function.parameters)
+                }
+                for parameter_index, parameter in enumerate(function.parameters):
+                    if parameter.value_type.kind != "array":
+                        continue
+                    size_name = parameter.value_type.size_parameter_name
+                    size_index = (
+                        parameter_indexes.get(size_name)
+                        if size_name is not None
+                        else None
+                    )
+                    if size_index is None:
+                        raise ValueError(
+                            f"{test.name} array {parameter.name} has no "
+                            "validated size parameter."
+                        )
+                    size_value = int(test.arguments[size_index].strip())
+                    if size_value < 0:
+                        raise ValueError(
+                            f"{test.name} size parameter {size_name} "
+                            "cannot be negative."
+                        )
+                    element_count = prepared_arguments[
+                        parameter_index
+                    ].array_element_count
+                    if (
+                        element_count is None
+                        or size_value > element_count
+                    ):
+                        raise ValueError(
+                            f"{test.name} size parameter {size_name} "
+                            f"cannot exceed the {element_count or 0} "
+                            f"provided element(s) for {parameter.name}."
+                        )
                 if not is_void:
                     _safe_value_literal(
                         function.return_value_type,
@@ -722,14 +828,14 @@ def run_test_request(
                     function=_function_response(function),
                     tests=[],
                 )
-            argument_literals.append(literals)
+            arguments_by_test.append(prepared_arguments)
 
     try:
         with tempfile.TemporaryDirectory(prefix="inktocode-tests-") as directory:
             working_directory = Path(directory)
             executable = working_directory / "program"
             source = (
-                _build_function_harness(request.code, function, argument_literals)
+                _build_function_harness(request.code, function, arguments_by_test)
                 if isinstance(request, FunctionRunTestsRequest)
                 and function is not None
                 else request.code

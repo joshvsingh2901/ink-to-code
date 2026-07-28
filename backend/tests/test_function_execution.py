@@ -293,7 +293,7 @@ def test_invalid_argument_values_are_rejected(
     [
         (
             "int first(int *arr) { return arr[0]; }",
-            "not supported",
+            "requires a later integral size parameter",
         ),
         (
             "int identity(int &value) { return value; }",
@@ -343,6 +343,7 @@ def test_mode_endpoint_returns_function_metadata():
                 "scalar_type": "int",
                 "element_type": None,
                 "passing": "value",
+                "size_parameter_name": None,
             },
             "parameters": [
                 {
@@ -354,6 +355,7 @@ def test_mode_endpoint_returns_function_metadata():
                         "scalar_type": "int",
                         "element_type": None,
                         "passing": "value",
+                        "size_parameter_name": None,
                     },
                 },
                 {
@@ -365,6 +367,7 @@ def test_mode_endpoint_returns_function_metadata():
                         "scalar_type": "int",
                         "element_type": None,
                         "passing": "value",
+                        "size_parameter_name": None,
                     },
                 },
             ],
@@ -1007,17 +1010,17 @@ std::string welcome(std::string name) { return shout(greet(name)); }
             "int size(std::string* value) { return value->size(); }",
             "String pointer",
         ),
-        (
-            "int size(char* value) { return 0; }",
-            "Unsupported type",
+            (
+                "int size(char* value) { return 0; }",
+                "Character arrays and pointers",
         ),
         (
             "int size(const char* value) { return 0; }",
             "Unsupported type",
         ),
-        (
-            "int size(char value[]) { return 0; }",
-            "not supported",
+            (
+                "int size(char value[]) { return 0; }",
+                "Character arrays and pointers",
         ),
     ],
 )
@@ -1381,6 +1384,284 @@ def test_void_function_output_limit_is_preserved():
             "void noisy() { while (true) std::cout << "
             "\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; }",
             arguments=[],
+            expected_stdout="",
+        )
+    )
+
+    assert result.tests[0].output_limited is True
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "int values[]",
+        "int values []",
+        "int* values",
+        "int *values",
+    ],
+)
+def test_array_parameter_metadata_links_explicit_size(
+    declaration: str,
+):
+    analysis = analyze_test_mode(
+        f"int sum({declaration}, int size) {{ return size; }}"
+    )
+
+    assert analysis.mode == "function"
+    array_type = analysis.functions[0].parameters[0].value_type
+    assert array_type.kind == "array"
+    assert array_type.display_type == "int[]"
+    assert array_type.element_type == "int"
+    assert array_type.passing == "array_pointer"
+    assert array_type.size_parameter_name == "size"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("element_type", "values", "size", "expected"),
+    [
+        ("int", "[1, 2, 3, 4]", "4", "10"),
+        ("long", "-2, 5, 10", "3", "13"),
+        ("long long", "-3000000000 3000000004", "2", "4"),
+        ("double", "[1.5, -2e0, 3.25]", "3", "2.75"),
+        ("bool", "[true, false, true]", "3", "2"),
+    ],
+)
+def test_supported_numeric_array_types_execute(
+    element_type: str,
+    values: str,
+    size: str,
+    expected: str,
+):
+    accumulator_type = "double" if element_type == "double" else "long long"
+    source = (
+        f"{accumulator_type} sum({element_type} values[], int size) {{\n"
+        f"    {accumulator_type} total = 0;\n"
+        "    for (int index = 0; index < size; ++index) total += values[index];\n"
+        "    return total;\n"
+        "}"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[values, size],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_pointer_spelling_executes_with_local_array_storage():
+    result = run_test_request(
+        vector_request(
+            "int maximum(int* values, int count) "
+            "{ int result = values[0]; "
+            "for (int i = 1; i < count; ++i) "
+            "if (values[i] > result) result = values[i]; return result; }",
+            arguments=["[4, 9, 2]", "3"],
+            expected_return="9",
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("values", "size", "expected"),
+    [
+        ("[]", "0", "0"),
+        ("[1, 2, 3, 4]", "3", "6"),
+        ("[1, 2, 3, 4]", "4", "10"),
+    ],
+)
+def test_array_size_zero_smaller_and_equal_are_supported(
+    values: str,
+    size: str,
+    expected: str,
+):
+    result = run_test_request(
+        vector_request(
+            "int sum(int values[], int size) "
+            "{ int total = 0; for (int i = 0; i < size; ++i) "
+            "total += values[i]; return total; }",
+            arguments=[values, size],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("values", "size", "message"),
+    [
+        ("[1, 2]", "5", "cannot exceed"),
+        ("[1, 2]", "-1", "cannot be negative"),
+        ("[1,,2]", "2", "empty array element"),
+        ("[1, 2.5]", "2", "signed decimal int"),
+        ("[foo()]", "1", "not C++ expressions"),
+        ("[1 + dangerousCall()]", "1", "not C++ expressions"),
+    ],
+)
+def test_invalid_array_values_and_sizes_are_rejected_before_compilation(
+    values: str,
+    size: str,
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        vector_request(
+            "int sum(int values[], int size) { return size; }",
+            arguments=[values, size],
+            expected_return="0",
+        )
+    )
+
+    assert result.input_error
+    assert message in result.input_error
+    assert invoked is False
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_array_with_additional_scalar_parameter_executes():
+    result = run_test_request(
+        vector_request(
+            "bool contains(int values[], int length, int target) "
+            "{ for (int i = 0; i < length; ++i) "
+            "if (values[i] == target) return true; return false; }",
+            arguments=["[3, 7, 9]", "3", "7"],
+            expected_return="true",
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_array_function_captures_stdout():
+    result = run_test_request(
+        void_request(
+            "#include <iostream>\n"
+            "void printValues(int values[], int size) "
+            "{ for (int i = 0; i < size; ++i) "
+            "std::cout << values[i] << ' '; }",
+            arguments=["[1, 2, 3]", "3"],
+            expected_stdout="1 2 3",
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].match_type == "whitespace_normalized"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_multiple_array_targets_and_helpers_remain_supported():
+    source = """
+int sum(int values[], int size)
+{
+    int total = 0;
+    for (int index = 0; index < size; ++index) total += values[index];
+    return total;
+}
+int average(int values[], int size)
+{
+    return sum(values, size) / size;
+}
+""".strip()
+    analysis = analyze_test_mode(source)
+    assert [function.name for function in analysis.functions] == [
+        "sum",
+        "average",
+    ]
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=["[2, 4, 6]", "3"],
+            expected_return="4",
+            target_index=1,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "int sum(int values[]) { return 0; }",
+            "requires a later integral size parameter",
+        ),
+        (
+            "int f(int* values, int size, long count) { return 0; }",
+            "ambiguous size parameter",
+        ),
+        (
+            "int f(int* values, int x, int y) { return 0; }",
+            "requires a later integral size parameter",
+        ),
+        (
+            "int f(int** values, int size) { return 0; }",
+            "Pointer-to-pointer",
+        ),
+        (
+            "int f(int values[][], int size) { return 0; }",
+            "Multidimensional",
+        ),
+        (
+            "int f(char values[], int size) { return 0; }",
+            "Character arrays",
+        ),
+        (
+            "int* values() { return nullptr; }",
+            "Pointer return",
+        ),
+    ],
+)
+def test_unsupported_array_signatures_have_clear_messages(
+    source: str,
+    message: str,
+):
+    analysis = analyze_test_mode(source)
+
+    assert analysis.mode == "unsupported"
+    assert analysis.message
+    assert message in analysis.message
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_array_function_runtime_timeout_is_preserved():
+    result = run_test_request(
+        vector_request(
+            "int spin(int values[], int size) "
+            "{ while (true) {} return values[size]; }",
+            arguments=["[]", "0"],
+            expected_return="0",
+        ),
+        test_timeout_seconds=0.05,
+    )
+
+    assert result.tests[0].timed_out is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_array_void_function_output_limit_is_preserved():
+    result = run_test_request(
+        void_request(
+            "#include <iostream>\n"
+            "void noisy(int values[], int size) "
+            "{ while (true) std::cout << values[0]; }",
+            arguments=["[1]", "1"],
             expected_stdout="",
         )
     )

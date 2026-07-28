@@ -4,11 +4,12 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class FunctionTypeResponse(BaseModel):
-    kind: Literal["scalar", "vector", "void"]
+    kind: Literal["scalar", "vector", "array", "void"]
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
-    passing: Literal["value", "const_reference"]
+    passing: Literal["value", "const_reference", "array_pointer"]
+    size_parameter_name: str | None = None
 
 
 class FunctionParameterResponse(BaseModel):

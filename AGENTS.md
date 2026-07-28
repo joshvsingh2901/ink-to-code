@@ -363,3 +363,14 @@ The expected request should contain the current source code in structured JSON, 
 - Vector results must use deterministic serialization for comparison.
 - Generated harness code must never modify the Monaco source.
 - Full-program stdin/stdout testing and scalar function testing must remain unchanged.
+
+## String function testing
+
+- Function-mode tests may support `std::string` and `std::vector<std::string>`.
+- String arguments are data, never arbitrary C++ expressions.
+- Strings must support spaces and escaped quotes safely.
+- Vector-of-string inputs must use a clear quoted format such as `["hello", "world"]`.
+- String and vector-of-string returns must use deterministic serialization.
+- Generated harness code must escape string literals safely.
+- Full-program, scalar, and existing vector testing must remain unchanged.
+- Character arrays and raw C strings are not supported in this stage.

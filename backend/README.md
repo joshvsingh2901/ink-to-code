@@ -78,6 +78,18 @@ to safe literals before harness generation. Results use canonical
 numeric tolerance. Nested vectors, unsupported element types, vector pointers,
 non-const references, and mutation-through-void signatures are not supported.
 
+Function mode supports `std::string` and one-dimensional
+`std::vector<std::string>` parameters by value or const reference, with returns
+by value. A scalar string field is the complete string value and does not
+require C++ quotation marks. String vectors require JSON-style quoted-list
+syntax such as `["hello", "hello world"]`; `[]` is empty. Quotes, backslashes,
+newlines, tabs, carriage returns, and control bytes are escaped before safe C++
+literals are generated. Scalar strings compare exact contents.
+`vector<string>` results serialize canonically as `["hello", "world"]` and
+compare exact element contents, order, and length. Character pointers, character
+arrays, string pointers, non-const references, nested vectors, and void mutation
+functions remain unsupported.
+
 The test runner compiles with a fixed argument list, runs only after an explicit
 request, and uses a unique temporary directory that is deleted afterward.
 Generated harness code exists only in that directory and never changes the

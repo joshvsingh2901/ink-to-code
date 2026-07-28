@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 SUPPORTED_SCALAR_TYPES = {"int", "long", "long long", "double", "bool"}
+STRING_TYPE = "std::string"
 
 
 @dataclass(frozen=True)
@@ -16,7 +17,12 @@ class ValueType:
     @property
     def canonical_type(self) -> str:
         if self.kind == "scalar":
-            return self.scalar_type or self.display_type
+            base = self.scalar_type or self.display_type
+            return (
+                f"const {base}&"
+                if self.passing == "const_reference"
+                else base
+            )
         base = f"std::vector<{self.element_type}>"
         return (
             f"const {base}&"
@@ -73,6 +79,7 @@ class FunctionAnalysis:
 _FUNCTION_DEFINITION = re.compile(
     r"(?P<return_type>"
     r"(?:const\s+)?(?:std::)?vector\s*<[^<>]+>\s*(?:const\s*)?[&*]?"
+    r"|(?:const\s+)?(?:std::)?string\s*(?:const\s*)?[&*]?"
     r"|[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*"
     r")\s+(?P<name>[A-Za-z_]\w*)\s*"
     r"\((?P<parameters>[^()]*)\)\s*(?:noexcept\s*)?\{",
@@ -83,6 +90,11 @@ _PARAMETER_DECLARATION = re.compile(
 _VECTOR_TYPE = re.compile(
     r"(?P<prefix_const>const\s+)?"
     r"(?P<qualified>std::)?vector\s*<\s*(?P<element>[^<>]+)\s*>\s*"
+    r"(?P<suffix_const>const\s*)?(?P<modifier>[&*])?"
+)
+_STRING_TYPE = re.compile(
+    r"(?P<prefix_const>const\s+)?"
+    r"(?P<qualified>std::)?string\s*"
     r"(?P<suffix_const>const\s*)?(?P<modifier>[&*])?"
 )
 
@@ -174,6 +186,48 @@ def _parse_value_type(
             None,
         )
 
+    string_match = _STRING_TYPE.fullmatch(normalized)
+    if string_match is not None:
+        if (
+            string_match.group("qualified") is None
+            and not unqualified_vector_allowed
+        ):
+            return (
+                None,
+                "Unqualified string types require `using namespace std;`.",
+            )
+        modifier = string_match.group("modifier")
+        is_const = bool(
+            string_match.group("prefix_const")
+            or string_match.group("suffix_const")
+        )
+        if modifier == "*":
+            return None, "String pointer parameters and returns are unsupported."
+        if modifier == "&":
+            if not allow_reference:
+                return None, "String return values must be returned by value."
+            if not is_const:
+                return None, "Non-const string reference parameters are unsupported."
+            passing: Literal["value", "const_reference"] = "const_reference"
+        else:
+            if is_const and not allow_reference:
+                return None, "String return values must be returned by value."
+            passing = "value"
+        display_type = (
+            f"const {STRING_TYPE}&"
+            if passing == "const_reference"
+            else STRING_TYPE
+        )
+        return (
+            ValueType(
+                kind="scalar",
+                display_type=display_type,
+                scalar_type=STRING_TYPE,
+                passing=passing,
+            ),
+            None,
+        )
+
     vector_match = _VECTOR_TYPE.fullmatch(normalized)
     if vector_match is None:
         if "vector" in normalized:
@@ -185,11 +239,23 @@ def _parse_value_type(
             None,
             "Unqualified vector types require `using namespace std;`.",
         )
-    element_type = " ".join(vector_match.group("element").split())
-    if element_type not in SUPPORTED_SCALAR_TYPES:
+    raw_element_type = " ".join(vector_match.group("element").split())
+    if raw_element_type in SUPPORTED_SCALAR_TYPES:
+        element_type = raw_element_type
+    elif raw_element_type in {"string", STRING_TYPE}:
+        if (
+            raw_element_type == "string"
+            and not unqualified_vector_allowed
+        ):
+            return (
+                None,
+                "Unqualified string types require `using namespace std;`.",
+            )
+        element_type = STRING_TYPE
+    else:
         return (
             None,
-            f"Unsupported vector element type: {element_type}.",
+            f"Unsupported vector element type: {raw_element_type}.",
         )
     modifier = vector_match.group("modifier")
     is_const = bool(

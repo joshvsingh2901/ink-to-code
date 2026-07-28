@@ -1,4 +1,5 @@
 import ctypes
+import json
 import math
 import re
 import subprocess
@@ -26,6 +27,7 @@ from app.services.compiler import (
 from app.services.function_analysis import (
     FunctionAnalysis,
     FunctionSignature,
+    STRING_TYPE,
     ValueType,
     analyze_test_mode,
 )
@@ -202,6 +204,9 @@ def _integer_bounds(c_type: type[ctypes._SimpleCData]) -> tuple[int, int]:
 
 
 def _safe_literal(type_name: str, raw_value: str, label: str) -> str:
+    if type_name == STRING_TYPE:
+        return _cpp_string_literal(raw_value)
+
     value = raw_value.strip()
     if type_name == "bool":
         if value not in {"true", "false"}:
@@ -239,6 +244,41 @@ def _safe_literal(type_name: str, raw_value: str, label: str) -> str:
     raise ValueError(f"{label} uses an unsupported type.")
 
 
+def _cpp_string_literal(value: str) -> str:
+    escaped: list[str] = []
+    replacements = {
+        "\\": "\\\\",
+        '"': '\\"',
+        "\n": "\\n",
+        "\t": "\\t",
+        "\r": "\\r",
+    }
+    for character in value:
+        if character in replacements:
+            escaped.append(replacements[character])
+        elif ord(character) < 32 or ord(character) == 127:
+            escaped.append(f"\\{ord(character):03o}")
+        else:
+            escaped.append(character)
+    return f'"{"".join(escaped)}"'
+
+
+def _parse_string_vector(raw_value: str, label: str) -> list[str]:
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f'{label} must be a quoted list such as ["hello", "world"].'
+        ) from error
+    if not isinstance(parsed, list) or not all(
+        isinstance(element, str) for element in parsed
+    ):
+        raise ValueError(
+            f'{label} must contain only quoted strings, such as ["hello", "world"].'
+        )
+    return parsed
+
+
 def _split_vector_input(raw_value: str, label: str) -> list[str]:
     value = raw_value.strip()
     if not value:
@@ -273,7 +313,11 @@ def _vector_literal(
     element_type = value_type.element_type
     if element_type is None:
         raise ValueError(f"{label} uses an unsupported vector type.")
-    elements = _split_vector_input(raw_value, label)
+    elements = (
+        _parse_string_vector(raw_value, label)
+        if element_type == STRING_TYPE
+        else _split_vector_input(raw_value, label)
+    )
     literals = [
         _safe_literal(element_type, element, f"{label} element {index + 1}")
         for index, element in enumerate(elements)
@@ -297,14 +341,21 @@ def _typed_vector_values(
     value_type: ValueType,
     raw_value: str,
     label: str,
-) -> list[int | float | bool]:
+) -> list[int | float | bool | str]:
     element_type = value_type.element_type
     if element_type is None:
         raise ValueError(f"{label} uses an unsupported vector type.")
-    values: list[int | float | bool] = []
-    for index, element in enumerate(_split_vector_input(raw_value, label)):
+    values: list[int | float | bool | str] = []
+    elements = (
+        _parse_string_vector(raw_value, label)
+        if element_type == STRING_TYPE
+        else _split_vector_input(raw_value, label)
+    )
+    for index, element in enumerate(elements):
         _safe_literal(element_type, element, f"{label} element {index + 1}")
-        if element_type == "bool":
+        if element_type == STRING_TYPE:
+            values.append(element)
+        elif element_type == "bool":
             values.append(element.strip() == "true")
         elif element_type == "double":
             values.append(float(element.strip()))
@@ -335,7 +386,12 @@ def _classify_vector_match(
 def _vector_output(function: FunctionSignature, call: str) -> str:
     element_type = function.return_value_type.element_type
     value_output = "inktocode_result[inktocode_index]"
-    if element_type == "bool":
+    if element_type == STRING_TYPE:
+        value_output = (
+            "inktocode_write_quoted_string("
+            "inktocode_result[inktocode_index])"
+        )
+    elif element_type == "bool":
         value_output = f"std::boolalpha << {value_output}"
     elif element_type == "double":
         value_output = (
@@ -349,9 +405,38 @@ def _vector_output(function: FunctionSignature, call: str) -> str:
             "inktocode_index < inktocode_result.size();",
             "++inktocode_index) {",
             'if (inktocode_index != 0) std::cout << ", ";',
-            f"std::cout << {value_output};",
+            (
+                f"{value_output};"
+                if element_type == STRING_TYPE
+                else f"std::cout << {value_output};"
+            ),
             "}",
             'std::cout << "]";',
+        ]
+    )
+
+
+def _string_serializer_source() -> str:
+    return "\n".join(
+        [
+            "static void inktocode_write_quoted_string("
+            "const std::string& inktocode_value)",
+            "{",
+            "    std::cout << '\"';",
+            "    for (char inktocode_character : inktocode_value)",
+            "    {",
+            "        switch (inktocode_character)",
+            "        {",
+            "            case '\\\\': std::cout << \"\\\\\\\\\"; break;",
+            "            case '\"': std::cout << \"\\\\\\\"\"; break;",
+            "            case '\\n': std::cout << \"\\\\n\"; break;",
+            "            case '\\t': std::cout << \"\\\\t\"; break;",
+            "            case '\\r': std::cout << \"\\\\r\"; break;",
+            "            default: std::cout << inktocode_character; break;",
+            "        }",
+            "    }",
+            "    std::cout << '\"';",
+            "}",
         ]
     )
 
@@ -394,8 +479,10 @@ def _build_function_harness(
     return (
         "#include <iomanip>\n"
         "#include <iostream>\n\n"
+        "#include <string>\n"
         "#include <vector>\n\n"
         f"{code}\n\n"
+        f"{_string_serializer_source()}\n\n"
         f"{generated_main}\n"
     )
 
@@ -465,6 +552,12 @@ def _function_results(
                 output.stdout,
             )
             if function.return_value_type.kind == "vector"
+            else (
+                "exact"
+                if test.expected_return == output.stdout
+                else "mismatch"
+            )
+            if function.return_value_type.scalar_type == STRING_TYPE
             else _classify_output_match(
                 test.expected_return,
                 output.stdout,

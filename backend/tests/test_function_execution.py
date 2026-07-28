@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 from pathlib import Path
 
@@ -664,7 +665,7 @@ def test_invalid_expected_vector_is_rejected_before_compilation(monkeypatch):
             "Vector pointer",
         ),
         (
-            "std::vector<std::string> values() { return {}; }",
+            "std::vector<float> values() { return {}; }",
             "Unsupported vector element",
         ),
     ],
@@ -710,6 +711,333 @@ int averageRounded(std::vector<int> values)
     )
 
     assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("declaration", "passing"),
+    [
+        ("std::string text", "value"),
+        ("const std::string& text", "const_reference"),
+        ("std::string const& text", "const_reference"),
+    ],
+)
+def test_string_parameter_metadata_is_structured(
+    declaration: str,
+    passing: str,
+):
+    analysis = analyze_test_mode(
+        f"#include <string>\nstd::string identity({declaration}) "
+        "{ return text; }"
+    )
+
+    assert analysis.mode == "function"
+    parameter = analysis.functions[0].parameters[0].value_type
+    assert parameter.kind == "scalar"
+    assert parameter.scalar_type == "std::string"
+    assert parameter.passing == passing
+    assert analysis.functions[0].return_value_type.scalar_type == "std::string"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "passing"),
+    [
+        ("std::vector<std::string> words", "value"),
+        ("const std::vector<std::string>& words", "const_reference"),
+        ("std::vector<std::string> const& words", "const_reference"),
+    ],
+)
+def test_string_vector_parameter_metadata_is_structured(
+    declaration: str,
+    passing: str,
+):
+    analysis = analyze_test_mode(
+        "#include <string>\n#include <vector>\n"
+        f"std::vector<std::string> identity({declaration}) "
+        "{ return words; }"
+    )
+
+    assert analysis.mode == "function"
+    parameter = analysis.functions[0].parameters[0].value_type
+    assert parameter.kind == "vector"
+    assert parameter.element_type == "std::string"
+    assert parameter.passing == passing
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Josh Singh",
+        "",
+        'He said "hello"',
+        "path\\name",
+        "first\nsecond\tvalue\rcarriage",
+    ],
+)
+def test_string_parameter_and_return_preserve_exact_contents(value: str):
+    source = (
+        "#include <string>\n"
+        "std::string identity(std::string value) { return value; }"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[value],
+            expected_return=value,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_return == value
+    assert result.tests[0].match_type == "exact"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("argument", "expected", "actual"),
+    [
+        (
+            '["hello", "world"]',
+            '["hello", "world"]',
+            '["hello", "world"]',
+        ),
+        ("[]", "[]", "[]"),
+        (
+            '["hello world", "second,value"]',
+            '["hello world", "second,value"]',
+            '["hello world", "second,value"]',
+        ),
+        (
+            r'["a quote: \"hello\"", "path\\name"]',
+            r'["a quote: \"hello\"", "path\\name"]',
+            r'["a quote: \"hello\"", "path\\name"]',
+        ),
+    ],
+)
+def test_string_vector_parameter_and_return_use_canonical_serialization(
+    argument: str,
+    expected: str,
+    actual: str,
+):
+    source = (
+        "#include <string>\n#include <vector>\n"
+        "std::vector<std::string> identity("
+        "std::vector<std::string> words) { return words; }"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[argument],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_return == actual
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[hello, world]",
+        '["hello",]',
+        '["unterminated]',
+        '["a" "b"]',
+        '"hello"',
+        "[1, 2]",
+    ],
+)
+def test_malformed_string_vector_is_rejected_before_compilation(
+    value: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        vector_request(
+            "#include <string>\n#include <vector>\n"
+            "std::vector<std::string> identity("
+            "std::vector<std::string> words) { return words; }",
+            arguments=[value],
+            expected_return="[]",
+        )
+    )
+
+    assert result.input_error
+    assert "quoted" in result.input_error
+    assert invoked is False
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("hello  world", "hello world"),
+        ("Hello", "hello"),
+        ("hello!", "hello."),
+    ],
+)
+def test_scalar_string_comparison_is_exact(expected: str, actual: str):
+    source = (
+        "#include <string>\n"
+        f"std::string value() {{ return {json.dumps(actual)}; }}"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].match_type == "mismatch"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    "expected",
+    [
+        '["world", "hello"]',
+        '["hello"]',
+        '["hello  world"]',
+    ],
+)
+def test_string_vector_order_length_and_internal_spaces_matter(expected: str):
+    source = (
+        "#include <string>\n#include <vector>\n"
+        "std::vector<std::string> values() "
+        '{ return {"hello world", "world"}; }'
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].match_type == "mismatch"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_mixed_string_and_scalar_parameters_execute():
+    source = """
+#include <string>
+std::string repeat(std::string value, int count)
+{
+    std::string result;
+    for (int index = 0; index < count; ++index) result += value;
+    return result;
+}
+""".strip()
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=["ab", "3"],
+            expected_return="ababab",
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_multiple_string_functions_and_helper_calls_remain_supported():
+    source = """
+#include <string>
+std::string greet(std::string name) { return "Hello, " + name; }
+std::string shout(std::string text) { return text + "!"; }
+std::string welcome(std::string name) { return shout(greet(name)); }
+""".strip()
+    analysis = analyze_test_mode(source)
+    assert [function.name for function in analysis.functions] == [
+        "greet",
+        "shout",
+        "welcome",
+    ]
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=["Josh"],
+            expected_return="Hello, Josh!",
+            target_index=2,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "int size(std::string& value) { return value.size(); }",
+            "Non-const string reference",
+        ),
+        (
+            "int size(std::string* value) { return value->size(); }",
+            "String pointer",
+        ),
+        (
+            "int size(char* value) { return 0; }",
+            "Unsupported type",
+        ),
+        (
+            "int size(const char* value) { return 0; }",
+            "Unsupported type",
+        ),
+        (
+            "int size(char value[]) { return 0; }",
+            "not supported",
+        ),
+    ],
+)
+def test_unsupported_string_signatures_are_rejected(
+    source: str,
+    message: str,
+):
+    analysis = analyze_test_mode(source)
+
+    assert analysis.mode == "unsupported"
+    assert analysis.message
+    assert message in analysis.message
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_string_function_runtime_timeout_is_preserved():
+    result = run_test_request(
+        vector_request(
+            "#include <string>\n"
+            "std::string spin(std::string value) "
+            "{ while (true) {} return value; }",
+            arguments=["value"],
+            expected_return="value",
+        ),
+        test_timeout_seconds=0.05,
+    )
+
+    assert result.tests[0].timed_out is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_string_function_output_limit_is_preserved():
+    result = run_test_request(
+        vector_request(
+            "#include <string>\n"
+            "std::string huge() { return std::string(100000, 'x'); }",
+            arguments=[],
+            expected_return="",
+        )
+    )
+
+    assert result.tests[0].output_limited is True
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")

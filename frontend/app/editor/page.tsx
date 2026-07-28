@@ -1209,7 +1209,10 @@ export default function EditorPage() {
                                         placeholder={
                                           parameter.type_metadata.kind ===
                                           "vector"
-                                            ? "[1, 2, 3]"
+                                            ? parameter.type_metadata
+                                                .element_type === "std::string"
+                                              ? '["hello", "world"]'
+                                              : "[1, 2, 3]"
                                             : undefined
                                         }
                                         onChange={(event) =>
@@ -1224,7 +1227,10 @@ export default function EditorPage() {
                                       {parameter.type_metadata.kind ===
                                         "vector" && (
                                         <p className="mt-1 text-[11px] text-slate-500">
-                                          Enter values like [1, 2, 3]
+                                          {parameter.type_metadata
+                                            .element_type === "std::string"
+                                            ? 'Enter values like ["hello", "world"]'
+                                            : "Enter values like [1, 2, 3]"}
                                         </p>
                                       )}
                                     </div>
@@ -1250,7 +1256,10 @@ export default function EditorPage() {
                               placeholder={
                                 selectedFunction.return_type_metadata.kind ===
                                 "vector"
-                                  ? "[1, 2, 3]"
+                                  ? selectedFunction.return_type_metadata
+                                      .element_type === "std::string"
+                                    ? '["hello", "world"]'
+                                    : "[1, 2, 3]"
                                   : undefined
                               }
                               maxLength={1_000}
@@ -1266,7 +1275,10 @@ export default function EditorPage() {
                             {selectedFunction.return_type_metadata.kind ===
                               "vector" && (
                               <p className="mt-1 text-[11px] text-slate-500">
-                                Enter values like [1, 2, 3]
+                                {selectedFunction.return_type_metadata
+                                  .element_type === "std::string"
+                                  ? 'Enter values like ["hello", "world"]'
+                                  : "Enter values like [1, 2, 3]"}
                               </p>
                             )}
                           </>

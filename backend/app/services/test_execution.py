@@ -11,6 +11,7 @@ from pathlib import Path
 from app.schemas.test_execution import (
     FunctionResponse,
     FunctionRunTestsRequest,
+    FunctionOutputTestResult,
     FunctionTestResult,
     FunctionTypeResponse,
     ProgramRunTestsRequest,
@@ -449,7 +450,9 @@ def _build_function_harness(
     cases: list[str] = []
     for index, literals in enumerate(argument_literals):
         call = f"{function.name}({', '.join(literals)})"
-        if function.return_value_type.kind == "vector":
+        if function.return_value_type.kind == "void":
+            output = f"{call};"
+        elif function.return_value_type.kind == "vector":
             output = _vector_output(function, call)
         elif function.return_type == "bool":
             output = f"std::cout << std::boolalpha << {call};"
@@ -536,8 +539,8 @@ def _function_results(
     function: FunctionSignature,
     *,
     timeout_seconds: float,
-) -> list[FunctionTestResult]:
-    results: list[FunctionTestResult] = []
+) -> list[FunctionTestResult | FunctionOutputTestResult]:
+    results: list[FunctionTestResult | FunctionOutputTestResult] = []
     for index, test in enumerate(request.tests):
         output = _run_process(
             executable,
@@ -545,21 +548,55 @@ def _function_results(
             f"{index}\n",
             timeout_seconds=timeout_seconds,
         )
+        if function.return_value_type.kind == "void":
+            expected_stdout = test.expected_stdout
+            if expected_stdout is None:
+                raise ValueError("Void function tests require expected_stdout.")
+            match_type = _classify_program_output_match(
+                expected_stdout,
+                output.stdout,
+                request.comparison_mode,
+            )
+            passed = (
+                not output.timed_out
+                and not output.output_limited
+                and output.exit_code == 0
+                and match_type not in {"formatting_mismatch", "mismatch"}
+            )
+            results.append(
+                FunctionOutputTestResult(
+                    name=test.name,
+                    passed=passed,
+                    arguments=test.arguments,
+                    expected_stdout=expected_stdout,
+                    actual_stdout=output.stdout,
+                    stderr=output.stderr,
+                    exit_code=output.exit_code,
+                    timed_out=output.timed_out,
+                    output_limited=output.output_limited,
+                    match_type=match_type,
+                )
+            )
+            continue
+
+        expected_return = test.expected_return
+        if expected_return is None:
+            raise ValueError("Non-void function tests require expected_return.")
         match_type = (
             _classify_vector_match(
                 function.return_value_type,
-                test.expected_return,
+                expected_return,
                 output.stdout,
             )
             if function.return_value_type.kind == "vector"
             else (
                 "exact"
-                if test.expected_return == output.stdout
+                if expected_return == output.stdout
                 else "mismatch"
             )
             if function.return_value_type.scalar_type == STRING_TYPE
             else _classify_output_match(
-                test.expected_return,
+                expected_return,
                 output.stdout,
             )
         )
@@ -574,7 +611,7 @@ def _function_results(
                 name=test.name,
                 passed=passed,
                 arguments=test.arguments,
-                expected_return=test.expected_return,
+                expected_return=expected_return,
                 actual_return=output.stdout,
                 stderr=output.stderr,
                 exit_code=output.exit_code,
@@ -648,6 +685,17 @@ def run_test_request(
                     tests=[],
                 )
             try:
+                is_void = function.return_value_type.kind == "void"
+                if is_void and test.expected_stdout is None:
+                    raise ValueError(
+                        f"{test.name} must provide expected output for "
+                        "the selected void function."
+                    )
+                if not is_void and test.expected_return is None:
+                    raise ValueError(
+                        f"{test.name} must provide an expected return value "
+                        "for the selected non-void function."
+                    )
                 literals = [
                     _safe_value_literal(
                         parameter.value_type,
@@ -660,11 +708,12 @@ def run_test_request(
                         strict=True,
                     )
                 ]
-                _safe_value_literal(
-                    function.return_value_type,
-                    test.expected_return,
-                    f"{test.name} expected return",
-                )
+                if not is_void:
+                    _safe_value_literal(
+                        function.return_value_type,
+                        test.expected_return or "",
+                        f"{test.name} expected return",
+                    )
             except ValueError as error:
                 return RunTestsResponse(
                     mode="function",

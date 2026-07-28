@@ -1,10 +1,10 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FunctionTypeResponse(BaseModel):
-    kind: Literal["scalar", "vector"]
+    kind: Literal["scalar", "vector", "void"]
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
@@ -46,7 +46,20 @@ class ProgramTestCase(BaseModel):
 class FunctionTestCase(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     arguments: list[str] = Field(max_length=20)
-    expected_return: str = Field(max_length=1_000)
+    expected_return: str | None = Field(default=None, max_length=1_000)
+    expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
+
+    @model_validator(mode="after")
+    def validate_expected_value(self) -> "FunctionTestCase":
+        supplied = sum(
+            value is not None
+            for value in (self.expected_return, self.expected_stdout)
+        )
+        if supplied != 1:
+            raise ValueError(
+                "Provide exactly one of expected_return or expected_stdout."
+            )
+        return self
 
 
 class ProgramRunTestsRequest(BaseModel):
@@ -64,6 +77,9 @@ class FunctionRunTestsRequest(BaseModel):
     code: str = Field(min_length=1, max_length=1_000_000)
     language: Literal["cpp"]
     target_function: str = Field(min_length=1, max_length=300)
+    comparison_mode: Literal["whitespace_tolerant", "exact"] = (
+        "whitespace_tolerant"
+    )
     tests: list[FunctionTestCase] = Field(min_length=1, max_length=10)
 
 
@@ -103,6 +119,24 @@ class FunctionTestResult(BaseModel):
     match_type: Literal["exact", "whitespace_normalized", "mismatch"]
 
 
+class FunctionOutputTestResult(BaseModel):
+    name: str
+    passed: bool
+    arguments: list[str]
+    expected_stdout: str
+    actual_stdout: str
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    output_limited: bool
+    match_type: Literal[
+        "exact",
+        "whitespace_normalized",
+        "formatting_mismatch",
+        "mismatch",
+    ]
+
+
 class RunTestsResponse(BaseModel):
     mode: Literal["program", "function", "unsupported"]
     success: bool
@@ -110,4 +144,6 @@ class RunTestsResponse(BaseModel):
     input_error: str | None = None
     unsupported_error: str | None = None
     function: FunctionResponse | None = None
-    tests: list[ProgramTestResult | FunctionTestResult]
+    tests: list[
+        FunctionTestResult | FunctionOutputTestResult | ProgramTestResult
+    ]

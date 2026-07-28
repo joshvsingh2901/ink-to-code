@@ -53,9 +53,9 @@ full program, a supported function-only submission, or unsupported. `POST
 tests provide standard input and expected standard output. Function tests
 provide one scalar value per parameter and an expected return value.
 
-Function mode conservatively supports top-level functions with a non-void
-`int`, `long`, `long long`, `double`, or `bool` return and zero or more named
-parameters using those same scalar types. One detected function is selected
+Function mode conservatively supports top-level functions returning `void`,
+`int`, `long`, `long long`, `double`, or `bool`, with zero or more named
+parameters using the supported scalar, string, or vector types. One detected function is selected
 automatically. When several supported functions are present, the frontend
 requires an explicit target selection and the backend validates that target
 against the submitted source. The harness calls only the selected target while
@@ -89,6 +89,14 @@ literals are generated. Scalar strings compare exact contents.
 compare exact element contents, order, and length. Character pointers, character
 arrays, string pointers, non-const references, nested vectors, and void mutation
 functions remain unsupported.
+
+Supported `void` functions are tested through their captured standard output.
+Their test cases use `expected_stdout` instead of `expected_return` and may use
+the same whitespace-tolerant or exact comparison modes as full-program output.
+The harness calls the function without storing or printing a return value.
+Standard error remains separate. Functions whose behavior can only be checked
+through argument mutation remain unsupported because pointer, array, and
+non-const-reference mutation is outside the current test model.
 
 The test runner compiles with a fixed argument list, runs only after an explicit
 request, and uses a unique temporary directory that is deleted afterward.

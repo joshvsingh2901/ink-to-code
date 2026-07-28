@@ -299,10 +299,6 @@ def test_invalid_argument_values_are_rejected(
             "int identity(int &value) { return value; }",
             "not supported",
         ),
-        (
-            "void printValue(int value) {}",
-            "Void returns are unsupported",
-        ),
     ],
 )
 def test_unsupported_or_ambiguous_signatures_are_rejected(
@@ -396,6 +392,32 @@ def vector_request(
                 name="Vector test",
                 arguments=arguments,
                 expected_return=expected_return,
+            )
+        ],
+    )
+
+
+def void_request(
+    code: str,
+    *,
+    arguments: list[str],
+    expected_stdout: str,
+    comparison_mode: str = "whitespace_tolerant",
+    target_index: int = 0,
+) -> FunctionRunTestsRequest:
+    analysis = analyze_test_mode(code)
+    assert analysis.mode == "function"
+    return FunctionRunTestsRequest(
+        mode="function",
+        code=code,
+        language="cpp",
+        target_function=analysis.functions[target_index].id,
+        comparison_mode=comparison_mode,
+        tests=[
+            FunctionTestCase(
+                name="Void output test",
+                arguments=arguments,
+                expected_stdout=expected_stdout,
             )
         ],
     )
@@ -1034,6 +1056,332 @@ def test_string_function_output_limit_is_preserved():
             "std::string huge() { return std::string(100000, 'x'); }",
             arguments=[],
             expected_return="",
+        )
+    )
+
+    assert result.tests[0].output_limited is True
+
+
+def test_void_function_metadata_is_detected():
+    analysis = analyze_test_mode(
+        "void printDouble(int value) { (void)value; }"
+    )
+
+    assert analysis.mode == "function"
+    assert analysis.functions[0].return_type == "void"
+    assert analysis.functions[0].return_value_type.kind == "void"
+    assert analysis.functions[0].id == "printDouble(int)->void"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("source", "arguments", "expected"),
+    [
+        (
+            "#include <iostream>\n"
+            "void printDouble(int value) { std::cout << value * 2; }",
+            ["5"],
+            "10",
+        ),
+        (
+            "#include <iostream>\n#include <string>\n"
+            "void greet(std::string name) "
+            '{ std::cout << "Hello, " << name; }',
+            ["Josh Singh"],
+            "Hello, Josh Singh",
+        ),
+        (
+            "#include <iostream>\n"
+            "void values(int first, int second) "
+            "{ std::cout << first << ' ' << second; }",
+            ["2", "3"],
+            "2 3",
+        ),
+        (
+            "#include <iostream>\n"
+            "void lines() { std::cout << \"one\\ntwo\\n\"; }",
+            [],
+            "one\ntwo\n",
+        ),
+        (
+            "void silent() {}",
+            [],
+            "",
+        ),
+    ],
+)
+def test_void_functions_capture_stdout(
+    source: str,
+    arguments: list[str],
+    expected: str,
+):
+    result = run_test_request(
+        void_request(
+            source,
+            arguments=arguments,
+            expected_stdout=expected,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].passed is True
+    assert result.tests[0].actual_stdout == expected
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_output_whitespace_tolerant_comparison():
+    result = run_test_request(
+        void_request(
+            "#include <iostream>\n"
+            "void printValues() { std::cout << \"1  2\\n3 \"; }",
+            arguments=[],
+            expected_stdout="1 2 3",
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].match_type == "whitespace_normalized"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_output_exact_comparison_and_formatting_mismatch():
+    source = (
+        "#include <iostream>\n"
+        "void printValue() { std::cout << \"value\\n\"; }"
+    )
+    exact = run_test_request(
+        void_request(
+            source,
+            arguments=[],
+            expected_stdout="value\n",
+            comparison_mode="exact",
+        )
+    )
+    formatting_mismatch = run_test_request(
+        void_request(
+            source,
+            arguments=[],
+            expected_stdout="value",
+            comparison_mode="exact",
+        )
+    )
+
+    assert exact.success is True
+    assert exact.tests[0].match_type == "exact"
+    assert formatting_mismatch.success is False
+    assert formatting_mismatch.tests[0].match_type == "formatting_mismatch"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_function_preserves_stderr_separately():
+    result = run_test_request(
+        void_request(
+            "#include <iostream>\n"
+            "void report() { std::cerr << \"warning\"; }",
+            arguments=[],
+            expected_stdout="",
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_stdout == ""
+    assert result.tests[0].stderr == "warning"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_function_nonzero_exit_is_reported():
+    result = run_test_request(
+        void_request(
+            "#include <cstdlib>\nvoid stop() { std::exit(7); }",
+            arguments=[],
+            expected_stdout="",
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].exit_code == 7
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("source", "argument", "expected"),
+    [
+        (
+            "#include <iostream>\n#include <vector>\n"
+            "void printValues(const std::vector<int>& values) "
+            "{ for (int value : values) std::cout << value << ' '; }",
+            "[1, 2, 3]",
+            "1 2 3",
+        ),
+        (
+            "#include <iostream>\n#include <string>\n#include <vector>\n"
+            "void printWords(const std::vector<std::string>& words) "
+            "{ for (const auto& word : words) std::cout << word << '\\n'; }",
+            '["hello world", "second"]',
+            "hello world\nsecond",
+        ),
+    ],
+)
+def test_void_functions_accept_supported_vector_arguments(
+    source: str,
+    argument: str,
+    expected: str,
+):
+    result = run_test_request(
+        void_request(
+            source,
+            arguments=[argument],
+            expected_stdout=expected,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_and_non_void_targets_remain_selectable_with_helpers():
+    source = """
+#include <iostream>
+int add(int left, int right) { return left + right; }
+void printSum(int left, int right) { std::cout << add(left, right); }
+""".strip()
+    analysis = analyze_test_mode(source)
+    assert [function.name for function in analysis.functions] == [
+        "add",
+        "printSum",
+    ]
+    result = run_test_request(
+        void_request(
+            source,
+            arguments=["2", "3"],
+            expected_stdout="5",
+            target_index=1,
+        )
+    )
+
+    assert result.success is True
+
+
+def test_expected_return_is_rejected_for_void_target():
+    source = "void printValue(int value) { (void)value; }"
+    analysis = analyze_test_mode(source)
+    result = run_test_request(
+        FunctionRunTestsRequest(
+            mode="function",
+            code=source,
+            language="cpp",
+            target_function=analysis.functions[0].id,
+            tests=[
+                FunctionTestCase(
+                    name="Wrong shape",
+                    arguments=["1"],
+                    expected_return="",
+                )
+            ],
+        )
+    )
+
+    assert result.input_error
+    assert "expected output" in result.input_error
+
+
+def test_expected_stdout_is_rejected_for_non_void_target():
+    source = "int value() { return 1; }"
+    analysis = analyze_test_mode(source)
+    result = run_test_request(
+        FunctionRunTestsRequest(
+            mode="function",
+            code=source,
+            language="cpp",
+            target_function=analysis.functions[0].id,
+            tests=[
+                FunctionTestCase(
+                    name="Wrong shape",
+                    arguments=[],
+                    expected_stdout="1",
+                )
+            ],
+        )
+    )
+
+    assert result.input_error
+    assert "expected return" in result.input_error
+
+
+def test_void_function_test_requires_an_expected_field():
+    response = asyncio.run(
+        api_request(
+            "/api/run-tests",
+            {
+                "mode": "function",
+                "code": "void silent() {}",
+                "language": "cpp",
+                "target_function": "silent()->void",
+                "tests": [{"name": "Missing output", "arguments": []}],
+            },
+        )
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_run_tests_endpoint_returns_void_function_output_shape():
+    response = asyncio.run(
+        api_request(
+            "/api/run-tests",
+            {
+                "mode": "function",
+                "code": (
+                    "#include <iostream>\n"
+                    "void printValue(int value) { std::cout << value; }"
+                ),
+                "language": "cpp",
+                "target_function": "printValue(int)->void",
+                "comparison_mode": "exact",
+                "tests": [
+                    {
+                        "name": "Print",
+                        "arguments": ["5"],
+                        "expected_stdout": "5",
+                    }
+                ],
+            },
+        )
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["function"]["return_type_metadata"]["kind"] == "void"
+    assert body["tests"][0]["arguments"] == ["5"]
+    assert body["tests"][0]["expected_stdout"] == "5"
+    assert body["tests"][0]["actual_stdout"] == "5"
+    assert "expected_return" not in body["tests"][0]
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_function_runtime_timeout_is_preserved():
+    result = run_test_request(
+        void_request(
+            "void spin() { while (true) {} }",
+            arguments=[],
+            expected_stdout="",
+        ),
+        test_timeout_seconds=0.05,
+    )
+
+    assert result.tests[0].timed_out is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_void_function_output_limit_is_preserved():
+    result = run_test_request(
+        void_request(
+            "#include <iostream>\n"
+            "void noisy() { while (true) std::cout << "
+            "\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; }",
+            arguments=[],
+            expected_stdout="",
         )
     )
 

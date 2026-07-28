@@ -374,3 +374,13 @@ The expected request should contain the current source code in structured JSON, 
 - Generated harness code must escape string literals safely.
 - Full-program, scalar, and existing vector testing must remain unchanged.
 - Character arrays and raw C strings are not supported in this stage.
+
+## Void function output testing
+
+- Function-mode tests may support `void` functions that produce output through `stdout`.
+- For supported `void` functions, tests compare captured standard output instead of a return value.
+- The generated harness calls the selected function with validated arguments.
+- The user's source code must remain unchanged.
+- Existing output-comparison modes apply to captured function output.
+- `void` functions that mutate arguments without producing output are not supported in this stage.
+- Non-const reference mutation, pointer mutation, and array mutation remain separate future stages.

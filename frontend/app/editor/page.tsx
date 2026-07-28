@@ -12,6 +12,7 @@ import {
 import {
   analyzeTestMode,
   runCppTests,
+  type FunctionOutputTestResult,
   type FunctionTestResult,
   type ProgramTestResult,
   type RunTestsResult,
@@ -76,7 +77,16 @@ function isPrimaryDiagnostic(
 }
 
 function isFunctionResult(
-  result: ProgramTestResult | FunctionTestResult,
+  result:
+    | ProgramTestResult
+    | FunctionTestResult
+    | FunctionOutputTestResult,
+): result is FunctionTestResult | FunctionOutputTestResult {
+  return "arguments" in result;
+}
+
+function isFunctionReturnResult(
+  result: FunctionTestResult | FunctionOutputTestResult,
 ): result is FunctionTestResult {
   return "expected_return" in result;
 }
@@ -260,6 +270,8 @@ export default function EditorPage() {
                   : [],
                 expected_return:
                   nextId === previousId ? test.expected_return : "",
+                expected_stdout:
+                  nextId === previousId ? test.expected_stdout : "",
               })),
             );
           } else {
@@ -493,13 +505,31 @@ export default function EditorPage() {
               code: currentCode,
               language: "cpp" as const,
               target_function: selectedFunction!.id,
-              tests: testCases.map(
-                ({ name, arguments: argumentValues, expected_return }) => ({
-                  name,
-                  arguments: argumentValues,
-                  expected_return,
-                }),
-              ),
+              comparison_mode: comparisonMode,
+              tests:
+                selectedFunction!.return_type_metadata.kind === "void"
+                  ? testCases.map(
+                      ({
+                        name,
+                        arguments: argumentValues,
+                        expected_stdout,
+                      }) => ({
+                        name,
+                        arguments: argumentValues,
+                        expected_stdout,
+                      }),
+                    )
+                  : testCases.map(
+                      ({
+                        name,
+                        arguments: argumentValues,
+                        expected_return,
+                      }) => ({
+                        name,
+                        arguments: argumentValues,
+                        expected_return,
+                      }),
+                    ),
             }
           : {
               mode: "program" as const,
@@ -603,6 +633,7 @@ export default function EditorPage() {
           ? nextFunction.parameters.map(() => "")
           : [],
         expected_return: "",
+        expected_stdout: "",
       })),
     );
     setTestRunResult(null);
@@ -1077,16 +1108,17 @@ export default function EditorPage() {
                     </div>
                   )}
 
-                  {testMode?.mode === "program" && (
+                  {(testMode?.mode === "program" ||
+                    selectedFunction?.return_type_metadata.kind === "void") && (
                     <div className="mt-3">
                       <label
-                        htmlFor="program-comparison-mode"
+                        htmlFor="output-comparison-mode"
                         className="block text-xs font-medium text-slate-600"
                       >
                         Output comparison
                       </label>
                       <select
-                        id="program-comparison-mode"
+                        id="output-comparison-mode"
                         value={comparisonMode}
                         disabled={isRunningTests}
                         onChange={(event) =>
@@ -1243,43 +1275,74 @@ export default function EditorPage() {
                                 </p>
                               )}
                             </div>
-                            <label
-                              htmlFor={`${test.id}-expected-return`}
-                              className="mt-3 block text-xs font-medium text-slate-600"
-                            >
-                              Expected return —{" "}
-                              {selectedFunction.return_type_metadata.display_type}
-                            </label>
-                            <input
-                              id={`${test.id}-expected-return`}
-                              value={test.expected_return}
-                              placeholder={
-                                selectedFunction.return_type_metadata.kind ===
-                                "vector"
-                                  ? selectedFunction.return_type_metadata
-                                      .element_type === "std::string"
-                                    ? '["hello", "world"]'
-                                    : "[1, 2, 3]"
-                                  : undefined
-                              }
-                              maxLength={1_000}
-                              onChange={(event) =>
-                                updateTestCase(
-                                  test.id,
-                                  "expected_return",
-                                  event.target.value,
-                                )
-                              }
-                              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                            />
                             {selectedFunction.return_type_metadata.kind ===
-                              "vector" && (
-                              <p className="mt-1 text-[11px] text-slate-500">
-                                {selectedFunction.return_type_metadata
-                                  .element_type === "std::string"
-                                  ? 'Enter values like ["hello", "world"]'
-                                  : "Enter values like [1, 2, 3]"}
-                              </p>
+                            "void" ? (
+                              <>
+                                <label
+                                  htmlFor={`${test.id}-expected-output`}
+                                  className="mt-3 block text-xs font-medium text-slate-600"
+                                >
+                                  Expected output
+                                </label>
+                                <textarea
+                                  id={`${test.id}-expected-output`}
+                                  value={test.expected_stdout}
+                                  maxLength={64 * 1024}
+                                  rows={3}
+                                  onChange={(event) =>
+                                    updateTestCase(
+                                      test.id,
+                                      "expected_stdout",
+                                      event.target.value,
+                                    )
+                                  }
+                                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                />
+                              </>
+                            ) : (
+                              <>
+                                <label
+                                  htmlFor={`${test.id}-expected-return`}
+                                  className="mt-3 block text-xs font-medium text-slate-600"
+                                >
+                                  Expected return —{" "}
+                                  {
+                                    selectedFunction.return_type_metadata
+                                      .display_type
+                                  }
+                                </label>
+                                <input
+                                  id={`${test.id}-expected-return`}
+                                  value={test.expected_return}
+                                  placeholder={
+                                    selectedFunction.return_type_metadata
+                                      .kind === "vector"
+                                      ? selectedFunction.return_type_metadata
+                                          .element_type === "std::string"
+                                        ? '["hello", "world"]'
+                                        : "[1, 2, 3]"
+                                      : undefined
+                                  }
+                                  maxLength={1_000}
+                                  onChange={(event) =>
+                                    updateTestCase(
+                                      test.id,
+                                      "expected_return",
+                                      event.target.value,
+                                    )
+                                  }
+                                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                />
+                                {selectedFunction.return_type_metadata.kind ===
+                                  "vector" && (
+                                  <p className="mt-1 text-[11px] text-slate-500">
+                                    {selectedFunction.return_type_metadata
+                                      .element_type === "std::string"
+                                      ? 'Enter values like ["hello", "world"]'
+                                      : "Enter values like [1, 2, 3]"}
+                                  </p>
+                                )}
+                              </>
                             )}
                           </>
                         ) : (
@@ -1453,18 +1516,26 @@ export default function EditorPage() {
                               <div className="grid grid-cols-2 gap-2">
                                 <div>
                                   <p className="text-xs font-medium text-slate-500">
-                                    Expected
+                                    {isFunctionReturnResult(result)
+                                      ? "Expected return"
+                                      : "Expected output"}
                                   </p>
                                   <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs leading-5 text-slate-800">
-                                    {result.expected_return || "(empty)"}
+                                    {(isFunctionReturnResult(result)
+                                      ? result.expected_return
+                                      : result.expected_stdout) || "(empty)"}
                                   </pre>
                                 </div>
                                 <div>
                                   <p className="text-xs font-medium text-slate-500">
-                                    Actual
+                                    {isFunctionReturnResult(result)
+                                      ? "Actual return"
+                                      : "Actual output"}
                                   </p>
                                   <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs leading-5 text-slate-800">
-                                    {result.actual_return || "(empty)"}
+                                    {(isFunctionReturnResult(result)
+                                      ? result.actual_return
+                                      : result.actual_stdout) || "(empty)"}
                                   </pre>
                                 </div>
                               </div>

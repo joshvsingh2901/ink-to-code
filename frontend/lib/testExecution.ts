@@ -5,7 +5,7 @@ export type FunctionParameter = {
 };
 
 export type FunctionTypeMetadata = {
-  kind: "scalar" | "vector";
+  kind: "scalar" | "vector" | "void";
   display_type: string;
   scalar_type: string | null;
   element_type: string | null;
@@ -39,6 +39,12 @@ export type FunctionTestInput = {
   expected_return: string;
 };
 
+export type FunctionOutputTestInput = {
+  name: string;
+  arguments: string[];
+  expected_stdout: string;
+};
+
 type ResultBase = {
   name: string;
   passed: boolean;
@@ -64,6 +70,12 @@ export type FunctionTestResult = ResultBase & {
   actual_return: string;
 };
 
+export type FunctionOutputTestResult = ResultBase & {
+  arguments: string[];
+  expected_stdout: string;
+  actual_stdout: string;
+};
+
 export type RunTestsResult = {
   mode: "program" | "function" | "unsupported";
   success: boolean;
@@ -71,7 +83,9 @@ export type RunTestsResult = {
   input_error: string | null;
   unsupported_error: string | null;
   function: FunctionDescriptor | null;
-  tests: Array<ProgramTestResult | FunctionTestResult>;
+  tests: Array<
+    ProgramTestResult | FunctionTestResult | FunctionOutputTestResult
+  >;
 };
 
 export type RunTestsRequest =
@@ -87,7 +101,8 @@ export type RunTestsRequest =
       code: string;
       language: "cpp";
       target_function: string;
-      tests: FunctionTestInput[];
+      comparison_mode: "whitespace_tolerant" | "exact";
+      tests: Array<FunctionTestInput | FunctionOutputTestInput>;
     };
 
 type ApiError = { error?: { message?: string } };
@@ -126,7 +141,7 @@ function isFunctionTypeMetadata(
   if (!value || typeof value !== "object") return false;
   const metadata = value as Partial<FunctionTypeMetadata>;
   return (
-    ["scalar", "vector"].includes(metadata.kind ?? "") &&
+    ["scalar", "vector", "void"].includes(metadata.kind ?? "") &&
     typeof metadata.display_type === "string" &&
     (metadata.scalar_type === null ||
       typeof metadata.scalar_type === "string") &&
@@ -161,7 +176,10 @@ function isResultBase(value: unknown): value is ResultBase {
 
 function isTestResult(
   value: unknown,
-): value is ProgramTestResult | FunctionTestResult {
+): value is
+  | ProgramTestResult
+  | FunctionTestResult
+  | FunctionOutputTestResult {
   if (!isResultBase(value)) return false;
   const result = value as Partial<ProgramTestResult & FunctionTestResult>;
   const programResult =
@@ -172,7 +190,12 @@ function isTestResult(
     result.arguments.every((argument) => typeof argument === "string") &&
     typeof result.expected_return === "string" &&
     typeof result.actual_return === "string";
-  return programResult || functionResult;
+  const functionOutputResult =
+    Array.isArray(result.arguments) &&
+    result.arguments.every((argument) => typeof argument === "string") &&
+    typeof result.expected_stdout === "string" &&
+    typeof result.actual_stdout === "string";
+  return programResult || functionResult || functionOutputResult;
 }
 
 function isRunTestsResult(value: unknown): value is RunTestsResult {

@@ -8,7 +8,7 @@ STRING_TYPE = "std::string"
 
 @dataclass(frozen=True)
 class ValueType:
-    kind: Literal["scalar", "vector"]
+    kind: Literal["scalar", "vector", "void"]
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
@@ -16,6 +16,8 @@ class ValueType:
 
     @property
     def canonical_type(self) -> str:
+        if self.kind == "void":
+            return "void"
         if self.kind == "scalar":
             base = self.scalar_type or self.display_type
             return (
@@ -339,8 +341,12 @@ def _parse_candidate(
     )
     if return_value_type is None:
         if candidate.group("return_type").strip() == "void":
-            return None, "Void returns are unsupported."
-        return None, error
+            return_value_type = ValueType(
+                kind="void",
+                display_type="void",
+            )
+        else:
+            return None, error
     parameters, error = _parse_parameters(
         candidate.group("parameters"),
         unqualified_vector_allowed=unqualified_vector_allowed,

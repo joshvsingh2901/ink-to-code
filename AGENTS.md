@@ -358,8 +358,8 @@ The expected request should contain the current source code in structured JSON, 
 - The backend must validate and safely convert vector elements into generated C++ literals.
 - The initial vector implementation supports one-dimensional vectors only.
 - Supported element types are `int`, `long`, `long long`, `double`, and `bool`.
-- Vector parameters may initially be passed by value or by const reference.
-- Non-const reference mutation and `void` functions are not supported yet.
+- Vector parameters may be passed by value, const reference, or supported
+  non-const reference mutation.
 - Vector results must use deterministic serialization for comparison.
 - Generated harness code must never modify the Monaco source.
 - Full-program stdin/stdout testing and scalar function testing must remain unchanged.
@@ -382,8 +382,9 @@ The expected request should contain the current source code in structured JSON, 
 - The generated harness calls the selected function with validated arguments.
 - The user's source code must remain unchanged.
 - Existing output-comparison modes apply to captured function output.
-- `void` functions may be checked through the supported scalar-reference mutation model.
-- Pointer mutation and array mutation remain separate future stages.
+- `void` functions may be checked through supported scalar, vector, or array
+  mutation models.
+- Arbitrary pointer mutation remains a separate future stage.
 
 ## C-style array testing
 
@@ -394,7 +395,8 @@ The expected request should contain the current source code in structured JSON, 
 - Array values are data, never arbitrary C++ expressions.
 - Generated harness code must create temporary local arrays safely.
 - Array-return pointers, pointer ownership, dynamic allocation, pointer-to-pointer types, and multidimensional arrays are not supported yet.
-- Array mutation checking is not part of this stage.
+- Array mutation checking uses the explicit size parameter as its comparison
+  boundary.
 - Existing program, scalar, string, vector, and void-output testing must remain unchanged.
 
 ## Scalar reference mutation testing
@@ -405,4 +407,15 @@ The expected request should contain the current source code in structured JSON, 
 - The generated harness must inspect mutable arguments after the function call.
 - The user’s Monaco source must never be modified.
 - Const references remain read-only inputs.
-- Pointer mutation, vector mutation, array mutation, multiple mutable outputs, and returned references are not part of this stage.
+- Pointer mutation, multiple mutable outputs, and returned references are not
+  part of this stage.
+
+## Vector and array mutation testing
+
+- Function-mode tests may inspect mutations to supported non-const vector references and C-style array parameters.
+- Supported mutable vectors are one-dimensional vectors of existing supported element types.
+- Supported mutable arrays are one-dimensional numeric C-style arrays with an explicit size parameter.
+- Tests provide initial values and expected final values.
+- The generated harness must serialize mutated arguments after the function call.
+- The Monaco source must never be modified.
+- Pointer ownership, returned pointers, multidimensional arrays, and multiple mutable outputs remain unsupported.

@@ -364,16 +364,21 @@ def _prepare_argument(
     parameter_index: int,
 ) -> HarnessArgument:
     if value_type.passing == "mutable_reference":
-        if value_type.scalar_type is None:
-            raise ValueError(f"{label} uses an unsupported mutable type.")
         storage_name = (
             f"inktocode_mutable_{test_index}_{parameter_index}_storage"
         )
-        literal = _safe_literal(value_type.scalar_type, raw_value, label)
+        if value_type.kind == "vector":
+            literal = _vector_literal(value_type, raw_value, label)
+            storage_type = f"std::vector<{value_type.element_type}>"
+        else:
+            if value_type.scalar_type is None:
+                raise ValueError(f"{label} uses an unsupported mutable type.")
+            literal = _safe_literal(value_type.scalar_type, raw_value, label)
+            storage_type = value_type.scalar_type
         return HarnessArgument(
             expression=storage_name,
             declarations=(
-                f"{value_type.scalar_type} {storage_name} = {literal};",
+                f"{storage_type} {storage_name} = {literal};",
             ),
         )
     if value_type.kind != "array":
@@ -488,6 +493,41 @@ def _vector_output(function: FunctionSignature, call: str) -> str:
     )
 
 
+def _collection_output(
+    expression: str,
+    element_type: str,
+    length_expression: str,
+) -> str:
+    value_expression = f"{expression}[inktocode_index]"
+    if element_type == STRING_TYPE:
+        value_output = (
+            f"inktocode_write_quoted_string({value_expression});"
+        )
+    elif element_type == "bool":
+        value_output = (
+            f"std::cout << std::boolalpha << {value_expression};"
+        )
+    elif element_type == "double":
+        value_output = (
+            "std::cout << std::setprecision"
+            f"({DOUBLE_OUTPUT_PRECISION}) << {value_expression};"
+        )
+    else:
+        value_output = f"std::cout << {value_expression};"
+    return " ".join(
+        [
+            'std::cout << "[";',
+            "for (std::size_t inktocode_index = 0;",
+            f"inktocode_index < static_cast<std::size_t>({length_expression});",
+            "++inktocode_index) {",
+            'if (inktocode_index != 0) std::cout << ", ";',
+            value_output,
+            "}",
+            'std::cout << "]";',
+        ]
+    )
+
+
 def _string_serializer_source() -> str:
     return "\n".join(
         [
@@ -517,13 +557,14 @@ def _build_function_harness(
     code: str,
     function: FunctionSignature,
     arguments_by_test: list[list[HarnessArgument]],
+    mutation_parameter_name: str | None,
 ) -> str:
     cases: list[str] = []
     mutable_parameter = next(
         (
             (parameter_index, parameter)
             for parameter_index, parameter in enumerate(function.parameters)
-            if parameter.value_type.passing == "mutable_reference"
+            if parameter.name == mutation_parameter_name
         ),
         None,
     )
@@ -540,7 +581,37 @@ def _build_function_harness(
         if mutable_parameter is not None:
             mutable_index, parameter = mutable_parameter
             mutable_expression = arguments[mutable_index].expression
-            if parameter.value_type.scalar_type == STRING_TYPE:
+            if parameter.value_type.kind in {"vector", "array"}:
+                element_type = parameter.value_type.element_type
+                if element_type is None:
+                    raise ValueError(
+                        f"Mutable parameter {parameter.name} has no element type."
+                    )
+                if parameter.value_type.kind == "vector":
+                    length_expression = f"{mutable_expression}.size()"
+                else:
+                    size_name = parameter.value_type.size_parameter_name
+                    size_index = next(
+                        (
+                            candidate_index
+                            for candidate_index, candidate in enumerate(
+                                function.parameters
+                            )
+                            if candidate.name == size_name
+                        ),
+                        None,
+                    )
+                    if size_index is None:
+                        raise ValueError(
+                            f"Mutable array {parameter.name} has no size."
+                        )
+                    length_expression = arguments[size_index].expression
+                serialized_value = _collection_output(
+                    mutable_expression,
+                    element_type,
+                    length_expression,
+                )
+            elif parameter.value_type.scalar_type == STRING_TYPE:
                 serialized_value = (
                     f"inktocode_write_quoted_string({mutable_expression});"
                 )
@@ -649,6 +720,7 @@ def _function_results(
     working_directory: Path,
     request: FunctionRunTestsRequest,
     function: FunctionSignature,
+    mutation_parameter_name: str | None,
     *,
     timeout_seconds: float,
 ) -> list[
@@ -665,7 +737,7 @@ def _function_results(
         (
             parameter
             for parameter in function.parameters
-            if parameter.value_type.passing == "mutable_reference"
+            if parameter.name == mutation_parameter_name
         ),
         None,
     )
@@ -687,16 +759,31 @@ def _function_results(
                 MUTATION_RESULT_MARKER
             )
             actual_value = serialized_value if marker else output.stdout
-            if mutable_parameter.value_type.scalar_type == STRING_TYPE:
+            if mutable_parameter.value_type.kind in {"vector", "array"}:
+                collection_match = _classify_vector_match(
+                    mutable_parameter.value_type,
+                    expected_value,
+                    actual_value,
+                )
+                match_type = (
+                    "mismatch"
+                    if collection_match == "mismatch"
+                    else "exact"
+                )
+            elif mutable_parameter.value_type.scalar_type == STRING_TYPE:
                 try:
                     decoded_value = json.loads(actual_value)
                 except (json.JSONDecodeError, TypeError):
                     decoded_value = None
                 if isinstance(decoded_value, str):
                     actual_value = decoded_value
-            match_type = (
-                "exact" if expected_value == actual_value else "mismatch"
-            )
+                match_type = (
+                    "exact" if expected_value == actual_value else "mismatch"
+                )
+            else:
+                match_type = (
+                    "exact" if expected_value == actual_value else "mismatch"
+                )
             passed = (
                 not output.timed_out
                 and not output.output_limited
@@ -841,6 +928,7 @@ def run_test_request(
 
     arguments_by_test: list[list[HarnessArgument]] = []
     function = None
+    mutation_parameter_name: str | None = None
     if isinstance(request, FunctionRunTestsRequest):
         function = next(
             (
@@ -860,6 +948,81 @@ def run_test_request(
                 ),
                 tests=[],
             )
+        mutation_capable_parameters = [
+            parameter
+            for parameter in function.parameters
+            if parameter.value_type.passing
+            in {"mutable_reference", "array_pointer"}
+        ]
+        mutation_tests = [
+            test
+            for test in request.tests
+            if test.expected_final_arguments is not None
+        ]
+        if mutation_tests:
+            if len(mutation_tests) != len(request.tests):
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    input_error=(
+                        "All tests for a selected function must use the same "
+                        "expected result channel."
+                    ),
+                    function=_function_response(function),
+                    tests=[],
+                )
+            mutation_names = {
+                name
+                for test in mutation_tests
+                for name in (test.expected_final_arguments or {})
+            }
+            if len(mutation_names) != 1:
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    input_error=(
+                        "Mutation tests require exactly one mutable output."
+                    ),
+                    function=_function_response(function),
+                    tests=[],
+                )
+            mutation_parameter_name = next(iter(mutation_names))
+            if len(mutation_capable_parameters) != 1:
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    unsupported_error=(
+                        "Functions with multiple mutable outputs are "
+                        "unsupported."
+                    ),
+                    function=_function_response(function),
+                    tests=[],
+                )
+            if (
+                mutation_capable_parameters[0].name
+                != mutation_parameter_name
+            ):
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    input_error=(
+                        "The expected mutation does not match the selected "
+                        "function."
+                    ),
+                    function=_function_response(function),
+                    tests=[],
+                )
+            if function.return_value_type.kind != "void":
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    unsupported_error=(
+                        "Return-value and mutation checks cannot be combined "
+                        "in this stage."
+                    ),
+                    function=_function_response(function),
+                    tests=[],
+                )
         for test_index, test in enumerate(request.tests):
             if len(test.arguments) != len(function.parameters):
                 return RunTestsResponse(
@@ -874,7 +1037,7 @@ def run_test_request(
                 )
             try:
                 is_void = function.return_value_type.kind == "void"
-                mutable_parameter = next(
+                required_mutable_parameter = next(
                     (
                         parameter
                         for parameter in function.parameters
@@ -884,15 +1047,15 @@ def run_test_request(
                     None,
                 )
                 if (
-                    mutable_parameter is not None
+                    required_mutable_parameter is not None
                     and test.expected_final_arguments is None
                 ):
                     raise ValueError(
                         f"{test.name} must provide the expected final value "
-                        f"for {mutable_parameter.name}."
+                        f"for {required_mutable_parameter.name}."
                     )
                 if (
-                    mutable_parameter is not None
+                    mutation_parameter_name is not None
                     and (
                         test.expected_stdout is not None
                         or test.expected_return is not None
@@ -903,7 +1066,7 @@ def run_test_request(
                         "expected final value."
                     )
                 if (
-                    mutable_parameter is None
+                    mutation_parameter_name is None
                     and is_void
                     and test.expected_stdout is None
                 ):
@@ -912,7 +1075,7 @@ def run_test_request(
                         "the selected void function."
                     )
                 if (
-                    mutable_parameter is None
+                    mutation_parameter_name is None
                     and not is_void
                     and test.expected_return is None
                 ):
@@ -936,18 +1099,39 @@ def run_test_request(
                         )
                     )
                 ]
-                if mutable_parameter is not None:
+                if mutation_parameter_name is not None:
+                    mutable_parameter = next(
+                        parameter
+                        for parameter in function.parameters
+                        if parameter.name == mutation_parameter_name
+                    )
                     expected_values = test.expected_final_arguments or {}
                     if set(expected_values) != {mutable_parameter.name}:
                         raise ValueError(
                             f"{test.name} must provide exactly one expected "
                             f"final value for {mutable_parameter.name}."
                         )
-                    _safe_value_literal(
-                        mutable_parameter.value_type,
-                        expected_values[mutable_parameter.name],
-                        f"{test.name} expected final {mutable_parameter.name}",
-                    )
+                    if mutable_parameter.value_type.kind in {
+                        "vector",
+                        "array",
+                    }:
+                        _typed_vector_values(
+                            mutable_parameter.value_type,
+                            expected_values[mutable_parameter.name],
+                            (
+                                f"{test.name} expected final "
+                                f"{mutable_parameter.name}"
+                            ),
+                        )
+                    else:
+                        _safe_value_literal(
+                            mutable_parameter.value_type,
+                            expected_values[mutable_parameter.name],
+                            (
+                                f"{test.name} expected final "
+                                f"{mutable_parameter.name}"
+                            ),
+                        )
                 parameter_indexes = {
                     parameter.name: index
                     for index, parameter in enumerate(function.parameters)
@@ -1005,7 +1189,12 @@ def run_test_request(
             working_directory = Path(directory)
             executable = working_directory / "program"
             source = (
-                _build_function_harness(request.code, function, arguments_by_test)
+                _build_function_harness(
+                    request.code,
+                    function,
+                    arguments_by_test,
+                    mutation_parameter_name,
+                )
                 if isinstance(request, FunctionRunTestsRequest)
                 and function is not None
                 else request.code
@@ -1047,6 +1236,7 @@ def run_test_request(
                 working_directory,
                 request,
                 function,
+                mutation_parameter_name,
                 timeout_seconds=test_timeout_seconds,
             )
             return RunTestsResponse(

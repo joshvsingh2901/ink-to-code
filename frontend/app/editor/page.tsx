@@ -518,7 +518,9 @@ export default function EditorPage() {
       const currentCode = editorRef.current?.getValue() ?? code;
       const mutableParameter = selectedFunction?.parameters.find(
         (parameter) =>
-          parameter.type_metadata.passing === "mutable_reference",
+          parameter.type_metadata.passing === "mutable_reference" ||
+          (parameter.type_metadata.passing === "array_pointer" &&
+            selectedFunction.return_type_metadata.kind === "void"),
       );
       const request =
         testMode.mode === "function"
@@ -769,7 +771,9 @@ export default function EditorPage() {
       : null;
   const mutableParameter = selectedFunction?.parameters.find(
     (parameter) =>
-      parameter.type_metadata.passing === "mutable_reference",
+      parameter.type_metadata.passing === "mutable_reference" ||
+      (parameter.type_metadata.passing === "array_pointer" &&
+        selectedFunction.return_type_metadata.kind === "void"),
   );
   const isCleanCompileSuccess =
     compileResult?.success === true &&
@@ -1299,8 +1303,8 @@ export default function EditorPage() {
                                       </span>
                                     </label>
                                     <div className="mt-1 min-w-0">
-                                      {parameter.type_metadata.passing ===
-                                        "mutable_reference" && (
+                                      {parameter.name ===
+                                        mutableParameter?.name && (
                                         <p className="mb-1 text-[11px] font-medium text-slate-500">
                                           Initial value
                                         </p>
@@ -1360,8 +1364,8 @@ export default function EditorPage() {
                                 <div className="mt-1.5 space-y-2">
                                   {selectedFunction.parameters.map(
                                     (parameter, parameterIndex) =>
-                                      parameter.type_metadata.passing ===
-                                        "mutable_reference" ? (
+                                      parameter.name ===
+                                      mutableParameter.name ? (
                                         <div
                                           key={`${test.id}-expected-${parameter.name}`}
                                           className="min-w-0"

@@ -707,7 +707,7 @@ def test_invalid_expected_vector_is_rejected_before_compilation(monkeypatch):
         ),
         (
             "int size(std::vector<int>& values) { return 0; }",
-            "Non-const vector reference",
+            "Non-void functions with mutable reference",
         ),
         (
             "int size(std::vector<int>* values) { return 0; }",
@@ -1967,10 +1967,6 @@ def test_mutable_reference_with_scalar_and_helper_executes():
             "multiple mutable reference",
         ),
         (
-            "#include <vector>\nvoid change(std::vector<int>& values) {}",
-            "Non-const vector reference",
-        ),
-        (
             "void change(int*& value) {}",
             "References to pointers",
         ),
@@ -2072,3 +2068,214 @@ def test_mutable_reference_timeout_and_output_limits_are_preserved():
 
     assert timeout_result.tests[0].timed_out is True
     assert output_result.tests[0].output_limited is True
+
+
+@pytest.mark.parametrize(
+    ("declaration", "element_type"),
+    [
+        ("std::vector<int>& values", "int"),
+        ("vector<long>& values", "long"),
+        ("std::vector<long long>& values", "long long"),
+        ("std::vector<double>& values", "double"),
+        ("std::vector<bool>& values", "bool"),
+        ("std::vector<std::string>& values", "std::string"),
+    ],
+)
+def test_mutable_vector_metadata_is_structured(
+    declaration: str,
+    element_type: str,
+):
+    namespace = (
+        "using namespace std;\n"
+        if declaration.startswith("vector")
+        else ""
+    )
+    analysis = analyze_test_mode(
+        "#include <string>\n#include <vector>\n"
+        f"{namespace}void change({declaration}) {{}}"
+    )
+
+    assert analysis.mode == "function"
+    metadata = analysis.functions[0].parameters[0].value_type
+    assert metadata.kind == "vector"
+    assert metadata.element_type == element_type
+    assert metadata.passing == "mutable_reference"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("initial", "expected"),
+    [
+        ("[1, 2, 3]", "[2, 4, 6]"),
+        ("[]", "[]"),
+    ],
+)
+def test_numeric_vector_mutation_executes(initial: str, expected: str):
+    result = run_test_request(
+        mutation_request(
+            "#include <vector>\n"
+            "void doubleValues(std::vector<int>& values) "
+            "{ for (int& value : values) value *= 2; }",
+            arguments=[initial],
+            expected_final_arguments={"values": expected},
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {"values": expected}
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_string_vector_mutation_uses_canonical_serialization():
+    result = run_test_request(
+        mutation_request(
+            "#include <string>\n#include <vector>\n"
+            "void addPrefix(std::vector<std::string>& words) "
+            '{ for (std::string& word : words) word = "item-" + word; }',
+            arguments=['["one", "two"]'],
+            expected_final_arguments={
+                "words": '["item-one", "item-two"]'
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "words": '["item-one", "item-two"]'
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_vector_mutation_with_ordinary_scalar_parameter_executes():
+    result = run_test_request(
+        mutation_request(
+            "#include <vector>\n"
+            "void addAmount(std::vector<int>& values, int amount) "
+            "{ for (int& value : values) value += amount; }",
+            arguments=["[1, 2]", "3"],
+            expected_final_arguments={"values": "[4, 5]"},
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize("declaration", ["int values[]", "int* values"])
+def test_array_mutation_and_pointer_spelling_execute(declaration: str):
+    result = run_test_request(
+        mutation_request(
+            f"void reverseArray({declaration}, int size) "
+            "{ for (int i = 0; i < size / 2; ++i) "
+            "{ int temp = values[i]; values[i] = values[size - 1 - i]; "
+            "values[size - 1 - i] = temp; } }",
+            arguments=["[1, 2, 3, 4]", "4"],
+            expected_final_arguments={"values": "[4, 3, 2, 1]"},
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("initial", "size", "expected"),
+    [
+        ("[1, 2, 3, 99]", "3", "[3, 2, 1]"),
+        ("[]", "0", "[]"),
+    ],
+)
+def test_array_mutation_compares_only_the_explicit_size(
+    initial: str,
+    size: str,
+    expected: str,
+):
+    result = run_test_request(
+        mutation_request(
+            "void reverseArray(int values[], int size) "
+            "{ for (int i = 0; i < size / 2; ++i) "
+            "{ int temp = values[i]; values[i] = values[size - 1 - i]; "
+            "values[size - 1 - i] = temp; } }",
+            arguments=[initial, size],
+            expected_final_arguments={"values": expected},
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {"values": expected}
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_incorrect_expected_collection_mutation_fails():
+    result = run_test_request(
+        mutation_request(
+            "#include <vector>\n"
+            "void doubleValues(std::vector<int>& values) "
+            "{ for (int& value : values) value *= 2; }",
+            arguments=["[1, 2]"],
+            expected_final_arguments={"values": "[2, 5]"},
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].actual_final_arguments == {"values": "[2, 4]"}
+
+
+@pytest.mark.parametrize(
+    ("source", "arguments", "expected", "message"),
+    [
+        (
+            "#include <vector>\n"
+            "void change(std::vector<int>& values) {}",
+            ["[1, 2]"],
+            "[1,,2]",
+            "empty vector element",
+        ),
+        (
+            "void change(int values[], int size) {}",
+            ["[1, 2]", "2"],
+            "[one]",
+            "signed decimal int",
+        ),
+    ],
+)
+def test_malformed_expected_collection_mutation_is_rejected_before_compile(
+    source: str,
+    arguments: list[str],
+    expected: str,
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        mutation_request(
+            source,
+            arguments=arguments,
+            expected_final_arguments={
+                analyze_test_mode(source).functions[0].parameters[0].name:
+                    expected
+            },
+        )
+    )
+
+    assert result.input_error
+    assert message in result.input_error
+    assert invoked is False
+
+
+def test_multiple_collection_mutation_outputs_are_rejected():
+    analysis = analyze_test_mode(
+        "#include <vector>\n"
+        "void change(std::vector<int>& left, "
+        "std::vector<int>& right) {}"
+    )
+
+    assert analysis.mode == "unsupported"
+    assert analysis.message
+    assert "multiple mutable reference" in analysis.message

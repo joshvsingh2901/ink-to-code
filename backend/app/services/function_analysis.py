@@ -36,6 +36,8 @@ class ValueType:
                 else base
             )
         base = f"std::vector<{self.element_type}>"
+        if self.passing == "mutable_reference":
+            return f"{base}&"
         return (
             f"const {base}&"
             if self.passing == "const_reference"
@@ -347,9 +349,15 @@ def _parse_value_type(
     if modifier == "&":
         if not allow_reference:
             return None, "Vector return values must be returned by value."
-        if not is_const:
-            return None, "Non-const vector reference parameters are unsupported."
-        passing: Literal["value", "const_reference"] = "const_reference"
+        passing: Literal[
+            "value",
+            "const_reference",
+            "mutable_reference",
+        ] = (
+            "const_reference"
+            if is_const
+            else "mutable_reference"
+        )
     else:
         if is_const and not allow_reference:
             return None, "Vector return values must be returned by value."
@@ -357,7 +365,11 @@ def _parse_value_type(
 
     base = f"std::vector<{element_type}>"
     display_type = (
-        f"const {base}&" if passing == "const_reference" else base
+        f"const {base}&"
+        if passing == "const_reference"
+        else f"{base}&"
+        if passing == "mutable_reference"
+        else base
     )
     return (
         ValueType(

@@ -76,7 +76,7 @@ Unqualified `vector<T>` is accepted only when the source contains
 to safe literals before harness generation. Results use canonical
 `[1, 2, 3]` serialization and exact typed sequence comparison with no fuzzy
 numeric tolerance. Nested vectors, unsupported element types, vector pointers,
-non-const references, and mutation-through-void signatures are not supported.
+and unsupported reference types are not supported.
 
 Function tests support one-dimensional numeric C-style array parameters written
 as `T values[]` or `T* values`, where `T` is `int`, `long`, `long long`,
@@ -90,8 +90,8 @@ The temporary harness creates validated local array storage and passes it to the
 unchanged target function. Empty input (`[]`) uses a one-element
 value-initialized backing array while the explicit size remains zero, avoiding
 non-standard zero-length arrays. Pointer-to-pointer and returned-pointer types,
-multidimensional arrays, character arrays, arbitrary expressions, and
-mutation-result checking are not supported.
+multidimensional arrays, character arrays, and arbitrary expressions are not
+supported.
 
 Function mode supports `std::string` and one-dimensional
 `std::vector<std::string>` parameters by value or const reference, with returns
@@ -102,24 +102,29 @@ newlines, tabs, carriage returns, and control bytes are escaped before safe C++
 literals are generated. Scalar strings compare exact contents.
 `vector<string>` results serialize canonically as `["hello", "world"]` and
 compare exact element contents, order, and length. Character pointers, character
-arrays, string pointers, mutable vector references, and nested vectors remain
-unsupported.
+arrays, string pointers, and nested vectors remain unsupported.
 
-Function mode supports exactly one mutable scalar reference parameter of type
-`int&`, `long&`, `long long&`, `double&`, `bool&`, or `std::string&` on a
-`void` target. Each test supplies the parameter's initial value in the ordinary
-argument list and its expected final value in `expected_final_arguments`, keyed
-by parameter name. The harness creates validated local storage, calls the
-unchanged target, and serializes the final local value. Integer, boolean, and
-string values compare exactly; doubles retain the existing exact, non-fuzzy
-output policy. String values use the existing safe literal escaping and quoted
-serialization internally.
+Function mode supports exactly one mutable output on a `void` target. This may
+be a scalar reference (`int&`, `long&`, `long long&`, `double&`, `bool&`, or
+`std::string&`), a non-const `std::vector<T>&` using a supported vector element
+type, or a supported C-style array parameter. Each test supplies the initial
+value in the ordinary argument list and its expected final value in
+`expected_final_arguments`, keyed by parameter name. The harness creates
+validated local storage, calls the unchanged target, and serializes the final
+local value or collection.
+
+Mutated vectors serialize all elements canonically. Mutated arrays serialize
+only the first explicit-size elements; supplied backing elements beyond that
+size are not part of mutation comparison. Element order and count matter.
+Integer, boolean, and string values compare exactly; doubles retain the existing
+exact, non-fuzzy policy. Strings use the existing safe literal escaping and
+quoted serialization internally.
 
 Scalar and string const references remain read-only inputs. Non-void functions
-with mutable references are conservatively rejected so neither a return value
-nor a mutation is ignored. Multiple mutable references, returned references,
-rvalue references, pointer/array/vector mutation, and custom reference types
-are unsupported. Mutation tests do not have a second stdout expectation
+with mutable outputs are conservatively rejected so neither a return value nor
+a mutation is ignored. Multiple mutable outputs, returned references, rvalue
+references, arbitrary pointer mutation, and custom reference types are
+unsupported. Mutation tests do not have a second stdout expectation
 channel; if the target writes to `std::cout`, the test fails with a clear
 runtime message rather than silently discarding that output.
 
@@ -127,9 +132,9 @@ Supported `void` functions are tested through their captured standard output.
 Their test cases use `expected_stdout` instead of `expected_return` and may use
 the same whitespace-tolerant or exact comparison modes as full-program output.
 The harness calls the function without storing or printing a return value.
-Standard error remains separate. Supported scalar-reference mutation uses the
-dedicated final-value model above; pointer, array, and vector mutation remain
-outside the current test model.
+Standard error remains separate. Supported mutation uses the dedicated
+final-value model above; arbitrary pointer mutation remains outside the current
+test model.
 
 The test runner compiles with a fixed argument list, runs only after an explicit
 request, and uses a unique temporary directory that is deleted afterward.

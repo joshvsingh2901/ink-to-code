@@ -340,13 +340,409 @@ def test_mode_endpoint_returns_function_metadata():
             "id": "findMax(int,int)->int",
             "name": "findMax",
             "return_type": "int",
+            "return_type_metadata": {
+                "kind": "scalar",
+                "display_type": "int",
+                "scalar_type": "int",
+                "element_type": None,
+                "passing": "value",
+            },
             "parameters": [
-                {"name": "a", "type": "int"},
-                {"name": "b", "type": "int"},
+                {
+                    "name": "a",
+                    "type": "int",
+                    "type_metadata": {
+                        "kind": "scalar",
+                        "display_type": "int",
+                        "scalar_type": "int",
+                        "element_type": None,
+                        "passing": "value",
+                    },
+                },
+                {
+                    "name": "b",
+                    "type": "int",
+                    "type_metadata": {
+                        "kind": "scalar",
+                        "display_type": "int",
+                        "scalar_type": "int",
+                        "element_type": None,
+                        "passing": "value",
+                    },
+                },
             ],
             "display": "findMax(int a, int b)",
         }
     ]
+
+
+def vector_request(
+    code: str,
+    *,
+    arguments: list[str],
+    expected_return: str,
+    target_index: int = 0,
+) -> FunctionRunTestsRequest:
+    analysis = analyze_test_mode(code)
+    assert analysis.mode == "function"
+    return FunctionRunTestsRequest(
+        mode="function",
+        code=code,
+        language="cpp",
+        target_function=analysis.functions[target_index].id,
+        tests=[
+            FunctionTestCase(
+                name="Vector test",
+                arguments=arguments,
+                expected_return=expected_return,
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("declaration", "passing"),
+    [
+        ("std::vector<int> values", "value"),
+        ("const std::vector<int>& values", "const_reference"),
+        ("std::vector<int> const& values", "const_reference"),
+    ],
+)
+def test_vector_parameter_metadata_is_structured(
+    declaration: str,
+    passing: str,
+):
+    analysis = analyze_test_mode(
+        f"#include <vector>\nint size({declaration}) "
+        "{ return static_cast<int>(values.size()); }"
+    )
+
+    assert analysis.mode == "function"
+    metadata = analysis.functions[0].parameters[0].value_type
+    assert metadata.kind == "vector"
+    assert metadata.element_type == "int"
+    assert metadata.passing == passing
+
+
+def test_unqualified_vector_is_supported_with_using_namespace_std():
+    analysis = analyze_test_mode(
+        "#include <vector>\nusing namespace std;\n"
+        "int size(vector<int> values) { return values.size(); }"
+    )
+
+    assert analysis.mode == "function"
+    assert analysis.functions[0].parameters[0].type == "std::vector<int>"
+
+
+def test_unqualified_vector_without_namespace_is_rejected():
+    analysis = analyze_test_mode(
+        "int size(vector<int> values) { return values.size(); }"
+    )
+
+    assert analysis.mode == "unsupported"
+    assert analysis.message
+    assert "using namespace std" in analysis.message
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("element_type", "values", "expected"),
+    [
+        ("int", "[1, 2, 3, 4]", "10"),
+        ("long", "-2, 5, 10", "13"),
+        ("long long", "-3000000000 3000000004", "4"),
+        ("double", "[1.5, -2e0, 3.25]", "2.75"),
+        ("bool", "[true, false, true]", "2"),
+    ],
+)
+def test_supported_vector_parameters_execute(
+    element_type: str,
+    values: str,
+    expected: str,
+):
+    source = (
+        "#include <vector>\n"
+        f"{'double' if element_type == 'double' else 'long long'} "
+        f"sum(std::vector<{element_type}> values) {{\n"
+        f"    {'double' if element_type == 'double' else 'long long'} total = 0;\n"
+        "    for (auto value : values) total += value;\n"
+        "    return total;\n"
+        "}"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[values],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_empty_vector_and_mixed_scalar_vector_parameters_execute():
+    source = """
+#include <vector>
+bool contains(std::vector<int> values, int target)
+{
+    for (int value : values) if (value == target) return true;
+    return false;
+}
+""".strip()
+    empty_result = run_test_request(
+        vector_request(
+            source,
+            arguments=["[]", "7"],
+            expected_return="false",
+        )
+    )
+    populated_result = run_test_request(
+        vector_request(
+            source,
+            arguments=["3 7 9", "7"],
+            expected_return="true",
+        )
+    )
+
+    assert empty_result.success is True
+    assert populated_result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("element_type", "body", "values", "expected", "actual"),
+    [
+        (
+            "int",
+            "for (int &value : values) value *= 2;",
+            "[1, 2, 3]",
+            "2 4 6",
+            "[2, 4, 6]",
+        ),
+        ("int", "values.clear();", "[1]", "[]", "[]"),
+        (
+            "double",
+            "for (double &value : values) value /= 2;",
+            "[1, 2.5]",
+            "[0.5, 1.25]",
+            "[0.5, 1.25]",
+        ),
+        (
+            "bool",
+            "for (std::size_t i = 0; i < values.size(); ++i) "
+            "values[i] = !values[i];",
+            "[true, false]",
+            "[false, true]",
+            "[false, true]",
+        ),
+    ],
+)
+def test_vector_returns_are_serialized_and_compared_structurally(
+    element_type: str,
+    body: str,
+    values: str,
+    expected: str,
+    actual: str,
+):
+    source = (
+        "#include <vector>\n"
+        f"std::vector<{element_type}> transform("
+        f"std::vector<{element_type}> values) {{ {body} return values; }}"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[values],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_return == actual
+    assert result.tests[0].match_type in {"exact", "whitespace_normalized"}
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize("expected", ["[2, 6, 4]", "[2, 4]"])
+def test_vector_result_order_and_length_must_match(expected: str):
+    source = (
+        "#include <vector>\n"
+        "std::vector<int> doubled(std::vector<int> values) "
+        "{ for (int &value : values) value *= 2; return values; }"
+    )
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=["[1, 2, 3]"],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].match_type == "mismatch"
+    assert result.tests[0].actual_return == "[2, 4, 6]"
+
+
+@pytest.mark.parametrize(
+    ("element_type", "value", "message"),
+    [
+        ("int", "[1,,2]", "empty vector element"),
+        ("int", "", "use [] for empty"),
+        ("int", "[1, 2.5]", "signed decimal int"),
+        ("int", "{foo()}", "not C++ expressions"),
+        ("int", "std::vector<int>(3)", "not C++ expressions"),
+        ("bool", "[true, maybe]", "true or false"),
+    ],
+)
+def test_invalid_vector_input_is_rejected_before_compilation(
+    element_type: str,
+    value: str,
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        vector_request(
+            "#include <vector>\n"
+            f"int sum(std::vector<{element_type}> values) "
+            "{ return values.size(); }",
+            arguments=[value],
+            expected_return="0",
+        )
+    )
+
+    assert result.success is False
+    assert result.input_error
+    assert message in result.input_error
+    assert invoked is False
+
+
+def test_invalid_expected_vector_is_rejected_before_compilation(monkeypatch):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        vector_request(
+            "#include <vector>\n"
+            "std::vector<int> identity(std::vector<int> values) "
+            "{ return values; }",
+            arguments=["[1, 2]"],
+            expected_return="[1, nope]",
+        )
+    )
+
+    assert result.input_error
+    assert "expected return element 2" in result.input_error
+    assert invoked is False
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "int size(std::vector<std::vector<int>> values) { return 0; }",
+            "Unsupported vector",
+        ),
+        (
+            "int size(std::vector<int>& values) { return 0; }",
+            "Non-const vector reference",
+        ),
+        (
+            "int size(std::vector<int>* values) { return 0; }",
+            "Vector pointer",
+        ),
+        (
+            "std::vector<std::string> values() { return {}; }",
+            "Unsupported vector element",
+        ),
+    ],
+)
+def test_unsupported_vector_signatures_have_clear_messages(
+    source: str,
+    message: str,
+):
+    analysis = analyze_test_mode(source)
+
+    assert analysis.mode == "unsupported"
+    assert analysis.message
+    assert message in analysis.message
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_vector_target_can_call_vector_helper():
+    source = """
+#include <vector>
+int sum(std::vector<int> values)
+{
+    int total = 0;
+    for (int value : values) total += value;
+    return total;
+}
+int averageRounded(std::vector<int> values)
+{
+    return sum(values) / static_cast<int>(values.size());
+}
+""".strip()
+    analysis = analyze_test_mode(source)
+    assert [function.name for function in analysis.functions] == [
+        "sum",
+        "averageRounded",
+    ]
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=["[2, 4, 6]"],
+            expected_return="4",
+            target_index=1,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_vector_function_runtime_timeout_is_preserved():
+    result = run_test_request(
+        vector_request(
+            "#include <vector>\n"
+            "std::vector<int> spin(std::vector<int> values) "
+            "{ while (true) {} return values; }",
+            arguments=["[]"],
+            expected_return="[]",
+        ),
+        test_timeout_seconds=0.05,
+    )
+
+    assert result.tests[0].timed_out is True
+    assert result.tests[0].passed is False
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_vector_function_output_limit_is_preserved():
+    result = run_test_request(
+        vector_request(
+            "#include <vector>\n"
+            "std::vector<int> huge(std::vector<int> values) "
+            "{ return std::vector<int>(100000, 1); }",
+            arguments=["[]"],
+            expected_return="[]",
+        )
+    )
+
+    assert result.tests[0].output_limited is True
+    assert result.tests[0].passed is False
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")

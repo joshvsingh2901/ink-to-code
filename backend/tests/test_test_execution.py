@@ -12,6 +12,7 @@ from app.services import test_execution
 from app.services.test_execution import (
     TEST_OUTPUT_LIMIT_BYTES,
     _classify_output_match,
+    _classify_program_output_match,
     run_cpp_tests,
 )
 
@@ -213,6 +214,57 @@ def test_identical_output_is_classified_as_exact():
     assert _classify_output_match("hello world\n", "hello world\n") == "exact"
 
 
+def test_exact_mode_normalizes_crlf_only():
+    assert (
+        _classify_program_output_match(
+            "hello\r\nworld\r\n",
+            "hello\nworld\n",
+            "exact",
+        )
+        == "exact"
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual"),
+    [
+        ("2", "2\n"),
+        ("2 3", "2   3"),
+        ("hello world", "hello\tworld"),
+    ],
+)
+def test_exact_mode_identifies_formatting_only_mismatches(
+    expected: str,
+    actual: str,
+):
+    assert (
+        _classify_program_output_match(expected, actual, "exact")
+        == "formatting_mismatch"
+    )
+
+
+def test_exact_mode_preserves_real_value_mismatches():
+    assert (
+        _classify_program_output_match("2\n", "3\n", "exact")
+        == "mismatch"
+    )
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_exact_mode_fails_on_trailing_newline_and_preserves_raw_output():
+    result = run_cpp_tests(
+        '#include <iostream>\nint main() { std::cout << "2\\n"; }',
+        [make_test_case(expected_stdout="2")],
+        comparison_mode="exact",
+    )
+
+    assert result.success is False
+    assert result.tests[0].passed is False
+    assert result.tests[0].match_type == "formatting_mismatch"
+    assert result.tests[0].expected_stdout == "2"
+    assert result.tests[0].actual_stdout == "2\n"
+
+
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
 def test_output_limit_stops_large_output():
     result = run_cpp_tests(
@@ -257,6 +309,29 @@ def test_malformed_test_is_rejected():
                 "code": "int main() {}",
                 "language": "cpp",
                 "tests": [{"name": "", "stdin": ""}],
+            }
+        )
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"
+
+
+def test_invalid_comparison_mode_is_rejected():
+    response = asyncio.run(
+        api_request(
+            {
+                "mode": "program",
+                "code": "int main() {}",
+                "language": "cpp",
+                "comparison_mode": "close_enough",
+                "tests": [
+                    {
+                        "name": "Test 1",
+                        "stdin": "",
+                        "expected_stdout": "",
+                    }
+                ],
             }
         )
     )

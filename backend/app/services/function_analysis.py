@@ -2,27 +2,58 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-SUPPORTED_TYPES = {"int", "long", "long long", "double", "bool"}
+SUPPORTED_SCALAR_TYPES = {"int", "long", "long long", "double", "bool"}
+
+
+@dataclass(frozen=True)
+class ValueType:
+    kind: Literal["scalar", "vector"]
+    display_type: str
+    scalar_type: str | None = None
+    element_type: str | None = None
+    passing: Literal["value", "const_reference"] = "value"
+
+    @property
+    def canonical_type(self) -> str:
+        if self.kind == "scalar":
+            return self.scalar_type or self.display_type
+        base = f"std::vector<{self.element_type}>"
+        return (
+            f"const {base}&"
+            if self.passing == "const_reference"
+            else base
+        )
 
 
 @dataclass(frozen=True)
 class FunctionParameter:
     name: str
-    type: str
+    value_type: ValueType
+
+    @property
+    def type(self) -> str:
+        return self.value_type.display_type
 
 
 @dataclass(frozen=True)
 class FunctionSignature:
     name: str
-    return_type: str
+    return_value_type: ValueType
     parameters: tuple[FunctionParameter, ...]
+
+    @property
+    def return_type(self) -> str:
+        return self.return_value_type.display_type
 
     @property
     def id(self) -> str:
         parameter_types = ",".join(
-            parameter.type for parameter in self.parameters
+            parameter.value_type.canonical_type for parameter in self.parameters
         )
-        return f"{self.name}({parameter_types})->{self.return_type}"
+        return (
+            f"{self.name}({parameter_types})->"
+            f"{self.return_value_type.canonical_type}"
+        )
 
     @property
     def display(self) -> str:
@@ -40,13 +71,19 @@ class FunctionAnalysis:
 
 
 _FUNCTION_DEFINITION = re.compile(
-    r"(?P<return_type>[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)"
-    r"\s+(?P<name>[A-Za-z_]\w*)\s*"
+    r"(?P<return_type>"
+    r"(?:const\s+)?(?:std::)?vector\s*<[^<>]+>\s*(?:const\s*)?[&*]?"
+    r"|[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*"
+    r")\s+(?P<name>[A-Za-z_]\w*)\s*"
     r"\((?P<parameters>[^()]*)\)\s*(?:noexcept\s*)?\{",
 )
-_SUPPORTED_PARAMETER = re.compile(
-    r"(?P<type>long\s+long|long|int|double|bool)"
-    r"\s+(?P<name>[A-Za-z_]\w*)",
+_PARAMETER_DECLARATION = re.compile(
+    r"(?P<type>.+?)\s+(?P<name>[A-Za-z_]\w*)"
+)
+_VECTOR_TYPE = re.compile(
+    r"(?P<prefix_const>const\s+)?"
+    r"(?P<qualified>std::)?vector\s*<\s*(?P<element>[^<>]+)\s*>\s*"
+    r"(?P<suffix_const>const\s*)?(?P<modifier>[&*])?"
 )
 
 
@@ -120,50 +157,137 @@ def _brace_depths(source: str) -> list[int]:
     return depths
 
 
-def _parse_parameters(parameters: str) -> tuple[FunctionParameter, ...] | None:
+def _parse_value_type(
+    raw_type: str,
+    *,
+    allow_reference: bool,
+    unqualified_vector_allowed: bool,
+) -> tuple[ValueType | None, str | None]:
+    normalized = " ".join(raw_type.split())
+    if normalized in SUPPORTED_SCALAR_TYPES:
+        return (
+            ValueType(
+                kind="scalar",
+                display_type=normalized,
+                scalar_type=normalized,
+            ),
+            None,
+        )
+
+    vector_match = _VECTOR_TYPE.fullmatch(normalized)
+    if vector_match is None:
+        if "vector" in normalized:
+            return None, f"Unsupported vector type: {normalized}."
+        return None, f"Unsupported type: {normalized}."
+
+    if vector_match.group("qualified") is None and not unqualified_vector_allowed:
+        return (
+            None,
+            "Unqualified vector types require `using namespace std;`.",
+        )
+    element_type = " ".join(vector_match.group("element").split())
+    if element_type not in SUPPORTED_SCALAR_TYPES:
+        return (
+            None,
+            f"Unsupported vector element type: {element_type}.",
+        )
+    modifier = vector_match.group("modifier")
+    is_const = bool(
+        vector_match.group("prefix_const")
+        or vector_match.group("suffix_const")
+    )
+    if modifier == "*":
+        return None, "Vector pointer parameters and returns are unsupported."
+    if modifier == "&":
+        if not allow_reference:
+            return None, "Vector return values must be returned by value."
+        if not is_const:
+            return None, "Non-const vector reference parameters are unsupported."
+        passing: Literal["value", "const_reference"] = "const_reference"
+    else:
+        if is_const and not allow_reference:
+            return None, "Vector return values must be returned by value."
+        passing = "value"
+
+    base = f"std::vector<{element_type}>"
+    display_type = (
+        f"const {base}&" if passing == "const_reference" else base
+    )
+    return (
+        ValueType(
+            kind="vector",
+            display_type=display_type,
+            element_type=element_type,
+            passing=passing,
+        ),
+        None,
+    )
+
+
+def _parse_parameters(
+    parameters: str,
+    *,
+    unqualified_vector_allowed: bool,
+) -> tuple[tuple[FunctionParameter, ...] | None, str | None]:
     if not parameters.strip():
-        return ()
+        return (), None
 
     parsed: list[FunctionParameter] = []
     for raw_parameter in parameters.split(","):
         parameter = " ".join(raw_parameter.split())
-        if (
-            not parameter
-            or "=" in parameter
-            or "..." in parameter
-            or any(token in parameter for token in ("*", "&", "[", "]"))
-        ):
-            return None
-        match = _SUPPORTED_PARAMETER.fullmatch(parameter)
-        if not match:
-            return None
+        if not parameter or "=" in parameter or "..." in parameter:
+            return None, "Default and variadic parameters are unsupported."
+        match = _PARAMETER_DECLARATION.fullmatch(parameter)
+        if match is None:
+            return None, f"This parameter is not supported: {parameter}."
+        value_type, error = _parse_value_type(
+            match.group("type"),
+            allow_reference=True,
+            unqualified_vector_allowed=unqualified_vector_allowed,
+        )
+        if value_type is None:
+            return None, error
         parsed.append(
             FunctionParameter(
                 name=match.group("name"),
-                type=" ".join(match.group("type").split()),
+                value_type=value_type,
             )
         )
-    return tuple(parsed)
+    return tuple(parsed), None
 
 
 def _parse_candidate(
     candidate: re.Match[str],
     masked_source: str,
-) -> FunctionSignature | None:
+    *,
+    unqualified_vector_allowed: bool,
+) -> tuple[FunctionSignature | None, str | None]:
     prefix = masked_source[: candidate.start()]
     if re.search(r"template\s*<[^>]*>\s*$", prefix):
-        return None
+        return None, "Function templates are unsupported."
 
-    return_type = " ".join(candidate.group("return_type").split())
-    if return_type not in SUPPORTED_TYPES:
-        return None
-    parameters = _parse_parameters(candidate.group("parameters"))
+    return_value_type, error = _parse_value_type(
+        candidate.group("return_type"),
+        allow_reference=False,
+        unqualified_vector_allowed=unqualified_vector_allowed,
+    )
+    if return_value_type is None:
+        if candidate.group("return_type").strip() == "void":
+            return None, "Void returns are unsupported."
+        return None, error
+    parameters, error = _parse_parameters(
+        candidate.group("parameters"),
+        unqualified_vector_allowed=unqualified_vector_allowed,
+    )
     if parameters is None:
-        return None
-    return FunctionSignature(
-        name=candidate.group("name"),
-        return_type=return_type,
-        parameters=parameters,
+        return None, error
+    return (
+        FunctionSignature(
+            name=candidate.group("name"),
+            return_value_type=return_value_type,
+            parameters=parameters,
+        ),
+        None,
     )
 
 
@@ -179,10 +303,19 @@ def analyze_test_mode(source: str) -> FunctionAnalysis:
     if any(match.group("name") == "main" for match in candidates):
         return FunctionAnalysis(mode="program")
 
-    functions = tuple(
-        function
+    unqualified_vector_allowed = bool(
+        re.search(r"\busing\s+namespace\s+std\s*;", masked)
+    )
+    parsed_candidates = [
+        _parse_candidate(
+            candidate,
+            masked,
+            unqualified_vector_allowed=unqualified_vector_allowed,
+        )
         for candidate in candidates
-        if (function := _parse_candidate(candidate, masked)) is not None
+    ]
+    functions = tuple(
+        function for function, _ in parsed_candidates if function is not None
     )
     duplicate_names = {
         function.name
@@ -193,34 +326,17 @@ def analyze_test_mode(source: str) -> FunctionAnalysis:
         names = ", ".join(sorted(duplicate_names))
         return FunctionAnalysis(
             mode="unsupported",
-            message=(
-                f"Overloaded function name(s) are not supported yet: {names}."
-            ),
+            message=f"Overloaded function name(s) are not supported yet: {names}.",
         )
     if not functions:
-        message = "No supported top-level function could be identified."
-        if len(candidates) == 1:
-            candidate = candidates[0]
-            unsupported_signature = (
-                f"{' '.join(candidate.group('return_type').split())} "
-                f"{candidate.group('name')}"
-                f"({' '.join(candidate.group('parameters').split())})"
-            )
-            suffix = (
-                " Void returns are unsupported."
-                if candidate.group("return_type").strip() == "void"
-                else ""
-            )
-            message = (
-                f"This function signature is not supported yet: "
-                f"{unsupported_signature}.{suffix}"
-            )
+        errors = [error for _, error in parsed_candidates if error]
         return FunctionAnalysis(
             mode="unsupported",
-            message=message,
+            message=(
+                errors[0]
+                if len(candidates) == 1 and errors
+                else "No supported top-level function could be identified."
+            ),
         )
 
-    return FunctionAnalysis(
-        mode="function",
-        functions=functions,
-    )
+    return FunctionAnalysis(mode="function", functions=functions)

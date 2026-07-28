@@ -170,6 +170,9 @@ export default function EditorPage() {
   );
   const [testRunError, setTestRunError] = useState<string | null>(null);
   const [isRunningTests, setIsRunningTests] = useState(false);
+  const [comparisonMode, setComparisonMode] = useState<
+    "whitespace_tolerant" | "exact"
+  >("whitespace_tolerant");
   const [testMode, setTestMode] = useState<TestModeAnalysis | null>(null);
   const [selectedFunctionId, setSelectedFunctionId] = useState<string | null>(
     null,
@@ -186,6 +189,7 @@ export default function EditorPage() {
   const nextTestIdRef = useRef(2);
   const selectedFunctionIdRef = useRef<string | null>(null);
   const latestCompileRequestRef = useRef(0);
+  const isCompileInFlightRef = useRef(false);
   const hasCompletedCompileRef = useRef(false);
   const autoCompileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -204,6 +208,7 @@ export default function EditorPage() {
   }, [reviewedCode, router]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
@@ -401,6 +406,7 @@ export default function EditorPage() {
       setIsChecking(true);
     }
     setIsCompiling(true);
+    isCompileInFlightRef.current = true;
     const submittedVersion = codeVersionRef.current;
 
     try {
@@ -443,6 +449,7 @@ export default function EditorPage() {
         isMountedRef.current &&
         requestId === latestCompileRequestRef.current
       ) {
+        isCompileInFlightRef.current = false;
         setIsCompiling(false);
       }
     }
@@ -498,6 +505,7 @@ export default function EditorPage() {
               mode: "program" as const,
               code: currentCode,
               language: "cpp" as const,
+              comparison_mode: comparisonMode,
               tests: testCases.map(({ name, stdin, expected_stdout }) => ({
                 name,
                 stdin,
@@ -603,6 +611,14 @@ export default function EditorPage() {
 
   function removeTestCase(id: string) {
     setTestCases((current) => current.filter((test) => test.id !== id));
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function updateComparisonMode(
+    mode: "whitespace_tolerant" | "exact",
+  ) {
+    setComparisonMode(mode);
     setTestRunResult(null);
     setTestRunError(null);
   }
@@ -757,8 +773,13 @@ export default function EditorPage() {
                 setTestRunError(null);
                 setIsAnalyzingTests(true);
                 setTestModeError(null);
-                if (hasCompletedCompileRef.current) {
-                  setIsChecking(true);
+                if (
+                  hasCompletedCompileRef.current ||
+                  isCompileInFlightRef.current
+                ) {
+                  if (hasCompletedCompileRef.current) {
+                    setIsChecking(true);
+                  }
                   setCheckError(null);
                   autoCompileTimerRef.current = setTimeout(() => {
                     autoCompileTimerRef.current = null;
@@ -1056,6 +1077,35 @@ export default function EditorPage() {
                     </div>
                   )}
 
+                  {testMode?.mode === "program" && (
+                    <div className="mt-3">
+                      <label
+                        htmlFor="program-comparison-mode"
+                        className="block text-xs font-medium text-slate-600"
+                      >
+                        Output comparison
+                      </label>
+                      <select
+                        id="program-comparison-mode"
+                        value={comparisonMode}
+                        disabled={isRunningTests}
+                        onChange={(event) =>
+                          updateComparisonMode(
+                            event.target.value as
+                              | "whitespace_tolerant"
+                              | "exact",
+                          )
+                        }
+                        className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-xs text-slate-700 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <option value="whitespace_tolerant">
+                          Ignore whitespace differences
+                        </option>
+                        <option value="exact">Exact match</option>
+                      </select>
+                    </div>
+                  )}
+
                   {testMode?.mode === "function" &&
                     testMode.functions.length > 1 && (
                       <div className="mt-3">
@@ -1136,32 +1186,48 @@ export default function EditorPage() {
                                 (parameter, parameterIndex) => (
                                   <div
                                     key={`${test.id}-${parameter.name}`}
-                                    className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)] items-center gap-2"
+                                    className="min-w-0"
                                   >
                                     <label
                                       htmlFor={`${test.id}-argument-${parameterIndex}`}
-                                      className="truncate text-xs text-slate-600"
+                                      className="block min-w-0 text-xs font-medium text-slate-600"
                                     >
-                                      {parameter.name}{" "}
-                                      <span className="text-slate-400">
-                                        ({parameter.type})
+                                      <span className="block">
+                                        {parameter.name}
+                                      </span>
+                                      <span className="mt-0.5 block break-words text-[11px] font-normal text-slate-400">
+                                        {parameter.type}
                                       </span>
                                     </label>
-                                    <input
-                                      id={`${test.id}-argument-${parameterIndex}`}
-                                      value={
-                                        test.arguments[parameterIndex] ?? ""
-                                      }
-                                      maxLength={1_000}
-                                      onChange={(event) =>
-                                        updateTestArgument(
-                                          test.id,
-                                          parameterIndex,
-                                          event.target.value,
-                                        )
-                                      }
-                                      className="min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                    />
+                                    <div className="mt-1 min-w-0">
+                                      <input
+                                        id={`${test.id}-argument-${parameterIndex}`}
+                                        value={
+                                          test.arguments[parameterIndex] ?? ""
+                                        }
+                                        maxLength={1_000}
+                                        placeholder={
+                                          parameter.type_metadata.kind ===
+                                          "vector"
+                                            ? "[1, 2, 3]"
+                                            : undefined
+                                        }
+                                        onChange={(event) =>
+                                          updateTestArgument(
+                                            test.id,
+                                            parameterIndex,
+                                            event.target.value,
+                                          )
+                                        }
+                                        className="w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                      />
+                                      {parameter.type_metadata.kind ===
+                                        "vector" && (
+                                        <p className="mt-1 text-[11px] text-slate-500">
+                                          Enter values like [1, 2, 3]
+                                        </p>
+                                      )}
+                                    </div>
                                   </div>
                                 ),
                               )}
@@ -1175,11 +1241,18 @@ export default function EditorPage() {
                               htmlFor={`${test.id}-expected-return`}
                               className="mt-3 block text-xs font-medium text-slate-600"
                             >
-                              Expected return
+                              Expected return —{" "}
+                              {selectedFunction.return_type_metadata.display_type}
                             </label>
                             <input
                               id={`${test.id}-expected-return`}
                               value={test.expected_return}
+                              placeholder={
+                                selectedFunction.return_type_metadata.kind ===
+                                "vector"
+                                  ? "[1, 2, 3]"
+                                  : undefined
+                              }
                               maxLength={1_000}
                               onChange={(event) =>
                                 updateTestCase(
@@ -1190,6 +1263,12 @@ export default function EditorPage() {
                               }
                               className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
                             />
+                            {selectedFunction.return_type_metadata.kind ===
+                              "vector" && (
+                              <p className="mt-1 text-[11px] text-slate-500">
+                                Enter values like [1, 2, 3]
+                              </p>
+                            )}
                           </>
                         ) : (
                           <>
@@ -1392,8 +1471,15 @@ export default function EditorPage() {
                             <p className="mt-2 text-xs text-slate-500">
                               Formatting differences ignored
                             </p>
-                          ) : !result.passed &&
-                            !isFunctionResult(result) ? (
+                          ) : result.match_type === "formatting_mismatch" ? (
+                            <p className="mt-2 text-xs text-slate-600">
+                              Output values match, but formatting differs.
+                            </p>
+                          ) : null}
+                          {!result.timed_out &&
+                            !result.output_limited &&
+                            !result.passed &&
+                            !isFunctionResult(result) && (
                             <div className="mt-3 grid gap-3">
                               <div>
                                 <p className="text-xs font-medium text-slate-500">
@@ -1412,7 +1498,7 @@ export default function EditorPage() {
                                 </pre>
                               </div>
                             </div>
-                          ) : null}
+                          )}
                           {result.stderr && (
                             <details className="mt-3">
                               <summary className="cursor-pointer text-xs font-medium text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900">

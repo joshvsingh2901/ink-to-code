@@ -11,6 +11,7 @@ from app.schemas.test_execution import (
     FunctionResponse,
     FunctionRunTestsRequest,
     FunctionTestResult,
+    FunctionTypeResponse,
     ProgramRunTestsRequest,
     ProgramTestCase,
     ProgramTestResult,
@@ -25,6 +26,7 @@ from app.services.compiler import (
 from app.services.function_analysis import (
     FunctionAnalysis,
     FunctionSignature,
+    ValueType,
     analyze_test_mode,
 )
 
@@ -64,16 +66,47 @@ def _classify_output_match(expected: str, actual: str) -> str:
     return "mismatch"
 
 
+def _classify_program_output_match(
+    expected: str,
+    actual: str,
+    comparison_mode: str,
+) -> str:
+    if comparison_mode == "whitespace_tolerant":
+        return _classify_output_match(expected, actual)
+
+    normalized_expected = expected.replace("\r\n", "\n")
+    normalized_actual = actual.replace("\r\n", "\n")
+    if normalized_expected == normalized_actual:
+        return "exact"
+    if normalized_expected.split() == normalized_actual.split():
+        return "formatting_mismatch"
+    return "mismatch"
+
+
 def _function_response(signature: FunctionSignature) -> FunctionResponse:
+    def type_response(value_type: ValueType) -> FunctionTypeResponse:
+        return FunctionTypeResponse(
+            kind=value_type.kind,
+            display_type=value_type.display_type,
+            scalar_type=value_type.scalar_type,
+            element_type=value_type.element_type,
+            passing=value_type.passing,
+        )
+
     return FunctionResponse(
         id=signature.id,
         name=signature.name,
         return_type=signature.return_type,
         parameters=[
-            {"name": parameter.name, "type": parameter.type}
+            {
+                "name": parameter.name,
+                "type": parameter.type,
+                "type_metadata": type_response(parameter.value_type),
+            }
             for parameter in signature.parameters
         ],
         display=signature.display,
+        return_type_metadata=type_response(signature.return_value_type),
     )
 
 
@@ -206,6 +239,123 @@ def _safe_literal(type_name: str, raw_value: str, label: str) -> str:
     raise ValueError(f"{label} uses an unsupported type.")
 
 
+def _split_vector_input(raw_value: str, label: str) -> list[str]:
+    value = raw_value.strip()
+    if not value:
+        raise ValueError(f"{label} must contain values or use [] for empty.")
+    if value == "[]":
+        return []
+    if value.startswith("[") or value.endswith("]"):
+        if not (value.startswith("[") and value.endswith("]")):
+            raise ValueError(
+                f"{label} must use matching square brackets."
+            )
+        value = value[1:-1].strip()
+        if not value:
+            return []
+    if any(character in value for character in "{}()"):
+        raise ValueError(
+            f"{label} must contain data values, not C++ expressions."
+        )
+    if "," in value:
+        elements = [element.strip() for element in value.split(",")]
+        if any(not element for element in elements):
+            raise ValueError(f"{label} contains an empty vector element.")
+        return elements
+    return value.split()
+
+
+def _vector_literal(
+    value_type: ValueType,
+    raw_value: str,
+    label: str,
+) -> str:
+    element_type = value_type.element_type
+    if element_type is None:
+        raise ValueError(f"{label} uses an unsupported vector type.")
+    elements = _split_vector_input(raw_value, label)
+    literals = [
+        _safe_literal(element_type, element, f"{label} element {index + 1}")
+        for index, element in enumerate(elements)
+    ]
+    return f"std::vector<{element_type}>{{{', '.join(literals)}}}"
+
+
+def _safe_value_literal(
+    value_type: ValueType,
+    raw_value: str,
+    label: str,
+) -> str:
+    if value_type.kind == "vector":
+        return _vector_literal(value_type, raw_value, label)
+    if value_type.scalar_type is None:
+        raise ValueError(f"{label} uses an unsupported scalar type.")
+    return _safe_literal(value_type.scalar_type, raw_value, label)
+
+
+def _typed_vector_values(
+    value_type: ValueType,
+    raw_value: str,
+    label: str,
+) -> list[int | float | bool]:
+    element_type = value_type.element_type
+    if element_type is None:
+        raise ValueError(f"{label} uses an unsupported vector type.")
+    values: list[int | float | bool] = []
+    for index, element in enumerate(_split_vector_input(raw_value, label)):
+        _safe_literal(element_type, element, f"{label} element {index + 1}")
+        if element_type == "bool":
+            values.append(element.strip() == "true")
+        elif element_type == "double":
+            values.append(float(element.strip()))
+        else:
+            values.append(int(element.strip()))
+    return values
+
+
+def _classify_vector_match(
+    value_type: ValueType,
+    expected: str,
+    actual: str,
+) -> str:
+    try:
+        expected_values = _typed_vector_values(
+            value_type, expected, "Expected return"
+        )
+        actual_values = _typed_vector_values(
+            value_type, actual, "Actual return"
+        )
+    except ValueError:
+        return "mismatch"
+    if expected_values != actual_values:
+        return "mismatch"
+    return "exact" if expected == actual else "whitespace_normalized"
+
+
+def _vector_output(function: FunctionSignature, call: str) -> str:
+    element_type = function.return_value_type.element_type
+    value_output = "inktocode_result[inktocode_index]"
+    if element_type == "bool":
+        value_output = f"std::boolalpha << {value_output}"
+    elif element_type == "double":
+        value_output = (
+            f"std::setprecision({DOUBLE_OUTPUT_PRECISION}) << {value_output}"
+        )
+    return " ".join(
+        [
+            f"auto inktocode_result = {call};",
+            'std::cout << "[";',
+            "for (std::size_t inktocode_index = 0;",
+            "inktocode_index < inktocode_result.size();",
+            "++inktocode_index) {",
+            'if (inktocode_index != 0) std::cout << ", ";',
+            f"std::cout << {value_output};",
+            "}",
+            'std::cout << "]";',
+        ]
+    )
+
+
 def _build_function_harness(
     code: str,
     function: FunctionSignature,
@@ -214,7 +364,9 @@ def _build_function_harness(
     cases: list[str] = []
     for index, literals in enumerate(argument_literals):
         call = f"{function.name}({', '.join(literals)})"
-        if function.return_type == "bool":
+        if function.return_value_type.kind == "vector":
+            output = _vector_output(function, call)
+        elif function.return_type == "bool":
             output = f"std::cout << std::boolalpha << {call};"
         elif function.return_type == "double":
             output = (
@@ -242,6 +394,7 @@ def _build_function_harness(
     return (
         "#include <iomanip>\n"
         "#include <iostream>\n\n"
+        "#include <vector>\n\n"
         f"{code}\n\n"
         f"{generated_main}\n"
     )
@@ -262,15 +415,16 @@ def _program_results(
             test.stdin,
             timeout_seconds=timeout_seconds,
         )
-        match_type = _classify_output_match(
+        match_type = _classify_program_output_match(
             test.expected_stdout,
             output.stdout,
+            request.comparison_mode,
         )
         passed = (
             not output.timed_out
             and not output.output_limited
             and output.exit_code == 0
-            and match_type != "mismatch"
+            and match_type not in {"formatting_mismatch", "mismatch"}
         )
         results.append(
             ProgramTestResult(
@@ -292,6 +446,7 @@ def _function_results(
     executable: Path,
     working_directory: Path,
     request: FunctionRunTestsRequest,
+    function: FunctionSignature,
     *,
     timeout_seconds: float,
 ) -> list[FunctionTestResult]:
@@ -303,9 +458,17 @@ def _function_results(
             f"{index}\n",
             timeout_seconds=timeout_seconds,
         )
-        match_type = _classify_output_match(
-            test.expected_return,
-            output.stdout,
+        match_type = (
+            _classify_vector_match(
+                function.return_value_type,
+                test.expected_return,
+                output.stdout,
+            )
+            if function.return_value_type.kind == "vector"
+            else _classify_output_match(
+                test.expected_return,
+                output.stdout,
+            )
         )
         passed = (
             not output.timed_out
@@ -393,8 +556,8 @@ def run_test_request(
                 )
             try:
                 literals = [
-                    _safe_literal(
-                        parameter.type,
+                    _safe_value_literal(
+                        parameter.value_type,
                         argument,
                         f"{test.name} argument {parameter.name}",
                     )
@@ -404,8 +567,8 @@ def run_test_request(
                         strict=True,
                     )
                 ]
-                _safe_literal(
-                    function.return_type,
+                _safe_value_literal(
+                    function.return_value_type,
                     test.expected_return,
                     f"{test.name} expected return",
                 )
@@ -465,6 +628,7 @@ def run_test_request(
                 executable,
                 working_directory,
                 request,
+                function,
                 timeout_seconds=test_timeout_seconds,
             )
             return RunTestsResponse(
@@ -500,12 +664,14 @@ def run_cpp_tests(
     compiler: str = COMPILER_EXECUTABLE,
     compile_timeout_seconds: int = COMPILE_TIMEOUT_SECONDS,
     test_timeout_seconds: float = TEST_TIMEOUT_SECONDS,
+    comparison_mode: str = "whitespace_tolerant",
 ) -> RunTestsResponse:
     return run_test_request(
         ProgramRunTestsRequest(
             mode="program",
             code=code,
             language="cpp",
+            comparison_mode=comparison_mode,
             tests=tests,
         ),
         compiler=compiler,

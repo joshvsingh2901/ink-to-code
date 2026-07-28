@@ -349,3 +349,17 @@ The expected request should contain the current source code in structured JSON, 
 - The backend must never guess which function is intended.
 - The selected target function is the only function directly invoked by the generated harness.
 - All other user-defined functions must remain available so the selected function can call them normally.
+
+
+## Vector function testing
+
+- Function-mode tests may support selected `std::vector` parameter and return types.
+- Vector test values must be entered as data, never as arbitrary C++ expressions.
+- The backend must validate and safely convert vector elements into generated C++ literals.
+- The initial vector implementation supports one-dimensional vectors only.
+- Supported element types are `int`, `long`, `long long`, `double`, and `bool`.
+- Vector parameters may initially be passed by value or by const reference.
+- Non-const reference mutation and `void` functions are not supported yet.
+- Vector results must use deterministic serialization for comparison.
+- Generated harness code must never modify the Monaco source.
+- Full-program stdin/stdout testing and scalar function testing must remain unchanged.

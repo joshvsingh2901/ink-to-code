@@ -3,15 +3,25 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 
+class FunctionTypeResponse(BaseModel):
+    kind: Literal["scalar", "vector"]
+    display_type: str
+    scalar_type: str | None = None
+    element_type: str | None = None
+    passing: Literal["value", "const_reference"]
+
+
 class FunctionParameterResponse(BaseModel):
     name: str
     type: str
+    type_metadata: FunctionTypeResponse
 
 
 class FunctionResponse(BaseModel):
     id: str
     name: str
     return_type: str
+    return_type_metadata: FunctionTypeResponse
     parameters: list[FunctionParameterResponse]
     display: str
 
@@ -43,6 +53,9 @@ class ProgramRunTestsRequest(BaseModel):
     mode: Literal["program"]
     code: str = Field(min_length=1, max_length=1_000_000)
     language: Literal["cpp"]
+    comparison_mode: Literal["whitespace_tolerant", "exact"] = (
+        "whitespace_tolerant"
+    )
     tests: list[ProgramTestCase] = Field(min_length=1, max_length=10)
 
 
@@ -69,7 +82,12 @@ class ProgramTestResult(BaseModel):
     exit_code: int | None
     timed_out: bool
     output_limited: bool
-    match_type: Literal["exact", "whitespace_normalized", "mismatch"]
+    match_type: Literal[
+        "exact",
+        "whitespace_normalized",
+        "formatting_mismatch",
+        "mismatch",
+    ]
 
 
 class FunctionTestResult(BaseModel):

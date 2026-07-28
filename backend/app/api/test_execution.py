@@ -6,6 +6,7 @@ from app.api.compilation import error_response
 from app.schemas.test_execution import (
     FunctionParameterResponse,
     FunctionResponse,
+    FunctionTypeResponse,
     RunTestsRequest,
     RunTestsResponse,
     SourceModeRequest,
@@ -37,10 +38,24 @@ async def analyze_source_mode(
                     FunctionParameterResponse(
                         name=parameter.name,
                         type=parameter.type,
+                        type_metadata=FunctionTypeResponse(
+                            kind=parameter.value_type.kind,
+                            display_type=parameter.value_type.display_type,
+                            scalar_type=parameter.value_type.scalar_type,
+                            element_type=parameter.value_type.element_type,
+                            passing=parameter.value_type.passing,
+                        ),
                     )
                     for parameter in function.parameters
                 ],
                 display=function.display,
+                return_type_metadata=FunctionTypeResponse(
+                    kind=function.return_value_type.kind,
+                    display_type=function.return_value_type.display_type,
+                    scalar_type=function.return_value_type.scalar_type,
+                    element_type=function.return_value_type.element_type,
+                    passing=function.return_value_type.passing,
+                ),
             )
             for function in analysis.functions
         ],

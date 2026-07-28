@@ -67,6 +67,17 @@ expressions are never accepted. A temporary harness calls the unchanged user
 target. Bool returns print as `true` or `false`, and doubles use 17 significant
 digits without fuzzy comparison.
 
+Function tests also support one-dimensional `std::vector<T>` parameters and
+returns where `T` is `int`, `long`, `long long`, `double`, or `bool`. Parameters
+may be passed by value or by const reference; vector returns must be by value.
+Unqualified `vector<T>` is accepted only when the source contains
+`using namespace std;`. Inputs may use `[1, 2, 3]`, `1, 2, 3`, or `1 2 3`;
+`[]` represents an empty vector. Elements are validated as data and converted
+to safe literals before harness generation. Results use canonical
+`[1, 2, 3]` serialization and exact typed sequence comparison with no fuzzy
+numeric tolerance. Nested vectors, unsupported element types, vector pointers,
+non-const references, and mutation-through-void signatures are not supported.
+
 The test runner compiles with a fixed argument list, runs only after an explicit
 request, and uses a unique temporary directory that is deleted afterward.
 Generated harness code exists only in that directory and never changes the

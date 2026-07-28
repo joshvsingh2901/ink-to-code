@@ -1,12 +1,22 @@
 export type FunctionParameter = {
   name: string;
   type: string;
+  type_metadata: FunctionTypeMetadata;
+};
+
+export type FunctionTypeMetadata = {
+  kind: "scalar" | "vector";
+  display_type: string;
+  scalar_type: string | null;
+  element_type: string | null;
+  passing: "value" | "const_reference";
 };
 
 export type FunctionDescriptor = {
   id: string;
   name: string;
   return_type: string;
+  return_type_metadata: FunctionTypeMetadata;
   parameters: FunctionParameter[];
   display: string;
 };
@@ -36,7 +46,11 @@ type ResultBase = {
   exit_code: number | null;
   timed_out: boolean;
   output_limited: boolean;
-  match_type: "exact" | "whitespace_normalized" | "mismatch";
+  match_type:
+    | "exact"
+    | "whitespace_normalized"
+    | "formatting_mismatch"
+    | "mismatch";
 };
 
 export type ProgramTestResult = ResultBase & {
@@ -65,6 +79,7 @@ export type RunTestsRequest =
       mode: "program";
       code: string;
       language: "cpp";
+      comparison_mode: "whitespace_tolerant" | "exact";
       tests: ProgramTestInput[];
     }
   | {
@@ -91,6 +106,7 @@ function isFunctionDescriptor(value: unknown): value is FunctionDescriptor {
     typeof descriptor.id === "string" &&
     typeof descriptor.name === "string" &&
     typeof descriptor.return_type === "string" &&
+    isFunctionTypeMetadata(descriptor.return_type_metadata) &&
     typeof descriptor.display === "string" &&
     Array.isArray(descriptor.parameters) &&
     descriptor.parameters.every(
@@ -98,15 +114,35 @@ function isFunctionDescriptor(value: unknown): value is FunctionDescriptor {
         parameter !== null &&
         typeof parameter === "object" &&
         typeof parameter.name === "string" &&
-        typeof parameter.type === "string",
+        typeof parameter.type === "string" &&
+        isFunctionTypeMetadata(parameter.type_metadata),
     )
   );
 }
 
-function isMatchType(value: unknown) {
-  return ["exact", "whitespace_normalized", "mismatch"].includes(
-    typeof value === "string" ? value : "",
+function isFunctionTypeMetadata(
+  value: unknown,
+): value is FunctionTypeMetadata {
+  if (!value || typeof value !== "object") return false;
+  const metadata = value as Partial<FunctionTypeMetadata>;
+  return (
+    ["scalar", "vector"].includes(metadata.kind ?? "") &&
+    typeof metadata.display_type === "string" &&
+    (metadata.scalar_type === null ||
+      typeof metadata.scalar_type === "string") &&
+    (metadata.element_type === null ||
+      typeof metadata.element_type === "string") &&
+    ["value", "const_reference"].includes(metadata.passing ?? "")
   );
+}
+
+function isMatchType(value: unknown) {
+  return [
+    "exact",
+    "whitespace_normalized",
+    "formatting_mismatch",
+    "mismatch",
+  ].includes(typeof value === "string" ? value : "");
 }
 
 function isResultBase(value: unknown): value is ResultBase {

@@ -91,7 +91,6 @@ Do not add these unless explicitly requested:
 - Gemini-generated test cases;
 - automatic code repair;
 - AI-generated code fixes;
-- function harness generation for function-only submissions;
 - Docker-based sandboxing;
 - production-grade remote code execution infrastructure;
 - authentication;
@@ -109,7 +108,7 @@ For the current local MVP:
 - test execution may run student C++ code only after an explicit `Run Tests` action;
 - auto-compile must never execute student code;
 - test execution must use strict timeouts, output limits, temporary files, and safe subprocess invocation;
-- function-only code without `main()` is not executable yet;
+- supported function-only code may execute through a deterministic temporary harness;
 - stronger sandboxing is required before arbitrary code execution is exposed to real users.
 
 ## Definition of done
@@ -313,8 +312,8 @@ The expected request should contain the current source code in structured JSON, 
 - Compile and Run Tests are separate operations.
 - Compile performs C++17 syntax/type checking and does not require `main()`.
 - Run Tests executes student code only after an explicit user action.
-- Run Tests currently requires a complete runnable C++ program with `main()`.
-- Function-only harness generation is not implemented yet.
+- Full-program tests execute code containing `main()` with stdin/stdout cases.
+- Supported function-only tests execute through a deterministic temporary harness.
 - Tests are explicit/manual in this stage.
 - Gemini must not generate tests, expected outputs, or runtime fixes.
 - Test execution must use strict timeouts and output-size limits.
@@ -332,3 +331,21 @@ The expected request should contain the current source code in structured JSON, 
 - A compile failure during Run Tests must prevent execution.
 - Local subprocess execution is for development only and is not production-grade sandboxing.
 - Stronger sandboxing/container isolation is required before exposing arbitrary code execution to real users.
+
+## Function test harness stage
+
+- InkToCode may generate deterministic temporary C++ harness code for testing function-only submissions.
+- Generated harness code must never modify the Monaco source shown to the user.
+- Harness generation is infrastructure only and must not use Gemini.
+- The user's submitted function must remain unchanged.
+- Function tests use explicit argument values and explicit expected results.
+- The initial version should support simple function signatures only.
+- Unsupported signatures must return a clear unsupported message rather than guessing.
+- Full programs with `main()` continue to use stdin/stdout tests.
+- Function-only tests and full-program tests are separate execution modes.
+
+- Function-only submissions may contain multiple supported top-level functions.
+- When multiple supported functions are detected, the frontend must let the user choose which function to test.
+- The backend must never guess which function is intended.
+- The selected target function is the only function directly invoked by the generated harness.
+- All other user-defined functions must remain available so the selected function can call them normally.

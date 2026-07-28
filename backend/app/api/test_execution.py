@@ -3,11 +3,49 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.api.compilation import error_response
-from app.schemas.test_execution import RunTestsRequest, RunTestsResponse
+from app.schemas.test_execution import (
+    FunctionParameterResponse,
+    FunctionResponse,
+    RunTestsRequest,
+    RunTestsResponse,
+    SourceModeRequest,
+    SourceModeResponse,
+)
 from app.services.compiler import CompilerServiceError
-from app.services.test_execution import run_cpp_tests
+from app.services.function_analysis import analyze_test_mode
+from app.services.test_execution import run_test_request
 
 router = APIRouter(prefix="/api", tags=["test execution"])
+
+
+@router.post(
+    "/test-mode",
+    response_model=SourceModeResponse,
+)
+async def analyze_source_mode(
+    request: SourceModeRequest,
+) -> SourceModeResponse:
+    analysis = await run_in_threadpool(analyze_test_mode, request.code)
+    return SourceModeResponse(
+        mode=analysis.mode,
+        functions=[
+            FunctionResponse(
+                id=function.id,
+                name=function.name,
+                return_type=function.return_type,
+                parameters=[
+                    FunctionParameterResponse(
+                        name=parameter.name,
+                        type=parameter.type,
+                    )
+                    for parameter in function.parameters
+                ],
+                display=function.display,
+            )
+            for function in analysis.functions
+        ],
+        message=analysis.message,
+    )
 
 
 @router.post(
@@ -26,9 +64,8 @@ async def run_tests(
 
     try:
         return await run_in_threadpool(
-            run_cpp_tests,
-            request.code,
-            request.tests,
+            run_test_request,
+            request,
         )
     except CompilerServiceError as error:
         return error_response(error.code, error.message, error.status_code)

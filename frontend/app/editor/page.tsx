@@ -10,8 +10,12 @@ import {
   type CompileResult,
 } from "@/lib/compiler";
 import {
+  analyzeTestMode,
   runCppTests,
+  type FunctionTestResult,
+  type ProgramTestResult,
   type RunTestsResult,
+  type TestModeAnalysis,
 } from "@/lib/testExecution";
 
 type SidebarTab = "compiler" | "tests";
@@ -37,6 +41,8 @@ type EditableTestCase = {
   name: string;
   stdin: string;
   expected_stdout: string;
+  arguments: string[];
+  expected_return: string;
 };
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
@@ -49,6 +55,8 @@ const INITIAL_TEST_CASE: EditableTestCase = {
   name: "Test 1",
   stdin: "",
   expected_stdout: "",
+  arguments: [],
+  expected_return: "",
 };
 
 function sanitizeFilename(filename: string) {
@@ -65,6 +73,12 @@ function isPrimaryDiagnostic(
   diagnostic: CompileDiagnostic,
 ): diagnostic is PrimaryDiagnostic {
   return diagnostic.severity === "error" || diagnostic.severity === "warning";
+}
+
+function isFunctionResult(
+  result: ProgramTestResult | FunctionTestResult,
+): result is FunctionTestResult {
+  return "expected_return" in result;
 }
 
 function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
@@ -156,6 +170,12 @@ export default function EditorPage() {
   );
   const [testRunError, setTestRunError] = useState<string | null>(null);
   const [isRunningTests, setIsRunningTests] = useState(false);
+  const [testMode, setTestMode] = useState<TestModeAnalysis | null>(null);
+  const [selectedFunctionId, setSelectedFunctionId] = useState<string | null>(
+    null,
+  );
+  const [testModeError, setTestModeError] = useState<string | null>(null);
+  const [isAnalyzingTests, setIsAnalyzingTests] = useState(true);
   const [isEdited, setIsEdited] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const initialCodeRef = useRef(reviewedCode ?? "");
@@ -164,6 +184,7 @@ export default function EditorPage() {
   const currentSourceRef = useRef(reviewedCode ?? "");
   const codeVersionRef = useRef(0);
   const nextTestIdRef = useRef(2);
+  const selectedFunctionIdRef = useRef<string | null>(null);
   const latestCompileRequestRef = useRef(0);
   const hasCompletedCompileRef = useRef(false);
   const autoCompileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -195,6 +216,73 @@ export default function EditorPage() {
       issueHighlightRef.current?.clear();
     };
   }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      setIsAnalyzingTests(true);
+      setTestModeError(null);
+      void analyzeTestMode(code, controller.signal)
+        .then((analysis) => {
+          if (controller.signal.aborted) return;
+          setTestMode(analysis);
+          if (analysis.mode === "function") {
+            const previousId = selectedFunctionIdRef.current;
+            const nextId =
+              analysis.functions.length === 1
+                ? analysis.functions[0].id
+                : analysis.functions.some(
+                      (candidate) => candidate.id === previousId,
+                    )
+                  ? previousId
+                  : null;
+            const nextFunction =
+              analysis.functions.find(
+                (candidate) => candidate.id === nextId,
+              ) ?? null;
+            selectedFunctionIdRef.current = nextId;
+            setSelectedFunctionId(nextId);
+            setTestCases((current) =>
+              current.map((test) => ({
+                ...test,
+                arguments: nextFunction
+                  ? nextFunction.parameters.map(
+                      (_, index) =>
+                        nextId === previousId
+                          ? (test.arguments[index] ?? "")
+                          : "",
+                    )
+                  : [],
+                expected_return:
+                  nextId === previousId ? test.expected_return : "",
+              })),
+            );
+          } else {
+            selectedFunctionIdRef.current = null;
+            setSelectedFunctionId(null);
+          }
+        })
+        .catch((error) => {
+          if (controller.signal.aborted) return;
+          setTestMode(null);
+          setTestModeError(
+            error instanceof Error
+              ? error.message
+              : "The test mode could not be determined.",
+          );
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setIsAnalyzingTests(false);
+          }
+        });
+    }, 400);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [code]);
 
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -366,7 +454,24 @@ export default function EditorPage() {
   }
 
   async function handleRunTests() {
-    if (isRunningTests) return;
+    if (
+      isRunningTests ||
+      !testMode ||
+      testMode.mode === "unsupported"
+    ) {
+      setActiveTab("tests");
+      return;
+    }
+    const selectedFunction =
+      testMode.mode === "function"
+        ? (testMode.functions.find(
+            (candidate) => candidate.id === selectedFunctionIdRef.current,
+          ) ?? null)
+        : null;
+    if (testMode.mode === "function" && !selectedFunction) {
+      setActiveTab("tests");
+      return;
+    }
     setActiveTab("tests");
     setIsRunningTests(true);
     setTestRunError(null);
@@ -374,14 +479,32 @@ export default function EditorPage() {
 
     try {
       const currentCode = editorRef.current?.getValue() ?? code;
-      const result = await runCppTests(
-        currentCode,
-        testCases.map(({ name, stdin, expected_stdout }) => ({
-          name,
-          stdin,
-          expected_stdout,
-        })),
-      );
+      const request =
+        testMode.mode === "function"
+          ? {
+              mode: "function" as const,
+              code: currentCode,
+              language: "cpp" as const,
+              target_function: selectedFunction!.id,
+              tests: testCases.map(
+                ({ name, arguments: argumentValues, expected_return }) => ({
+                  name,
+                  arguments: argumentValues,
+                  expected_return,
+                }),
+              ),
+            }
+          : {
+              mode: "program" as const,
+              code: currentCode,
+              language: "cpp" as const,
+              tests: testCases.map(({ name, stdin, expected_stdout }) => ({
+                name,
+                stdin,
+                expected_stdout,
+              })),
+            };
+      const result = await runCppTests(request);
       if (!isMountedRef.current) return;
       setTestRunResult(result);
     } catch (error) {
@@ -400,12 +523,33 @@ export default function EditorPage() {
 
   function updateTestCase(
     id: string,
-    field: "name" | "stdin" | "expected_stdout",
+    field:
+      | "name"
+      | "stdin"
+      | "expected_stdout"
+      | "expected_return",
     value: string,
   ) {
     setTestCases((current) =>
       current.map((test) =>
         test.id === id ? { ...test, [field]: value } : test,
+      ),
+    );
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function updateTestArgument(id: string, index: number, value: string) {
+    setTestCases((current) =>
+      current.map((test) =>
+        test.id === id
+          ? {
+              ...test,
+              arguments: test.arguments.map((argument, argumentIndex) =>
+                argumentIndex === index ? value : argument,
+              ),
+            }
+          : test,
       ),
     );
     setTestRunResult(null);
@@ -423,8 +567,36 @@ export default function EditorPage() {
         name: `Test ${sequence}`,
         stdin: "",
         expected_stdout: "",
+        arguments:
+          testMode?.mode === "function" && selectedFunction
+            ? selectedFunction.parameters.map(() => "")
+            : [],
+        expected_return: "",
       },
     ]);
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function selectFunction(functionId: string) {
+    const nextId = functionId || null;
+    const nextFunction =
+      testMode?.mode === "function"
+        ? (testMode.functions.find(
+            (candidate) => candidate.id === nextId,
+          ) ?? null)
+        : null;
+    selectedFunctionIdRef.current = nextId;
+    setSelectedFunctionId(nextId);
+    setTestCases((current) =>
+      current.map((test) => ({
+        ...test,
+        arguments: nextFunction
+          ? nextFunction.parameters.map(() => "")
+          : [],
+        expected_return: "",
+      })),
+    );
     setTestRunResult(null);
     setTestRunError(null);
   }
@@ -479,6 +651,12 @@ export default function EditorPage() {
 
   const primaryDiagnostics =
     compileResult?.diagnostics.filter(isPrimaryDiagnostic) ?? [];
+  const selectedFunction =
+    testMode?.mode === "function"
+      ? (testMode.functions.find(
+          (candidate) => candidate.id === selectedFunctionId,
+        ) ?? null)
+      : null;
   const isCleanCompileSuccess =
     compileResult?.success === true &&
     compileResult.exit_code === 0 &&
@@ -538,7 +716,14 @@ export default function EditorPage() {
               <button
                 type="button"
                 onClick={() => void handleRunTests()}
-                disabled={isRunningTests || testCases.length === 0}
+                disabled={
+                  isRunningTests ||
+                  isAnalyzingTests ||
+                  !testMode ||
+                  testCases.length === 0 ||
+                  testMode?.mode === "unsupported" ||
+                  (testMode?.mode === "function" && !selectedFunction)
+                }
                 className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {isRunningTests ? "Running Tests..." : "Run Tests"}
@@ -570,6 +755,8 @@ export default function EditorPage() {
                 issueHighlightRef.current?.clear();
                 setTestRunResult(null);
                 setTestRunError(null);
+                setIsAnalyzingTests(true);
+                setTestModeError(null);
                 if (hasCompletedCompileRef.current) {
                   setIsChecking(true);
                   setCheckError(null);
@@ -810,17 +997,31 @@ export default function EditorPage() {
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <h3 className="text-sm font-medium text-slate-800">
-                        Explicit Tests
+                        {testMode?.mode === "function"
+                          ? "Function Tests"
+                          : "Program Tests"}
                       </h3>
                       <p className="mt-1 text-xs leading-5 text-slate-500">
-                        Runnable programs must include main().
+                        {isAnalyzingTests
+                          ? "Determining test mode…"
+                          : testMode?.mode === "function" && selectedFunction
+                            ? `Function: ${selectedFunction.display}`
+                            : testMode?.mode === "function"
+                              ? "Choose a function to test."
+                            : testMode?.mode === "program"
+                              ? "Use standard input and expected output."
+                              : "Function testing is unavailable."}
                       </p>
                     </div>
                     <button
                       type="button"
                       onClick={addTestCase}
                       disabled={
-                        isRunningTests || testCases.length >= MAX_TEST_CASES
+                        isRunningTests ||
+                        isAnalyzingTests ||
+                        testMode?.mode === "unsupported" ||
+                        (testMode?.mode === "function" && !selectedFunction) ||
+                        testCases.length >= MAX_TEST_CASES
                       }
                       className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                     >
@@ -828,8 +1029,65 @@ export default function EditorPage() {
                     </button>
                   </div>
 
+                  {testModeError && (
+                    <div
+                      role="alert"
+                      className="mt-3 border-l-2 border-rose-300 pl-3"
+                    >
+                      <p className="text-sm font-medium text-slate-800">
+                        Test mode unavailable
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-slate-600">
+                        {testModeError}
+                      </p>
+                    </div>
+                  )}
+                  {testMode?.mode === "unsupported" && (
+                    <div
+                      role="status"
+                      className="mt-3 rounded-md border border-slate-200 p-3"
+                    >
+                      <p className="text-sm font-medium text-slate-800">
+                        Function testing unavailable
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-slate-600">
+                        {testMode.message}
+                      </p>
+                    </div>
+                  )}
+
+                  {testMode?.mode === "function" &&
+                    testMode.functions.length > 1 && (
+                      <div className="mt-3">
+                        <label
+                          htmlFor="test-target-function"
+                          className="block text-xs font-medium text-slate-600"
+                        >
+                          Function to test
+                        </label>
+                        <select
+                          id="test-target-function"
+                          value={selectedFunctionId ?? ""}
+                          disabled={isRunningTests}
+                          onChange={(event) =>
+                            selectFunction(event.target.value)
+                          }
+                          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          <option value="">Choose a function</option>
+                          {testMode.functions.map((candidate) => (
+                            <option key={candidate.id} value={candidate.id}>
+                              {candidate.display} → {candidate.return_type}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                  {testMode && testMode.mode !== "unsupported" && (
                   <div className="mt-3 space-y-3">
-                    {testCases.map((test, index) => (
+                    {(testMode.mode === "program" || selectedFunction) &&
+                      testCases.map((test, index) => (
                       <fieldset
                         key={test.id}
                         disabled={isRunningTests}
@@ -867,49 +1125,120 @@ export default function EditorPage() {
                             Remove
                           </button>
                         </div>
-                        <label
-                          htmlFor={`${test.id}-stdin`}
-                          className="mt-3 block text-xs font-medium text-slate-600"
-                        >
-                          Standard input
-                        </label>
-                        <textarea
-                          id={`${test.id}-stdin`}
-                          value={test.stdin}
-                          maxLength={64 * 1024}
-                          rows={3}
-                          onChange={(event) =>
-                            updateTestCase(
-                              test.id,
-                              "stdin",
-                              event.target.value,
-                            )
-                          }
-                          className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                        />
-                        <label
-                          htmlFor={`${test.id}-expected`}
-                          className="mt-3 block text-xs font-medium text-slate-600"
-                        >
-                          Expected output
-                        </label>
-                        <textarea
-                          id={`${test.id}-expected`}
-                          value={test.expected_stdout}
-                          maxLength={64 * 1024}
-                          rows={3}
-                          onChange={(event) =>
-                            updateTestCase(
-                              test.id,
-                              "expected_stdout",
-                              event.target.value,
-                            )
-                          }
-                          className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                        />
+                        {testMode.mode === "function" &&
+                        selectedFunction ? (
+                          <>
+                            <p className="mt-3 text-xs font-medium text-slate-600">
+                              Arguments
+                            </p>
+                            <div className="mt-1.5 space-y-2">
+                              {selectedFunction.parameters.map(
+                                (parameter, parameterIndex) => (
+                                  <div
+                                    key={`${test.id}-${parameter.name}`}
+                                    className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)] items-center gap-2"
+                                  >
+                                    <label
+                                      htmlFor={`${test.id}-argument-${parameterIndex}`}
+                                      className="truncate text-xs text-slate-600"
+                                    >
+                                      {parameter.name}{" "}
+                                      <span className="text-slate-400">
+                                        ({parameter.type})
+                                      </span>
+                                    </label>
+                                    <input
+                                      id={`${test.id}-argument-${parameterIndex}`}
+                                      value={
+                                        test.arguments[parameterIndex] ?? ""
+                                      }
+                                      maxLength={1_000}
+                                      onChange={(event) =>
+                                        updateTestArgument(
+                                          test.id,
+                                          parameterIndex,
+                                          event.target.value,
+                                        )
+                                      }
+                                      className="min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                    />
+                                  </div>
+                                ),
+                              )}
+                              {selectedFunction.parameters.length === 0 && (
+                                <p className="text-xs text-slate-500">
+                                  This function takes no arguments.
+                                </p>
+                              )}
+                            </div>
+                            <label
+                              htmlFor={`${test.id}-expected-return`}
+                              className="mt-3 block text-xs font-medium text-slate-600"
+                            >
+                              Expected return
+                            </label>
+                            <input
+                              id={`${test.id}-expected-return`}
+                              value={test.expected_return}
+                              maxLength={1_000}
+                              onChange={(event) =>
+                                updateTestCase(
+                                  test.id,
+                                  "expected_return",
+                                  event.target.value,
+                                )
+                              }
+                              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                            />
+                          </>
+                        ) : (
+                          <>
+                            <label
+                              htmlFor={`${test.id}-stdin`}
+                              className="mt-3 block text-xs font-medium text-slate-600"
+                            >
+                              Standard input
+                            </label>
+                            <textarea
+                              id={`${test.id}-stdin`}
+                              value={test.stdin}
+                              maxLength={64 * 1024}
+                              rows={3}
+                              onChange={(event) =>
+                                updateTestCase(
+                                  test.id,
+                                  "stdin",
+                                  event.target.value,
+                                )
+                              }
+                              className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                            />
+                            <label
+                              htmlFor={`${test.id}-expected`}
+                              className="mt-3 block text-xs font-medium text-slate-600"
+                            >
+                              Expected output
+                            </label>
+                            <textarea
+                              id={`${test.id}-expected`}
+                              value={test.expected_stdout}
+                              maxLength={64 * 1024}
+                              rows={3}
+                              onChange={(event) =>
+                                updateTestCase(
+                                  test.id,
+                                  "expected_stdout",
+                                  event.target.value,
+                                )
+                              }
+                              className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                            />
+                          </>
+                        )}
                       </fieldset>
                     ))}
                   </div>
+                  )}
 
                   {testCases.length === 0 && (
                     <p className="mt-3 text-sm leading-6 text-slate-600">
@@ -956,6 +1285,23 @@ export default function EditorPage() {
                       </pre>
                     </div>
                   )}
+                  {(testRunResult?.input_error ||
+                    testRunResult?.unsupported_error) && (
+                    <div
+                      role="alert"
+                      className="mt-4 rounded-md border border-slate-200 p-3"
+                    >
+                      <p className="text-sm font-medium text-slate-800">
+                        {testRunResult.unsupported_error
+                          ? "Function testing unavailable"
+                          : "Check test values"}
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-slate-600">
+                        {testRunResult.unsupported_error ||
+                          testRunResult.input_error}
+                      </p>
+                    </div>
+                  )}
                   {testRunResult && testRunResult.tests.length > 0 && (
                     <ul className="mt-4 space-y-3" aria-label="Test results">
                       {testRunResult.tests.map((result, index) => (
@@ -988,6 +1334,51 @@ export default function EditorPage() {
                                 </span>
                               )}
                           </div>
+                          {isFunctionResult(result) && (
+                            <div className="mt-3 grid gap-3">
+                              <div>
+                                <p className="text-xs font-medium text-slate-500">
+                                  Arguments
+                                </p>
+                                <dl className="mt-1 space-y-1 font-mono text-xs text-slate-700">
+                                  {testRunResult.function?.parameters.map(
+                                    (parameter, parameterIndex) => (
+                                      <div
+                                        key={`${result.name}-${parameter.name}`}
+                                        className="flex gap-2"
+                                      >
+                                        <dt>{parameter.name} =</dt>
+                                        <dd className="break-all">
+                                          {result.arguments[parameterIndex]}
+                                        </dd>
+                                      </div>
+                                    ),
+                                  )}
+                                  {result.arguments.length === 0 && (
+                                    <div>No arguments</div>
+                                  )}
+                                </dl>
+                              </div>
+                              <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                  <p className="text-xs font-medium text-slate-500">
+                                    Expected
+                                  </p>
+                                  <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs leading-5 text-slate-800">
+                                    {result.expected_return || "(empty)"}
+                                  </pre>
+                                </div>
+                                <div>
+                                  <p className="text-xs font-medium text-slate-500">
+                                    Actual
+                                  </p>
+                                  <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs leading-5 text-slate-800">
+                                    {result.actual_return || "(empty)"}
+                                  </pre>
+                                </div>
+                              </div>
+                            </div>
+                          )}
                           {result.timed_out ? (
                             <p className="mt-2 text-xs font-medium text-rose-700">
                               Timed out
@@ -1001,7 +1392,8 @@ export default function EditorPage() {
                             <p className="mt-2 text-xs text-slate-500">
                               Formatting differences ignored
                             </p>
-                          ) : !result.passed ? (
+                          ) : !result.passed &&
+                            !isFunctionResult(result) ? (
                             <div className="mt-3 grid gap-3">
                               <div>
                                 <p className="text-xs font-medium text-slate-500">

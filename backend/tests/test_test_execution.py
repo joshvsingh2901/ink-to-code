@@ -7,10 +7,9 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.schemas.test_execution import ExecutionTestCase
+from app.schemas.test_execution import ProgramTestCase
 from app.services import test_execution
 from app.services.test_execution import (
-    FUNCTION_ONLY_MESSAGE,
     TEST_OUTPUT_LIMIT_BYTES,
     _classify_output_match,
     run_cpp_tests,
@@ -42,8 +41,8 @@ def make_test_case(
     name: str = "Test 1",
     stdin: str = "",
     expected_stdout: str = "",
-) -> ExecutionTestCase:
-    return ExecutionTestCase(
+) -> ProgramTestCase:
+    return ProgramTestCase(
         name=name,
         stdin=stdin,
         expected_stdout=expected_stdout,
@@ -129,18 +128,6 @@ def test_compile_failure_prevents_execution():
 
     assert result.success is False
     assert result.compile_error
-    assert result.tests == []
-
-
-@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
-def test_function_only_source_returns_clear_unsupported_result():
-    result = run_cpp_tests(
-        "int findMax(int a, int b) { return a > b ? a : b; }",
-        [make_test_case()],
-    )
-
-    assert result.success is False
-    assert result.compile_error == FUNCTION_ONLY_MESSAGE
     assert result.tests == []
 
 

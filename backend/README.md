@@ -47,21 +47,36 @@ Images are limited to 10 MB each and 50 MB per category. The API validates and e
 
 ## Local C++ test execution
 
-`POST /api/run-tests` accepts the current C++17 source and 1–10 explicit test
-cases. Each test provides a name, standard input, and exact expected standard
-output. Runnable tests require a complete program with `main()`; function-only
-source remains valid for `/api/compile` but cannot be executed without a future
-test harness.
+`POST /api/test-mode` deterministically classifies current C++17 source as a
+full program, a supported function-only submission, or unsupported. `POST
+/api/run-tests` accepts 1–10 explicit cases in the corresponding mode. Program
+tests provide standard input and expected standard output. Function tests
+provide one scalar value per parameter and an expected return value.
+
+Function mode conservatively supports top-level functions with a non-void
+`int`, `long`, `long long`, `double`, or `bool` return and zero or more named
+parameters using those same scalar types. One detected function is selected
+automatically. When several supported functions are present, the frontend
+requires an explicit target selection and the backend validates that target
+against the submitted source. The harness calls only the selected target while
+keeping the complete original translation unit available for helper calls.
+Overloaded function names and other ambiguous source are rejected without
+guessing. Arguments accept signed decimal integers,
+finite decimal doubles, and lowercase `true` or `false`; arbitrary C++
+expressions are never accepted. A temporary harness calls the unchanged user
+target. Bool returns print as `true` or `false`, and doubles use 17 significant
+digits without fuzzy comparison.
 
 The test runner compiles with a fixed argument list, runs only after an explicit
-request, and uses a unique temporary directory that is deleted afterward. Each
-test has a two-second timeout. Standard output and standard error are each
-limited to 64 KiB; a process exceeding either limit is stopped and its output is
-reported as limited. Output comparison preserves the raw expected and actual
-text for display, but compares their whitespace-separated token sequences.
-Leading and trailing whitespace, repeated spaces, tabs, and line-break
-differences are ignored; token text, punctuation, capitalization, and order
-must still match exactly.
+request, and uses a unique temporary directory that is deleted afterward.
+Generated harness code exists only in that directory and never changes the
+editor source. Each test has a two-second timeout. Standard output and standard
+error are each limited to 64 KiB; a process exceeding either limit is stopped
+and its output is reported as limited. Output comparison preserves the raw
+expected and actual text for display, but compares their whitespace-separated
+token sequences. Leading and trailing whitespace, repeated spaces, tabs, and
+line-break differences are ignored; token text, punctuation, capitalization,
+and order must still match exactly.
 
 This local subprocess isolation is for development only. It is not a
 production-grade sandbox; container or equivalent isolation is required before

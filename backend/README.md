@@ -102,16 +102,34 @@ newlines, tabs, carriage returns, and control bytes are escaped before safe C++
 literals are generated. Scalar strings compare exact contents.
 `vector<string>` results serialize canonically as `["hello", "world"]` and
 compare exact element contents, order, and length. Character pointers, character
-arrays, string pointers, non-const references, nested vectors, and void mutation
-functions remain unsupported.
+arrays, string pointers, mutable vector references, and nested vectors remain
+unsupported.
+
+Function mode supports exactly one mutable scalar reference parameter of type
+`int&`, `long&`, `long long&`, `double&`, `bool&`, or `std::string&` on a
+`void` target. Each test supplies the parameter's initial value in the ordinary
+argument list and its expected final value in `expected_final_arguments`, keyed
+by parameter name. The harness creates validated local storage, calls the
+unchanged target, and serializes the final local value. Integer, boolean, and
+string values compare exactly; doubles retain the existing exact, non-fuzzy
+output policy. String values use the existing safe literal escaping and quoted
+serialization internally.
+
+Scalar and string const references remain read-only inputs. Non-void functions
+with mutable references are conservatively rejected so neither a return value
+nor a mutation is ignored. Multiple mutable references, returned references,
+rvalue references, pointer/array/vector mutation, and custom reference types
+are unsupported. Mutation tests do not have a second stdout expectation
+channel; if the target writes to `std::cout`, the test fails with a clear
+runtime message rather than silently discarding that output.
 
 Supported `void` functions are tested through their captured standard output.
 Their test cases use `expected_stdout` instead of `expected_return` and may use
 the same whitespace-tolerant or exact comparison modes as full-program output.
 The harness calls the function without storing or printing a return value.
-Standard error remains separate. Functions whose behavior can only be checked
-through argument mutation remain unsupported because pointer, array, and
-non-const-reference mutation is outside the current test model.
+Standard error remains separate. Supported scalar-reference mutation uses the
+dedicated final-value model above; pointer, array, and vector mutation remain
+outside the current test model.
 
 The test runner compiles with a fixed argument list, runs only after an explicit
 request, and uses a unique temporary directory that is deleted afterward.

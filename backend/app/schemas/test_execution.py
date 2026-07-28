@@ -8,7 +8,12 @@ class FunctionTypeResponse(BaseModel):
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
-    passing: Literal["value", "const_reference", "array_pointer"]
+    passing: Literal[
+        "value",
+        "const_reference",
+        "mutable_reference",
+        "array_pointer",
+    ]
     size_parameter_name: str | None = None
 
 
@@ -49,17 +54,30 @@ class FunctionTestCase(BaseModel):
     arguments: list[str] = Field(max_length=20)
     expected_return: str | None = Field(default=None, max_length=1_000)
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
+    expected_final_arguments: dict[str, str] | None = Field(
+        default=None,
+        max_length=1,
+    )
 
     @model_validator(mode="after")
     def validate_expected_value(self) -> "FunctionTestCase":
         supplied = sum(
             value is not None
-            for value in (self.expected_return, self.expected_stdout)
+            for value in (
+                self.expected_return,
+                self.expected_stdout,
+                self.expected_final_arguments,
+            )
         )
         if supplied != 1:
             raise ValueError(
-                "Provide exactly one of expected_return or expected_stdout."
+                "Provide exactly one expected result channel."
             )
+        if self.expected_final_arguments is not None and any(
+            not name or len(name) > 100 or len(value) > 1_000
+            for name, value in self.expected_final_arguments.items()
+        ):
+            raise ValueError("Expected final argument values are invalid.")
         return self
 
 
@@ -138,6 +156,19 @@ class FunctionOutputTestResult(BaseModel):
     ]
 
 
+class FunctionMutationTestResult(BaseModel):
+    name: str
+    passed: bool
+    initial_arguments: dict[str, str]
+    expected_final_arguments: dict[str, str]
+    actual_final_arguments: dict[str, str]
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    output_limited: bool
+    match_type: Literal["exact", "mismatch"]
+
+
 class RunTestsResponse(BaseModel):
     mode: Literal["program", "function", "unsupported"]
     success: bool
@@ -146,5 +177,8 @@ class RunTestsResponse(BaseModel):
     unsupported_error: str | None = None
     function: FunctionResponse | None = None
     tests: list[
-        FunctionTestResult | FunctionOutputTestResult | ProgramTestResult
+        FunctionTestResult
+        | FunctionOutputTestResult
+        | FunctionMutationTestResult
+        | ProgramTestResult
     ]

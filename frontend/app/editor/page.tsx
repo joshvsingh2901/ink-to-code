@@ -12,6 +12,7 @@ import {
 import {
   analyzeTestMode,
   runCppTests,
+  type FunctionMutationTestResult,
   type FunctionOutputTestResult,
   type FunctionTestResult,
   type ProgramTestResult,
@@ -44,6 +45,7 @@ type EditableTestCase = {
   expected_stdout: string;
   arguments: string[];
   expected_return: string;
+  expected_final_arguments: Record<string, string>;
 };
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
@@ -58,6 +60,7 @@ const INITIAL_TEST_CASE: EditableTestCase = {
   expected_stdout: "",
   arguments: [],
   expected_return: "",
+  expected_final_arguments: {},
 };
 
 function sanitizeFilename(filename: string) {
@@ -80,7 +83,8 @@ function isFunctionResult(
   result:
     | ProgramTestResult
     | FunctionTestResult
-    | FunctionOutputTestResult,
+    | FunctionOutputTestResult
+    | FunctionMutationTestResult,
 ): result is FunctionTestResult | FunctionOutputTestResult {
   return "arguments" in result;
 }
@@ -89,6 +93,16 @@ function isFunctionReturnResult(
   result: FunctionTestResult | FunctionOutputTestResult,
 ): result is FunctionTestResult {
   return "expected_return" in result;
+}
+
+function isFunctionMutationResult(
+  result:
+    | ProgramTestResult
+    | FunctionTestResult
+    | FunctionOutputTestResult
+    | FunctionMutationTestResult,
+): result is FunctionMutationTestResult {
+  return "actual_final_arguments" in result;
 }
 
 function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
@@ -272,6 +286,10 @@ export default function EditorPage() {
                   nextId === previousId ? test.expected_return : "",
                 expected_stdout:
                   nextId === previousId ? test.expected_stdout : "",
+                expected_final_arguments:
+                  nextId === previousId
+                    ? test.expected_final_arguments
+                    : {},
               })),
             );
           } else {
@@ -498,6 +516,10 @@ export default function EditorPage() {
 
     try {
       const currentCode = editorRef.current?.getValue() ?? code;
+      const mutableParameter = selectedFunction?.parameters.find(
+        (parameter) =>
+          parameter.type_metadata.passing === "mutable_reference",
+      );
       const request =
         testMode.mode === "function"
           ? {
@@ -507,7 +529,24 @@ export default function EditorPage() {
               target_function: selectedFunction!.id,
               comparison_mode: comparisonMode,
               tests:
-                selectedFunction!.return_type_metadata.kind === "void"
+                mutableParameter
+                  ? testCases.map(
+                      ({
+                        name,
+                        arguments: argumentValues,
+                        expected_final_arguments,
+                      }) => ({
+                        name,
+                        arguments: argumentValues,
+                        expected_final_arguments: {
+                          [mutableParameter.name]:
+                            expected_final_arguments[
+                              mutableParameter.name
+                            ] ?? "",
+                        },
+                      }),
+                    )
+                  : selectedFunction!.return_type_metadata.kind === "void"
                   ? testCases.map(
                       ({
                         name,
@@ -610,6 +649,7 @@ export default function EditorPage() {
             ? selectedFunction.parameters.map(() => "")
             : [],
         expected_return: "",
+        expected_final_arguments: {},
       },
     ]);
     setTestRunResult(null);
@@ -634,6 +674,7 @@ export default function EditorPage() {
           : [],
         expected_return: "",
         expected_stdout: "",
+        expected_final_arguments: {},
       })),
     );
     setTestRunResult(null);
@@ -650,6 +691,28 @@ export default function EditorPage() {
     mode: "whitespace_tolerant" | "exact",
   ) {
     setComparisonMode(mode);
+    setTestRunResult(null);
+    setTestRunError(null);
+  }
+
+  function updateExpectedFinalArgument(
+    id: string,
+    parameterName: string,
+    value: string,
+  ) {
+    setTestCases((current) =>
+      current.map((test) =>
+        test.id === id
+          ? {
+              ...test,
+              expected_final_arguments: {
+                ...test.expected_final_arguments,
+                [parameterName]: value,
+              },
+            }
+          : test,
+      ),
+    );
     setTestRunResult(null);
     setTestRunError(null);
   }
@@ -704,6 +767,10 @@ export default function EditorPage() {
           (candidate) => candidate.id === selectedFunctionId,
         ) ?? null)
       : null;
+  const mutableParameter = selectedFunction?.parameters.find(
+    (parameter) =>
+      parameter.type_metadata.passing === "mutable_reference",
+  );
   const isCleanCompileSuccess =
     compileResult?.success === true &&
     compileResult.exit_code === 0 &&
@@ -1232,6 +1299,12 @@ export default function EditorPage() {
                                       </span>
                                     </label>
                                     <div className="mt-1 min-w-0">
+                                      {parameter.type_metadata.passing ===
+                                        "mutable_reference" && (
+                                        <p className="mb-1 text-[11px] font-medium text-slate-500">
+                                          Initial value
+                                        </p>
+                                      )}
                                       <input
                                         id={`${test.id}-argument-${parameterIndex}`}
                                         value={
@@ -1267,7 +1340,7 @@ export default function EditorPage() {
                                             .element_type === "std::string"
                                             ? 'Enter values like ["hello", "world"]'
                                             : "Enter values like [1, 2, 3]"}
-                                        </p>
+                                          </p>
                                       )}
                                     </div>
                                   </div>
@@ -1279,7 +1352,57 @@ export default function EditorPage() {
                                 </p>
                               )}
                             </div>
-                            {selectedFunction.return_type_metadata.kind ===
+                            {mutableParameter && (
+                              <>
+                                <p className="mt-3 text-xs font-medium text-slate-600">
+                                  Expected mutations
+                                </p>
+                                <div className="mt-1.5 space-y-2">
+                                  {selectedFunction.parameters.map(
+                                    (parameter, parameterIndex) =>
+                                      parameter.type_metadata.passing ===
+                                        "mutable_reference" ? (
+                                        <div
+                                          key={`${test.id}-expected-${parameter.name}`}
+                                          className="min-w-0"
+                                        >
+                                          <label
+                                            htmlFor={`${test.id}-expected-final-${parameterIndex}`}
+                                            className="block min-w-0 text-xs font-medium text-slate-600"
+                                          >
+                                            <span className="block">
+                                              {parameter.name}
+                                            </span>
+                                            <span className="mt-0.5 block text-[11px] font-normal text-slate-500">
+                                              Expected final value
+                                            </span>
+                                          </label>
+                                          <input
+                                            id={`${test.id}-expected-final-${parameterIndex}`}
+                                            value={
+                                              test
+                                                .expected_final_arguments[
+                                                parameter.name
+                                              ] ?? ""
+                                            }
+                                            maxLength={1_000}
+                                            onChange={(event) =>
+                                              updateExpectedFinalArgument(
+                                                test.id,
+                                                parameter.name,
+                                                event.target.value,
+                                              )
+                                            }
+                                            className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                          />
+                                        </div>
+                                      ) : null,
+                                  )}
+                                </div>
+                              </>
+                            )}
+                            {mutableParameter ? null :
+                            selectedFunction.return_type_metadata.kind ===
                             "void" ? (
                               <>
                                 <label
@@ -1492,6 +1615,43 @@ export default function EditorPage() {
                                 </span>
                               )}
                           </div>
+                          {isFunctionMutationResult(result) && (
+                            <div className="mt-3 space-y-2">
+                              {Object.entries(
+                                result.expected_final_arguments,
+                              ).map(([parameterName, expectedValue]) => (
+                                <div key={parameterName}>
+                                  <p className="text-xs font-medium text-slate-500">
+                                    {parameterName}
+                                  </p>
+                                  <dl className="mt-1 grid gap-1 font-mono text-xs text-slate-700">
+                                    <div className="flex gap-2">
+                                      <dt>Initial:</dt>
+                                      <dd className="break-all">
+                                        {result.initial_arguments[
+                                          parameterName
+                                        ] ?? "(empty)"}
+                                      </dd>
+                                    </div>
+                                    <div className="flex gap-2">
+                                      <dt>Expected final:</dt>
+                                      <dd className="break-all">
+                                        {expectedValue || "(empty)"}
+                                      </dd>
+                                    </div>
+                                    <div className="flex gap-2">
+                                      <dt>Actual final:</dt>
+                                      <dd className="break-all">
+                                        {result.actual_final_arguments[
+                                          parameterName
+                                        ] ?? "(empty)"}
+                                      </dd>
+                                    </div>
+                                  </dl>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {isFunctionResult(result) && (
                             <div className="mt-3 grid gap-3">
                               <div>
@@ -1566,6 +1726,7 @@ export default function EditorPage() {
                           {!result.timed_out &&
                             !result.output_limited &&
                             !result.passed &&
+                            !isFunctionMutationResult(result) &&
                             !isFunctionResult(result) && (
                             <div className="mt-3 grid gap-3">
                               <div>

@@ -41,6 +41,30 @@ def function_request(
     )
 
 
+def mutation_request(
+    code: str,
+    *,
+    arguments: list[str],
+    expected_final_arguments: dict[str, str],
+    target_index: int = 0,
+) -> FunctionRunTestsRequest:
+    analysis = analyze_test_mode(code)
+    assert analysis.functions
+    return FunctionRunTestsRequest(
+        mode="function",
+        code=code,
+        language="cpp",
+        target_function=analysis.functions[target_index].id,
+        tests=[
+            FunctionTestCase(
+                name="Test 1",
+                arguments=arguments,
+                expected_final_arguments=expected_final_arguments,
+            )
+        ],
+    )
+
+
 async def api_request(path: str, payload: object):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -297,7 +321,7 @@ def test_invalid_argument_values_are_rejected(
         ),
         (
             "int identity(int &value) { return value; }",
-            "not supported",
+            "Non-void functions with mutable reference",
         ),
     ],
 )
@@ -1004,7 +1028,7 @@ std::string welcome(std::string name) { return shout(greet(name)); }
     [
         (
             "int size(std::string& value) { return value.size(); }",
-            "Non-const string reference",
+            "Non-void functions with mutable reference",
         ),
         (
             "int size(std::string* value) { return value->size(); }",
@@ -1822,3 +1846,229 @@ def test_existing_program_mode_still_uses_stdin_and_stdout():
     assert result.mode == "program"
     assert result.success is True
     assert result.tests[0].passed is True
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["int& value", "int &value", "int & value"],
+)
+def test_mutable_reference_metadata_is_structured(declaration: str):
+    analysis = analyze_test_mode(
+        f"void doubleValue({declaration}) {{ value *= 2; }}"
+    )
+
+    assert analysis.mode == "function"
+    metadata = analysis.functions[0].parameters[0].value_type
+    assert metadata.kind == "scalar"
+    assert metadata.scalar_type == "int"
+    assert metadata.passing == "mutable_reference"
+    assert metadata.display_type == "int&"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["const int& value", "int const& value"],
+)
+def test_const_scalar_reference_remains_read_only(declaration: str):
+    analysis = analyze_test_mode(
+        f"int identity({declaration}) {{ return value; }}"
+    )
+
+    assert analysis.mode == "function"
+    metadata = analysis.functions[0].parameters[0].value_type
+    assert metadata.passing == "const_reference"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("type_name", "body", "initial", "expected"),
+    [
+        ("int", "value *= 2;", "5", "10"),
+        ("long", "value -= 3;", "10", "7"),
+        ("long long", "value += 3000000000LL;", "2", "3000000002"),
+        ("double", "value *= 2.0;", "1.25", "2.5"),
+        ("bool", "value = !value;", "true", "false"),
+    ],
+)
+def test_supported_scalar_reference_mutations_execute(
+    type_name: str,
+    body: str,
+    initial: str,
+    expected: str,
+):
+    result = run_test_request(
+        mutation_request(
+            f"void change({type_name}& value) {{ {body} }}",
+            arguments=[initial],
+            expected_final_arguments={"value": expected},
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].passed is True
+    assert result.tests[0].actual_final_arguments == {"value": expected}
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_mutable_reference_failure_reports_actual_final_value():
+    result = run_test_request(
+        mutation_request(
+            "void doubleValue(int& value) { value *= 2; }",
+            arguments=["5"],
+            expected_final_arguments={"value": "9"},
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].initial_arguments == {"value": "5"}
+    assert result.tests[0].expected_final_arguments == {"value": "9"}
+    assert result.tests[0].actual_final_arguments == {"value": "10"}
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_string_reference_mutation_preserves_spaces_and_quotes():
+    result = run_test_request(
+        mutation_request(
+            "#include <string>\n"
+            "void addSuffix(std::string& text, std::string suffix) "
+            "{ text += suffix; }",
+            arguments=["hello", ' \"world\"'],
+            expected_final_arguments={"text": 'hello \"world\"'},
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "text": 'hello \"world\"'
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_mutable_reference_with_scalar_and_helper_executes():
+    result = run_test_request(
+        mutation_request(
+            "int amount(int value) { return value * 2; }\n"
+            "void addAmount(int& value, int input) "
+            "{ value += amount(input); }",
+            arguments=["5", "3"],
+            expected_final_arguments={"value": "11"},
+            target_index=1,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "void swapValues(int& left, int& right) {}",
+            "multiple mutable reference",
+        ),
+        (
+            "#include <vector>\nvoid change(std::vector<int>& values) {}",
+            "Non-const vector reference",
+        ),
+        (
+            "void change(int*& value) {}",
+            "References to pointers",
+        ),
+        (
+            "void change(int&& value) {}",
+            "Rvalue reference",
+        ),
+        (
+            "#include <string>\nvoid change(std::string&& value) {}",
+            "Rvalue reference",
+        ),
+        (
+            "int& value(int input) { static int result; return result; }",
+            "reference return",
+        ),
+        (
+            "int change(int& value) { return ++value; }",
+            "Non-void functions with mutable reference",
+        ),
+    ],
+)
+def test_unsupported_reference_signatures_are_clear(
+    source: str,
+    message: str,
+):
+    analysis = analyze_test_mode(source)
+
+    assert analysis.mode == "unsupported"
+    assert analysis.message
+    assert message.lower() in analysis.message.lower()
+
+
+@pytest.mark.parametrize(
+    ("initial", "expected", "message"),
+    [
+        ("1.5", "2", "signed decimal int"),
+        ("1", "false", "signed decimal int"),
+    ],
+)
+def test_invalid_reference_values_are_rejected_before_compilation(
+    initial: str,
+    expected: str,
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        mutation_request(
+            "void change(int& value) { ++value; }",
+            arguments=[initial],
+            expected_final_arguments={"value": expected},
+        )
+    )
+
+    assert result.input_error
+    assert message in result.input_error
+    assert invoked is False
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_mutable_reference_stdout_is_not_silently_ignored():
+    result = run_test_request(
+        mutation_request(
+            "#include <iostream>\n"
+            "void change(int& value) { ++value; std::cout << value; }",
+            arguments=["1"],
+            expected_final_arguments={"value": "2"},
+        )
+    )
+
+    assert result.success is False
+    assert "do not support function stdout" in result.tests[0].stderr
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_mutable_reference_timeout_and_output_limits_are_preserved():
+    timeout_result = run_test_request(
+        mutation_request(
+            "void spin(int& value) { while (true) {} }",
+            arguments=["1"],
+            expected_final_arguments={"value": "1"},
+        ),
+        test_timeout_seconds=0.05,
+    )
+    output_result = run_test_request(
+        mutation_request(
+            "#include <iostream>\n"
+            "void noisy(int& value) { while (true) std::cout << value; }",
+            arguments=["1"],
+            expected_final_arguments={"value": "1"},
+        )
+    )
+
+    assert timeout_result.tests[0].timed_out is True
+    assert output_result.tests[0].output_limited is True

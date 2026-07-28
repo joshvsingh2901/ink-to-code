@@ -9,7 +9,11 @@ export type FunctionTypeMetadata = {
   display_type: string;
   scalar_type: string | null;
   element_type: string | null;
-  passing: "value" | "const_reference" | "array_pointer";
+  passing:
+    | "value"
+    | "const_reference"
+    | "mutable_reference"
+    | "array_pointer";
   size_parameter_name: string | null;
 };
 
@@ -46,6 +50,12 @@ export type FunctionOutputTestInput = {
   expected_stdout: string;
 };
 
+export type FunctionMutationTestInput = {
+  name: string;
+  arguments: string[];
+  expected_final_arguments: Record<string, string>;
+};
+
 type ResultBase = {
   name: string;
   passed: boolean;
@@ -77,6 +87,12 @@ export type FunctionOutputTestResult = ResultBase & {
   actual_stdout: string;
 };
 
+export type FunctionMutationTestResult = ResultBase & {
+  initial_arguments: Record<string, string>;
+  expected_final_arguments: Record<string, string>;
+  actual_final_arguments: Record<string, string>;
+};
+
 export type RunTestsResult = {
   mode: "program" | "function" | "unsupported";
   success: boolean;
@@ -86,6 +102,7 @@ export type RunTestsResult = {
   function: FunctionDescriptor | null;
   tests: Array<
     ProgramTestResult | FunctionTestResult | FunctionOutputTestResult
+    | FunctionMutationTestResult
   >;
 };
 
@@ -103,7 +120,11 @@ export type RunTestsRequest =
       language: "cpp";
       target_function: string;
       comparison_mode: "whitespace_tolerant" | "exact";
-      tests: Array<FunctionTestInput | FunctionOutputTestInput>;
+      tests: Array<
+        FunctionTestInput
+        | FunctionOutputTestInput
+        | FunctionMutationTestInput
+      >;
     };
 
 type ApiError = { error?: { message?: string } };
@@ -148,7 +169,12 @@ function isFunctionTypeMetadata(
       typeof metadata.scalar_type === "string") &&
     (metadata.element_type === null ||
       typeof metadata.element_type === "string") &&
-    ["value", "const_reference", "array_pointer"].includes(
+    [
+      "value",
+      "const_reference",
+      "mutable_reference",
+      "array_pointer",
+    ].includes(
       metadata.passing ?? "",
     ) &&
     (metadata.size_parameter_name === null ||
@@ -184,7 +210,8 @@ function isTestResult(
 ): value is
   | ProgramTestResult
   | FunctionTestResult
-  | FunctionOutputTestResult {
+  | FunctionOutputTestResult
+  | FunctionMutationTestResult {
   if (!isResultBase(value)) return false;
   const result = value as Partial<ProgramTestResult & FunctionTestResult>;
   const programResult =
@@ -200,7 +227,26 @@ function isTestResult(
     result.arguments.every((argument) => typeof argument === "string") &&
     typeof result.expected_stdout === "string" &&
     typeof result.actual_stdout === "string";
-  return programResult || functionResult || functionOutputResult;
+  const mutation = value as Partial<FunctionMutationTestResult>;
+  const mutationResult =
+    isStringRecord(mutation.initial_arguments) &&
+    isStringRecord(mutation.expected_final_arguments) &&
+    isStringRecord(mutation.actual_final_arguments);
+  return (
+    programResult ||
+    functionResult ||
+    functionOutputResult ||
+    mutationResult
+  );
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.values(value).every((item) => typeof item === "string")
+  );
 }
 
 function isRunTestsResult(value: unknown): value is RunTestsResult {

@@ -11,6 +11,7 @@ from pathlib import Path
 from app.schemas.test_execution import (
     FunctionResponse,
     FunctionRunTestsRequest,
+    FunctionMutationTestResult,
     FunctionOutputTestResult,
     FunctionTestResult,
     FunctionTypeResponse,
@@ -37,6 +38,7 @@ TEST_TIMEOUT_SECONDS = 2
 TEST_OUTPUT_LIMIT_BYTES = 64 * 1024
 OUTPUT_LIMIT_MESSAGE = "\n[Output limited to 64 KiB.]"
 DOUBLE_OUTPUT_PRECISION = 17
+MUTATION_RESULT_MARKER = "__INKTOCODE_MUTATION_RESULT__"
 _INTEGER_VALUE = re.compile(r"[+-]?\d+")
 _DOUBLE_VALUE = re.compile(
     r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?"
@@ -361,6 +363,19 @@ def _prepare_argument(
     test_index: int,
     parameter_index: int,
 ) -> HarnessArgument:
+    if value_type.passing == "mutable_reference":
+        if value_type.scalar_type is None:
+            raise ValueError(f"{label} uses an unsupported mutable type.")
+        storage_name = (
+            f"inktocode_mutable_{test_index}_{parameter_index}_storage"
+        )
+        literal = _safe_literal(value_type.scalar_type, raw_value, label)
+        return HarnessArgument(
+            expression=storage_name,
+            declarations=(
+                f"{value_type.scalar_type} {storage_name} = {literal};",
+            ),
+        )
     if value_type.kind != "array":
         return HarnessArgument(
             expression=_safe_value_literal(value_type, raw_value, label)
@@ -504,6 +519,14 @@ def _build_function_harness(
     arguments_by_test: list[list[HarnessArgument]],
 ) -> str:
     cases: list[str] = []
+    mutable_parameter = next(
+        (
+            (parameter_index, parameter)
+            for parameter_index, parameter in enumerate(function.parameters)
+            if parameter.value_type.passing == "mutable_reference"
+        ),
+        None,
+    )
     for index, arguments in enumerate(arguments_by_test):
         declarations = " ".join(
             declaration
@@ -514,7 +537,30 @@ def _build_function_harness(
             f"{function.name}("
             f"{', '.join(argument.expression for argument in arguments)})"
         )
-        if function.return_value_type.kind == "void":
+        if mutable_parameter is not None:
+            mutable_index, parameter = mutable_parameter
+            mutable_expression = arguments[mutable_index].expression
+            if parameter.value_type.scalar_type == STRING_TYPE:
+                serialized_value = (
+                    f"inktocode_write_quoted_string({mutable_expression});"
+                )
+            elif parameter.value_type.scalar_type == "bool":
+                serialized_value = (
+                    f"std::cout << std::boolalpha << {mutable_expression};"
+                )
+            elif parameter.value_type.scalar_type == "double":
+                serialized_value = (
+                    "std::cout << std::setprecision"
+                    f"({DOUBLE_OUTPUT_PRECISION}) << {mutable_expression};"
+                )
+            else:
+                serialized_value = f"std::cout << {mutable_expression};"
+            output = (
+                f"{call}; "
+                f'std::cout << "{MUTATION_RESULT_MARKER}"; '
+                f"{serialized_value}"
+            )
+        elif function.return_value_type.kind == "void":
             output = f"{call};"
         elif function.return_value_type.kind == "vector":
             output = _vector_output(function, call)
@@ -605,8 +651,24 @@ def _function_results(
     function: FunctionSignature,
     *,
     timeout_seconds: float,
-) -> list[FunctionTestResult | FunctionOutputTestResult]:
-    results: list[FunctionTestResult | FunctionOutputTestResult] = []
+) -> list[
+    FunctionTestResult
+    | FunctionOutputTestResult
+    | FunctionMutationTestResult
+]:
+    results: list[
+        FunctionTestResult
+        | FunctionOutputTestResult
+        | FunctionMutationTestResult
+    ] = []
+    mutable_parameter = next(
+        (
+            parameter
+            for parameter in function.parameters
+            if parameter.value_type.passing == "mutable_reference"
+        ),
+        None,
+    )
     for index, test in enumerate(request.tests):
         output = _run_process(
             executable,
@@ -614,6 +676,66 @@ def _function_results(
             f"{index}\n",
             timeout_seconds=timeout_seconds,
         )
+        if mutable_parameter is not None:
+            expected_values = test.expected_final_arguments
+            if expected_values is None:
+                raise ValueError(
+                    "Mutable-reference tests require an expected final value."
+                )
+            expected_value = expected_values[mutable_parameter.name]
+            function_output, marker, serialized_value = output.stdout.rpartition(
+                MUTATION_RESULT_MARKER
+            )
+            actual_value = serialized_value if marker else output.stdout
+            if mutable_parameter.value_type.scalar_type == STRING_TYPE:
+                try:
+                    decoded_value = json.loads(actual_value)
+                except (json.JSONDecodeError, TypeError):
+                    decoded_value = None
+                if isinstance(decoded_value, str):
+                    actual_value = decoded_value
+            match_type = (
+                "exact" if expected_value == actual_value else "mismatch"
+            )
+            passed = (
+                not output.timed_out
+                and not output.output_limited
+                and output.exit_code == 0
+                and bool(marker)
+                and not function_output
+                and match_type == "exact"
+            )
+            stderr = output.stderr
+            if marker and function_output:
+                stderr = (
+                    f"{stderr}\n" if stderr else ""
+                ) + (
+                    "Mutable-reference tests do not support function stdout."
+                )
+            results.append(
+                FunctionMutationTestResult(
+                    name=test.name,
+                    passed=passed,
+                    initial_arguments={
+                        parameter.name: argument
+                        for parameter, argument in zip(
+                            function.parameters,
+                            test.arguments,
+                            strict=True,
+                        )
+                    },
+                    expected_final_arguments=expected_values,
+                    actual_final_arguments={
+                        mutable_parameter.name: actual_value
+                    },
+                    stderr=stderr,
+                    exit_code=output.exit_code,
+                    timed_out=output.timed_out,
+                    output_limited=output.output_limited,
+                    match_type=match_type,
+                )
+            )
+            continue
         if function.return_value_type.kind == "void":
             expected_stdout = test.expected_stdout
             if expected_stdout is None:
@@ -752,12 +874,48 @@ def run_test_request(
                 )
             try:
                 is_void = function.return_value_type.kind == "void"
-                if is_void and test.expected_stdout is None:
+                mutable_parameter = next(
+                    (
+                        parameter
+                        for parameter in function.parameters
+                        if parameter.value_type.passing
+                        == "mutable_reference"
+                    ),
+                    None,
+                )
+                if (
+                    mutable_parameter is not None
+                    and test.expected_final_arguments is None
+                ):
+                    raise ValueError(
+                        f"{test.name} must provide the expected final value "
+                        f"for {mutable_parameter.name}."
+                    )
+                if (
+                    mutable_parameter is not None
+                    and (
+                        test.expected_stdout is not None
+                        or test.expected_return is not None
+                    )
+                ):
+                    raise ValueError(
+                        f"{test.name} must use only the mutable-reference "
+                        "expected final value."
+                    )
+                if (
+                    mutable_parameter is None
+                    and is_void
+                    and test.expected_stdout is None
+                ):
                     raise ValueError(
                         f"{test.name} must provide expected output for "
                         "the selected void function."
                     )
-                if not is_void and test.expected_return is None:
+                if (
+                    mutable_parameter is None
+                    and not is_void
+                    and test.expected_return is None
+                ):
                     raise ValueError(
                         f"{test.name} must provide an expected return value "
                         "for the selected non-void function."
@@ -778,6 +936,18 @@ def run_test_request(
                         )
                     )
                 ]
+                if mutable_parameter is not None:
+                    expected_values = test.expected_final_arguments or {}
+                    if set(expected_values) != {mutable_parameter.name}:
+                        raise ValueError(
+                            f"{test.name} must provide exactly one expected "
+                            f"final value for {mutable_parameter.name}."
+                        )
+                    _safe_value_literal(
+                        mutable_parameter.value_type,
+                        expected_values[mutable_parameter.name],
+                        f"{test.name} expected final {mutable_parameter.name}",
+                    )
                 parameter_indexes = {
                     parameter.name: index
                     for index, parameter in enumerate(function.parameters)

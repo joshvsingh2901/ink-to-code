@@ -12,7 +12,12 @@ class ValueType:
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
-    passing: Literal["value", "const_reference", "array_pointer"] = "value"
+    passing: Literal[
+        "value",
+        "const_reference",
+        "mutable_reference",
+        "array_pointer",
+    ] = "value"
     size_parameter_name: str | None = None
 
     @property
@@ -23,6 +28,8 @@ class ValueType:
             return f"{self.element_type}[]"
         if self.kind == "scalar":
             base = self.scalar_type or self.display_type
+            if self.passing == "mutable_reference":
+                return f"{base}&"
             return (
                 f"const {base}&"
                 if self.passing == "const_reference"
@@ -85,6 +92,8 @@ _FUNCTION_DEFINITION = re.compile(
     r"(?P<return_type>"
     r"(?:const\s+)?(?:std::)?vector\s*<[^<>]+>\s*(?:const\s*)?[&*]?"
     r"|(?:const\s+)?(?:std::)?string\s*(?:const\s*)?[&*]?"
+    r"|(?:const\s+)?(?:long\s+long|long|int|double|bool)\s*"
+    r"(?:const\s*)?&&?"
     r"|(?:long\s+long|long|int|double|bool|char)\s*\*+"
     r"|[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*"
     r")\s+(?P<name>[A-Za-z_]\w*)\s*"
@@ -92,6 +101,17 @@ _FUNCTION_DEFINITION = re.compile(
 )
 _PARAMETER_DECLARATION = re.compile(
     r"(?P<type>.+?)\s+(?P<name>[A-Za-z_]\w*)"
+)
+_REFERENCE_PARAMETER = re.compile(
+    r"(?P<type>"
+    r"(?:const\s+)?(?:long\s+long|long|int|double|bool)\s*(?:const\s*)?&&?"
+    r"|(?:const\s+)?(?:std::)?string\s*(?:const\s*)?&&?"
+    r")\s*(?P<name>[A-Za-z_]\w*)"
+)
+_SCALAR_REFERENCE_TYPE = re.compile(
+    r"(?P<prefix_const>const\s+)?"
+    r"(?P<base>long\s+long|long|int|double|bool)\s*"
+    r"(?P<suffix_const>const\s*)?(?P<modifier>&&?)"
 )
 _ARRAY_PARAMETER = re.compile(
     r"(?P<element>long\s+long|long|int|double|bool|char)\s*"
@@ -192,6 +212,42 @@ def _parse_value_type(
     unqualified_vector_allowed: bool,
 ) -> tuple[ValueType | None, str | None]:
     normalized = " ".join(raw_type.split())
+    if normalized.endswith("&&"):
+        return (
+            None,
+            "Rvalue reference parameters are unsupported."
+            if allow_reference
+            else "Reference return values are unsupported.",
+        )
+    if "*&" in normalized or "* &" in normalized:
+        return None, "References to pointers are unsupported."
+    scalar_reference = _SCALAR_REFERENCE_TYPE.fullmatch(normalized)
+    if scalar_reference is not None:
+        if not allow_reference:
+            return None, "Scalar reference return values are unsupported."
+        if scalar_reference.group("modifier") == "&&":
+            return None, "Rvalue reference parameters are unsupported."
+        scalar_type = " ".join(scalar_reference.group("base").split())
+        is_const = bool(
+            scalar_reference.group("prefix_const")
+            or scalar_reference.group("suffix_const")
+        )
+        passing: Literal["const_reference", "mutable_reference"] = (
+            "const_reference" if is_const else "mutable_reference"
+        )
+        return (
+            ValueType(
+                kind="scalar",
+                display_type=(
+                    f"const {scalar_type}&"
+                    if is_const
+                    else f"{scalar_type}&"
+                ),
+                scalar_type=scalar_type,
+                passing=passing,
+            ),
+            None,
+        )
     if normalized in SUPPORTED_SCALAR_TYPES:
         return (
             ValueType(
@@ -222,9 +278,15 @@ def _parse_value_type(
         if modifier == "&":
             if not allow_reference:
                 return None, "String return values must be returned by value."
-            if not is_const:
-                return None, "Non-const string reference parameters are unsupported."
-            passing: Literal["value", "const_reference"] = "const_reference"
+            passing: Literal[
+                "value",
+                "const_reference",
+                "mutable_reference",
+            ] = (
+                "const_reference"
+                if is_const
+                else "mutable_reference"
+            )
         else:
             if is_const and not allow_reference:
                 return None, "String return values must be returned by value."
@@ -232,6 +294,8 @@ def _parse_value_type(
         display_type = (
             f"const {STRING_TYPE}&"
             if passing == "const_reference"
+            else f"{STRING_TYPE}&"
+            if passing == "mutable_reference"
             else STRING_TYPE
         )
         return (
@@ -319,6 +383,8 @@ def _parse_parameters(
         parameter = " ".join(raw_parameter.split())
         if not parameter or "=" in parameter or "..." in parameter:
             return None, "Default and variadic parameters are unsupported."
+        if "(&" in parameter and "[" in parameter:
+            return None, "References to arrays are unsupported."
         array_match = _ARRAY_PARAMETER.fullmatch(parameter)
         if array_match is not None:
             element_type = " ".join(array_match.group("element").split())
@@ -345,7 +411,10 @@ def _parse_parameters(
                 )
             )
             continue
-        match = _PARAMETER_DECLARATION.fullmatch(parameter)
+        match = (
+            _REFERENCE_PARAMETER.fullmatch(parameter)
+            or _PARAMETER_DECLARATION.fullmatch(parameter)
+        )
         if match is None:
             return None, f"This parameter is not supported: {parameter}."
         value_type, error = _parse_value_type(
@@ -360,6 +429,18 @@ def _parse_parameters(
                 name=match.group("name"),
                 value_type=value_type,
             )
+        )
+
+    mutable_parameters = [
+        parameter
+        for parameter in parsed
+        if parameter.value_type.passing == "mutable_reference"
+    ]
+    if len(mutable_parameters) > 1:
+        return (
+            None,
+            "Functions with multiple mutable reference parameters are "
+            "unsupported.",
         )
 
     linked = list(parsed)
@@ -426,6 +507,18 @@ def _parse_candidate(
     )
     if parameters is None:
         return None, error
+    if (
+        return_value_type.kind != "void"
+        and any(
+            parameter.value_type.passing == "mutable_reference"
+            for parameter in parameters
+        )
+    ):
+        return (
+            None,
+            "Non-void functions with mutable reference parameters are "
+            "unsupported.",
+        )
     return (
         FunctionSignature(
             name=candidate.group("name"),

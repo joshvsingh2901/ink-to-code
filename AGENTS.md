@@ -382,8 +382,8 @@ The expected request should contain the current source code in structured JSON, 
 - The generated harness calls the selected function with validated arguments.
 - The user's source code must remain unchanged.
 - Existing output-comparison modes apply to captured function output.
-- `void` functions that mutate arguments without producing output are not supported in this stage.
-- Non-const reference mutation, pointer mutation, and array mutation remain separate future stages.
+- `void` functions may be checked through the supported scalar-reference mutation model.
+- Pointer mutation and array mutation remain separate future stages.
 
 ## C-style array testing
 
@@ -396,3 +396,13 @@ The expected request should contain the current source code in structured JSON, 
 - Array-return pointers, pointer ownership, dynamic allocation, pointer-to-pointer types, and multidimensional arrays are not supported yet.
 - Array mutation checking is not part of this stage.
 - Existing program, scalar, string, vector, and void-output testing must remain unchanged.
+
+## Scalar reference mutation testing
+
+- Function-mode tests may support non-const scalar reference parameters.
+- Supported mutable reference types are `int&`, `long&`, `long long&`, `double&`, `bool&`, and `std::string&`.
+- Tests provide an initial argument value and an expected final argument value.
+- The generated harness must inspect mutable arguments after the function call.
+- The user’s Monaco source must never be modified.
+- Const references remain read-only inputs.
+- Pointer mutation, vector mutation, array mutation, multiple mutable outputs, and returned references are not part of this stage.

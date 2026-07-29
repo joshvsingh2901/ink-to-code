@@ -467,3 +467,13 @@ The expected request should contain the current source code in structured JSON, 
 - Mutable nested vectors require an initial value and expected final value.
 - Nested vectors must be parsed and compared structurally.
 - Deeper nesting, vectors of custom types, raw 2D arrays, and pointer-to-pointer matrices remain unsupported.
+
+## Object scenario testing
+
+- Function-mode testing may also test public class and struct behavior through object scenarios.
+- A scenario creates one object using a selected public constructor, then performs ordered public method calls.
+- Object state must be observed only through public methods, return values, or stdout.
+- Private fields must never be accessed or exposed by the generated harness.
+- Constructors and methods must be identified by full signatures, not names alone.
+- The original Monaco source must remain unchanged.
+- Big Five automation, inheritance, operator testing, memory diagnostics, and multiple interacting objects remain separate future stages.

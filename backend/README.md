@@ -194,6 +194,26 @@ This local subprocess isolation is for development only. It is not a
 production-grade sandbox; container or equivalent isolation is required before
 running arbitrary code for real users.
 
+### Object scenario testing
+
+Object scenario mode discovers usable inline public constructors and public
+instance methods on classes and structs. Each scenario must select one class
+and one full-signature constructor, then provide at least one ordered method
+step. The harness constructs exactly one object, invokes each selected method
+once in the displayed order, and lets the object be destroyed naturally.
+
+Non-void steps use the existing type-aware return comparison. Any step may
+optionally compare stdout using the selected exact or whitespace-tolerant mode.
+Each method's stdout and serialized return metadata use separate temporary
+channels. A runtime failure or timeout marks the current step failed and all
+later steps not executed. Object state is observed only through public method
+calls; the harness never accesses fields or rewrites the student's class.
+
+This first stage supports inline definitions and existing safe value and const
+reference types. It excludes inheritance, virtual dispatch, operators, static
+methods, implicit special members, expected exceptions, multiple interacting
+objects, and separate header/source definitions.
+
 ## Tests
 
 Tests mock the Gemini client and never make quota-consuming API calls:

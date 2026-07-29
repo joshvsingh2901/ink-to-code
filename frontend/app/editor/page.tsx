@@ -3,6 +3,10 @@
 import Editor, { type OnMount } from "@monaco-editor/react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import {
+  ObjectScenarioTests,
+  type EditableObjectScenario,
+} from "@/components/ObjectScenarioTests";
 import { useUploads } from "@/components/UploadProvider";
 import {
   compileCpp,
@@ -15,6 +19,7 @@ import {
   type FunctionCombinedTestResult,
   type FunctionDescriptor,
   type FunctionMutationTestResult,
+  type ObjectScenarioTestResult,
   type FunctionOutputTestResult,
   type FunctionTestResult,
   type ProgramTestResult,
@@ -50,6 +55,7 @@ type EditableTestCase = {
   expected_final_arguments: Record<string, string>;
   check_stdout: boolean;
 };
+type TestTargetKind = "program" | "function" | "object";
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
 const AUTO_COMPILE_DEBOUNCE_MS = 900;
@@ -65,6 +71,14 @@ const INITIAL_TEST_CASE: EditableTestCase = {
   expected_return: "",
   expected_final_arguments: {},
   check_stdout: false,
+};
+const INITIAL_OBJECT_SCENARIO: EditableObjectScenario = {
+  id: "scenario-1",
+  name: "Scenario 1",
+  class_id: "",
+  constructor_id: "",
+  constructor_arguments: [],
+  steps: [],
 };
 
 function mutableParameters(functionDescriptor: FunctionDescriptor) {
@@ -105,7 +119,8 @@ function isFunctionResult(
     | FunctionTestResult
     | FunctionOutputTestResult
     | FunctionMutationTestResult
-    | FunctionCombinedTestResult,
+    | FunctionCombinedTestResult
+    | ObjectScenarioTestResult,
 ): result is FunctionTestResult | FunctionOutputTestResult {
   return "arguments" in result && !("mutation_results" in result);
 }
@@ -122,7 +137,8 @@ function isFunctionMutationResult(
     | FunctionTestResult
     | FunctionOutputTestResult
     | FunctionMutationTestResult
-    | FunctionCombinedTestResult,
+    | FunctionCombinedTestResult
+    | ObjectScenarioTestResult,
 ): result is FunctionMutationTestResult {
   return "actual_final_arguments" in result;
 }
@@ -133,9 +149,22 @@ function isFunctionCombinedResult(
     | FunctionTestResult
     | FunctionOutputTestResult
     | FunctionMutationTestResult
-    | FunctionCombinedTestResult,
+    | FunctionCombinedTestResult
+    | ObjectScenarioTestResult,
 ): result is FunctionCombinedTestResult {
   return "mutation_results" in result;
+}
+
+function isObjectScenarioResult(
+  result:
+    | ProgramTestResult
+    | FunctionTestResult
+    | FunctionOutputTestResult
+    | FunctionMutationTestResult
+    | FunctionCombinedTestResult
+    | ObjectScenarioTestResult,
+): result is ObjectScenarioTestResult {
+  return "steps" in result && "constructor_completed" in result;
 }
 
 function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
@@ -231,6 +260,10 @@ export default function EditorPage() {
     "whitespace_tolerant" | "exact"
   >("whitespace_tolerant");
   const [testMode, setTestMode] = useState<TestModeAnalysis | null>(null);
+  const [testTarget, setTestTarget] = useState<TestTargetKind | null>(null);
+  const [objectScenarios, setObjectScenarios] = useState<
+    EditableObjectScenario[]
+  >([INITIAL_OBJECT_SCENARIO]);
   const [selectedFunctionId, setSelectedFunctionId] = useState<string | null>(
     null,
   );
@@ -288,7 +321,17 @@ export default function EditorPage() {
         .then((analysis) => {
           if (controller.signal.aborted) return;
           setTestMode(analysis);
-          if (analysis.mode === "function") {
+          setTestTarget((current) => {
+            if (current && analysis.available_modes.includes(current)) {
+              return current;
+            }
+            return analysis.available_modes.length === 1
+              ? analysis.available_modes[0]
+              : analysis.mode === "unsupported"
+                ? null
+                : analysis.mode;
+          });
+          if (analysis.functions.length > 0) {
             const previousId = selectedFunctionIdRef.current;
             const nextId =
               analysis.functions.length === 1
@@ -333,10 +376,49 @@ export default function EditorPage() {
             selectedFunctionIdRef.current = null;
             setSelectedFunctionId(null);
           }
+          setObjectScenarios((current) =>
+            current.map((scenario) => {
+              const objectClass =
+                analysis.classes.find(
+                  (candidate) => candidate.id === scenario.class_id,
+                ) ??
+                (analysis.classes.length === 1 ? analysis.classes[0] : null);
+              const constructor =
+                objectClass?.constructors.find(
+                  (candidate) => candidate.id === scenario.constructor_id,
+                ) ??
+                (objectClass?.constructors.length === 1
+                  ? objectClass.constructors[0]
+                  : null);
+              const sameConstructor =
+                constructor?.id === scenario.constructor_id;
+              return {
+                ...scenario,
+                class_id: objectClass?.id ?? "",
+                constructor_id: constructor?.id ?? "",
+                constructor_arguments: constructor
+                  ? constructor.parameters.map((_, index) =>
+                      sameConstructor
+                        ? (scenario.constructor_arguments[index] ?? "")
+                        : "",
+                    )
+                  : [],
+                steps:
+                  objectClass?.id === scenario.class_id
+                    ? scenario.steps.filter((step) =>
+                        objectClass.methods.some(
+                          (method) => method.id === step.method_id,
+                        ),
+                      )
+                    : [],
+              };
+            }),
+          );
         })
         .catch((error) => {
           if (controller.signal.aborted) return;
           setTestMode(null);
+          setTestTarget(null);
           setTestModeError(
             error instanceof Error
               ? error.message
@@ -531,18 +613,18 @@ export default function EditorPage() {
     if (
       isRunningTests ||
       !testMode ||
-      testMode.mode === "unsupported"
+      !testTarget
     ) {
       setActiveTab("tests");
       return;
     }
     const selectedFunction =
-      testMode.mode === "function"
+      testTarget === "function"
         ? (testMode.functions.find(
             (candidate) => candidate.id === selectedFunctionIdRef.current,
           ) ?? null)
         : null;
-    if (testMode.mode === "function" && !selectedFunction) {
+    if (testTarget === "function" && !selectedFunction) {
       setActiveTab("tests");
       return;
     }
@@ -560,7 +642,7 @@ export default function EditorPage() {
           parameter.type_metadata.passing === "array_pointer",
       );
       const request =
-        testMode.mode === "function"
+        testTarget === "function"
           ? {
               mode: "function" as const,
               code: currentCode,
@@ -592,7 +674,41 @@ export default function EditorPage() {
                   : {}),
               })),
             }
-          : {
+          : testTarget === "object"
+            ? {
+                mode: "object" as const,
+                code: currentCode,
+                language: "cpp" as const,
+                comparison_mode: comparisonMode,
+                tests: objectScenarios.map((scenario) => {
+                  const objectClass = testMode.classes.find(
+                    (candidate) => candidate.id === scenario.class_id,
+                  );
+                  return {
+                    name: scenario.name,
+                    class_id: scenario.class_id,
+                    constructor_id: scenario.constructor_id,
+                    constructor_arguments: scenario.constructor_arguments,
+                    steps: scenario.steps.map((step) => {
+                      const method = objectClass?.methods.find(
+                        (candidate) => candidate.id === step.method_id,
+                      );
+                      return {
+                        method_id: step.method_id,
+                        arguments: step.arguments,
+                        check_stdout: step.check_stdout,
+                        ...(method?.return_type_metadata.kind !== "void"
+                          ? { expected_return: step.expected_return }
+                          : {}),
+                        ...(step.check_stdout
+                          ? { expected_stdout: step.expected_stdout }
+                          : {}),
+                      };
+                    }),
+                  };
+                }),
+              }
+            : {
               mode: "program" as const,
               code: currentCode,
               language: "cpp" as const,
@@ -667,7 +783,7 @@ export default function EditorPage() {
         stdin: "",
         expected_stdout: "",
         arguments:
-          testMode?.mode === "function" && selectedFunction
+          testTarget === "function" && selectedFunction
             ? selectedFunction.parameters.map(() => "")
             : [],
         expected_return: "",
@@ -682,7 +798,7 @@ export default function EditorPage() {
   function selectFunction(functionId: string) {
     const nextId = functionId || null;
     const nextFunction =
-      testMode?.mode === "function"
+      testMode
         ? (testMode.functions.find(
             (candidate) => candidate.id === nextId,
           ) ?? null)
@@ -796,7 +912,7 @@ export default function EditorPage() {
   const primaryDiagnostics =
     compileResult?.diagnostics.filter(isPrimaryDiagnostic) ?? [];
   const selectedFunction =
-    testMode?.mode === "function"
+    testMode && testTarget === "function"
       ? (testMode.functions.find(
           (candidate) => candidate.id === selectedFunctionId,
         ) ?? null)
@@ -807,6 +923,15 @@ export default function EditorPage() {
       parameter.type_metadata.passing === "scalar_pointer" ||
       parameter.type_metadata.passing === "array_pointer",
   );
+  const objectScenariosReady =
+    objectScenarios.length > 0 &&
+    objectScenarios.every(
+      (scenario) =>
+        scenario.class_id &&
+        scenario.constructor_id &&
+        scenario.steps.length > 0 &&
+        scenario.steps.every((step) => step.method_id),
+    );
   const isCleanCompileSuccess =
     compileResult?.success === true &&
     compileResult.exit_code === 0 &&
@@ -870,9 +995,10 @@ export default function EditorPage() {
                   isRunningTests ||
                   isAnalyzingTests ||
                   !testMode ||
-                  testCases.length === 0 ||
-                  testMode?.mode === "unsupported" ||
-                  (testMode?.mode === "function" && !selectedFunction)
+                  !testTarget ||
+                  (testTarget !== "object" && testCases.length === 0) ||
+                  (testTarget === "object" && !objectScenariosReady) ||
+                  (testTarget === "function" && !selectedFunction)
                 }
                 className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -1152,36 +1278,42 @@ export default function EditorPage() {
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <h3 className="text-sm font-medium text-slate-800">
-                        {testMode?.mode === "function"
+                        {testTarget === "function"
                           ? "Function Tests"
-                          : "Program Tests"}
+                          : testTarget === "object"
+                            ? "Object Scenario Tests"
+                            : "Program Tests"}
                       </h3>
                       <p className="mt-1 text-xs leading-5 text-slate-500">
                         {isAnalyzingTests
                           ? "Determining test mode…"
-                          : testMode?.mode === "function" && selectedFunction
+                          : testTarget === "function" && selectedFunction
                             ? `Function: ${selectedFunction.display}`
-                            : testMode?.mode === "function"
+                            : testTarget === "function"
                               ? "Choose a function to test."
-                            : testMode?.mode === "program"
+                            : testTarget === "object"
+                              ? "Construct one object and call its methods in order."
+                            : testTarget === "program"
                               ? "Use standard input and expected output."
-                              : "Function testing is unavailable."}
+                              : "Testing is unavailable."}
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      onClick={addTestCase}
-                      disabled={
-                        isRunningTests ||
-                        isAnalyzingTests ||
-                        testMode?.mode === "unsupported" ||
-                        (testMode?.mode === "function" && !selectedFunction) ||
-                        testCases.length >= MAX_TEST_CASES
-                      }
-                      className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Add Test
-                    </button>
+                    {testTarget !== "object" && (
+                      <button
+                        type="button"
+                        onClick={addTestCase}
+                        disabled={
+                          isRunningTests ||
+                          isAnalyzingTests ||
+                          !testTarget ||
+                          (testTarget === "function" && !selectedFunction) ||
+                          testCases.length >= MAX_TEST_CASES
+                        }
+                        className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Add Test
+                      </button>
+                    )}
                   </div>
 
                   {testModeError && (
@@ -1211,7 +1343,42 @@ export default function EditorPage() {
                     </div>
                   )}
 
-                  {(testMode?.mode === "program" ||
+                  {testMode && testMode.available_modes.length > 0 && (
+                    <div className="mt-3">
+                      <label
+                        htmlFor="test-target-kind"
+                        className="block text-xs font-medium text-slate-600"
+                      >
+                        Test target
+                      </label>
+                      <select
+                        id="test-target-kind"
+                        value={testTarget ?? ""}
+                        disabled={isRunningTests}
+                        onChange={(event) => {
+                          setTestTarget(
+                            event.target.value as TestTargetKind,
+                          );
+                          setTestRunResult(null);
+                          setTestRunError(null);
+                        }}
+                        className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200 disabled:opacity-60"
+                      >
+                        {testMode.available_modes.includes("program") && (
+                          <option value="program">Full program</option>
+                        )}
+                        {testMode.available_modes.includes("function") && (
+                          <option value="function">Function</option>
+                        )}
+                        {testMode.available_modes.includes("object") && (
+                          <option value="object">Object scenario</option>
+                        )}
+                      </select>
+                    </div>
+                  )}
+
+                  {(testTarget === "program" ||
+                    testTarget === "object" ||
                     selectedFunction?.return_type_metadata.kind === "void") && (
                     <div className="mt-3">
                       <label
@@ -1241,7 +1408,8 @@ export default function EditorPage() {
                     </div>
                   )}
 
-                  {testMode?.mode === "function" &&
+                  {testTarget === "function" &&
+                    testMode &&
                     testMode.functions.length > 1 && (
                       <div className="mt-3">
                         <label
@@ -1269,9 +1437,22 @@ export default function EditorPage() {
                       </div>
                     )}
 
-                  {testMode && testMode.mode !== "unsupported" && (
+                  {testMode && testTarget === "object" && (
+                    <ObjectScenarioTests
+                      classes={testMode.classes}
+                      scenarios={objectScenarios}
+                      disabled={isRunningTests}
+                      onChange={(scenarios) => {
+                        setObjectScenarios(scenarios);
+                        setTestRunResult(null);
+                        setTestRunError(null);
+                      }}
+                    />
+                  )}
+
+                  {testMode && testTarget && testTarget !== "object" && (
                   <div className="mt-3 space-y-3">
-                    {(testMode.mode === "program" || selectedFunction) &&
+                    {(testTarget === "program" || selectedFunction) &&
                       testCases.map((test, index) => (
                       <fieldset
                         key={test.id}
@@ -1310,7 +1491,7 @@ export default function EditorPage() {
                             Remove
                           </button>
                         </div>
-                        {testMode.mode === "function" &&
+                        {testTarget === "function" &&
                         selectedFunction ? (
                           <>
                             <p className="mt-3 text-xs font-medium text-slate-600">
@@ -1649,12 +1830,13 @@ export default function EditorPage() {
                   </div>
                   )}
 
-                  {testCases.length === 0 && (
+                  {testTarget !== "object" && testCases.length === 0 && (
                     <p className="mt-3 text-sm leading-6 text-slate-600">
                       Add at least one test before running the program.
                     </p>
                   )}
-                  {testCases.length >= MAX_TEST_CASES && (
+                  {testTarget !== "object" &&
+                    testCases.length >= MAX_TEST_CASES && (
                     <p className="mt-2 text-xs text-slate-500">
                       Maximum of {MAX_TEST_CASES} tests reached.
                     </p>
@@ -1743,6 +1925,92 @@ export default function EditorPage() {
                                 </span>
                               )}
                           </div>
+                          {isObjectScenarioResult(result) && (
+                            <div className="mt-3 space-y-2">
+                              <div className="rounded bg-slate-50 p-2">
+                                <p className="text-xs font-medium text-slate-600">
+                                  {result.constructor_completed
+                                    ? "Constructed"
+                                    : "Construction failed"}
+                                </p>
+                                <p className="mt-1 break-words font-mono text-xs text-slate-800">
+                                  {result.constructor}
+                                  {result.constructor_arguments.length > 0
+                                    ? ` with ${result.constructor_arguments.join(", ")}`
+                                    : ""}
+                                </p>
+                              </div>
+                              {result.steps.map((step) => (
+                                <div
+                                  key={`${result.name}-step-${step.index}`}
+                                  className="border-t border-slate-200 pt-2"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div>
+                                      <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                                        Step {step.index + 1}
+                                      </p>
+                                      <p className="mt-0.5 break-words font-mono text-xs text-slate-800">
+                                        {step.method}
+                                      </p>
+                                    </div>
+                                    <span
+                                      className={`text-[11px] font-medium ${
+                                        step.status === "not_executed"
+                                          ? "text-slate-500"
+                                          : step.passed
+                                            ? "text-emerald-700"
+                                            : "text-rose-700"
+                                      }`}
+                                    >
+                                      {step.status === "not_executed"
+                                        ? "NOT EXECUTED"
+                                        : step.passed
+                                          ? "PASS"
+                                          : "FAIL"}
+                                    </span>
+                                  </div>
+                                  {step.status === "completed" &&
+                                    !step.return_result &&
+                                    !step.stdout_result && (
+                                      <p className="mt-1 text-xs text-slate-500">
+                                        Completed successfully
+                                      </p>
+                                    )}
+                                  {[step.return_result, step.stdout_result]
+                                    .filter(
+                                      (
+                                        channel,
+                                      ): channel is NonNullable<
+                                        typeof channel
+                                      > => channel !== null,
+                                    )
+                                    .map((channel, channelIndex) => (
+                                      <div
+                                        key={channelIndex}
+                                        className="mt-2"
+                                      >
+                                        <p className="text-[11px] font-medium text-slate-500">
+                                          {channel === step.return_result
+                                            ? "Return value"
+                                            : "Method output"}
+                                        </p>
+                                        <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
+                                          <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                                            Expected:{" "}
+                                            {channel.expected || "(empty)"}
+                                          </pre>
+                                          <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                                            Actual:{" "}
+                                            {channel.actual || "(empty)"}
+                                          </pre>
+                                        </div>
+                                      </div>
+                                    ))}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {isFunctionCombinedResult(result) && (
                             <div className="mt-3 space-y-3">
                               {result.return_result && (
@@ -1999,6 +2267,7 @@ export default function EditorPage() {
                           {!result.timed_out &&
                             !result.output_limited &&
                             !result.passed &&
+                            !isObjectScenarioResult(result) &&
                             !isFunctionMutationResult(result) &&
                             !isFunctionCombinedResult(result) &&
                             !isFunctionResult(result) && (

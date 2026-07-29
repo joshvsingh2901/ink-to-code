@@ -16,6 +16,9 @@ from app.schemas.test_execution import (
     FunctionRunTestsRequest,
     FunctionTestCase,
     FunctionMutationTestResult,
+    ObjectScenarioRunTestsRequest,
+    ObjectScenarioStepResult,
+    ObjectScenarioTestResult,
     FunctionOutputTestResult,
     FunctionTestResult,
     FunctionTypeResponse,
@@ -37,6 +40,12 @@ from app.services.function_analysis import (
     ValueType,
     analyze_test_mode,
 )
+from app.services.object_analysis import (
+    ObjectClass,
+    ObjectConstructor,
+    ObjectMethod,
+    analyze_object_scenarios,
+)
 
 TEST_TIMEOUT_SECONDS = 2
 TEST_OUTPUT_LIMIT_BYTES = 64 * 1024
@@ -57,6 +66,9 @@ class ProcessOutput:
     output_limited: bool
     function_stdout: str = ""
     result_metadata: str | None = None
+    step_stdout: tuple[str, ...] = ()
+    step_metadata: tuple[str | None, ...] = ()
+    progress_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,20 @@ class HarnessArgument:
     declarations: tuple[str, ...] = ()
     array_element_count: int | None = None
     mutation_expression: str | None = None
+
+
+@dataclass(frozen=True)
+class PreparedObjectStep:
+    method: ObjectMethod
+    arguments: tuple[HarnessArgument, ...]
+
+
+@dataclass(frozen=True)
+class PreparedObjectScenario:
+    object_class: ObjectClass
+    constructor: ObjectConstructor
+    constructor_arguments: tuple[HarnessArgument, ...]
+    steps: tuple[PreparedObjectStep, ...]
 
 
 def _limit_bytes(output: bytes) -> tuple[str, bool]:
@@ -167,8 +193,24 @@ def _run_process(
     function_stdout_path = working_directory / "function-stdout.txt"
     result_path = working_directory / "function-result.json"
     result_temp_path = working_directory / "function-result.json.tmp"
+    object_progress_path = working_directory / "object-progress.txt"
+    object_constructor_stdout_path = (
+        working_directory / "object-constructor-stdout.txt"
+    )
+    object_step_stdout_paths = tuple(
+        working_directory / f"object-step-{index}-stdout.txt"
+        for index in range(20)
+    )
+    object_step_result_paths = tuple(
+        working_directory / f"object-step-{index}-result.json"
+        for index in range(20)
+    )
     result_path.unlink(missing_ok=True)
     function_stdout_path.unlink(missing_ok=True)
+    object_progress_path.unlink(missing_ok=True)
+    object_constructor_stdout_path.unlink(missing_ok=True)
+    for path in (*object_step_stdout_paths, *object_step_result_paths):
+        path.unlink(missing_ok=True)
     stdin_path.write_bytes(stdin.encode("utf-8"))
     timed_out = False
     output_limited = False
@@ -205,6 +247,14 @@ def _run_process(
                 or (
                     _file_exceeds_limit(result_path)
                 )
+                or _file_exceeds_limit(object_constructor_stdout_path)
+                or any(
+                    _file_exceeds_limit(path)
+                    for path in (
+                        *object_step_stdout_paths,
+                        *object_step_result_paths,
+                    )
+                )
             ):
                 output_limited = True
                 process.kill()
@@ -237,6 +287,32 @@ def _run_process(
         )
     )
     output_limited = output_limited or metadata_limited
+    step_stdout = tuple(
+        (
+            _limit_bytes(
+                path.read_bytes()[: TEST_OUTPUT_LIMIT_BYTES + 1]
+            )[0]
+            if path.exists()
+            else ""
+        )
+        for path in object_step_stdout_paths
+    )
+    step_metadata = tuple(
+        (
+            path.read_text(encoding="utf-8", errors="replace")
+            if path.exists() and not _file_exceeds_limit(path)
+            else None
+        )
+        for path in object_step_result_paths
+    )
+    progress_index = None
+    if object_progress_path.exists():
+        try:
+            progress_index = int(
+                object_progress_path.read_text(encoding="utf-8").strip()
+            )
+        except ValueError:
+            progress_index = None
     return ProcessOutput(
         stdout=stdout,
         stderr=stderr,
@@ -249,6 +325,9 @@ def _run_process(
             if result_path.exists() and not metadata_limited
             else None
         ),
+        step_stdout=step_stdout,
+        step_metadata=step_metadata,
+        progress_index=progress_index,
     )
 
 
@@ -952,6 +1031,176 @@ def _build_function_harness(
     )
 
 
+def _serialized_value_output(
+    expression: str,
+    value_type: ValueType,
+) -> str:
+    if value_type.kind == "vector":
+        element_type = value_type.element_type
+        if element_type is None:
+            raise ValueError("Vector result has no element type.")
+        if value_type.vector_depth == 2:
+            return _nested_collection_output(expression, element_type)
+        return _collection_output(
+            expression,
+            element_type,
+            f"{expression}.size()",
+        )
+    if value_type.scalar_type == STRING_TYPE:
+        return f"inktocode_write_quoted_string({expression});"
+    if value_type.scalar_type == "bool":
+        return f"std::cout << std::boolalpha << {expression};"
+    if value_type.scalar_type == "double":
+        return (
+            "std::cout << std::setprecision"
+            f"({DOUBLE_OUTPUT_PRECISION}) << {expression};"
+        )
+    return f"std::cout << {expression};"
+
+
+def _progress_statement(index: int) -> str:
+    return " ".join(
+        [
+            '{ std::ofstream inktocode_progress("object-progress.txt",',
+            "std::ios::trunc);",
+            f"inktocode_progress << {index};",
+            "}",
+        ]
+    )
+
+
+def _build_object_harness(
+    code: str,
+    scenarios: list[PreparedObjectScenario],
+) -> str:
+    cases: list[str] = []
+    for scenario_index, scenario in enumerate(scenarios):
+        constructor_declarations = " ".join(
+            declaration
+            for argument in scenario.constructor_arguments
+            for declaration in argument.declarations
+        )
+        constructor_expressions = ", ".join(
+            argument.expression
+            for argument in scenario.constructor_arguments
+        )
+        statements = [
+            constructor_declarations,
+            _progress_statement(-1),
+            (
+                'std::ofstream inktocode_constructor_output('
+                '"object-constructor-stdout.txt", '
+                "std::ios::binary | std::ios::trunc);"
+            ),
+            "std::streambuf* inktocode_constructor_original = "
+            "std::cout.rdbuf(inktocode_constructor_output.rdbuf());",
+            (
+                f"{scenario.object_class.name} inktocode_object"
+                f"{{{constructor_expressions}}};"
+            ),
+            "std::cout.rdbuf(inktocode_constructor_original);",
+            "inktocode_constructor_output.close();",
+        ]
+        for step_index, step in enumerate(scenario.steps):
+            declarations = " ".join(
+                declaration
+                for argument in step.arguments
+                for declaration in argument.declarations
+            )
+            expressions = ", ".join(
+                argument.expression for argument in step.arguments
+            )
+            call = f"inktocode_object.{step.method.name}({expressions})"
+            result_name = f"inktocode_step_{step_index}_result"
+            call_statement = (
+                f"{call};"
+                if step.method.return_value_type.kind == "void"
+                else f"auto {result_name} = {call};"
+            )
+            serialized_return = (
+                'std::cout << "null";'
+                if step.method.return_value_type.kind == "void"
+                else _serialized_value_output(
+                    result_name,
+                    step.method.return_value_type,
+                )
+            )
+            statements.extend(
+                [
+                    declarations,
+                    _progress_statement(step_index),
+                    (
+                        f'std::ofstream inktocode_step_output_{step_index}('
+                        f'"object-step-{step_index}-stdout.txt", '
+                        "std::ios::binary | std::ios::trunc);"
+                    ),
+                    (
+                        f"std::streambuf* inktocode_step_original_{step_index} "
+                        "= std::cout.rdbuf("
+                        f"inktocode_step_output_{step_index}.rdbuf());"
+                    ),
+                    call_statement,
+                    (
+                        "std::cout.rdbuf("
+                        f"inktocode_step_original_{step_index});"
+                    ),
+                    f"inktocode_step_output_{step_index}.close();",
+                    (
+                        f'std::ofstream inktocode_step_metadata_{step_index}('
+                        f'"object-step-{step_index}-result.json.tmp", '
+                        "std::ios::binary | std::ios::trunc);"
+                    ),
+                    (
+                        f"std::streambuf* inktocode_metadata_original_"
+                        f"{step_index} = std::cout.rdbuf("
+                        f"inktocode_step_metadata_{step_index}.rdbuf());"
+                    ),
+                    'std::cout << "{\\"return\\":";',
+                    serialized_return,
+                    'std::cout << "}";',
+                    (
+                        "std::cout.rdbuf("
+                        f"inktocode_metadata_original_{step_index});"
+                    ),
+                    f"inktocode_step_metadata_{step_index}.close();",
+                    (
+                        f'std::rename("object-step-{step_index}-result.json.tmp", '
+                        f'"object-step-{step_index}-result.json");'
+                    ),
+                ]
+            )
+        statements.append(_progress_statement(len(scenario.steps)))
+        cases.append(
+            f"case {scenario_index}: {{ {' '.join(statements)} return 0; }}"
+        )
+
+    generated_main = "\n".join(
+        [
+            "int main()",
+            "{",
+            "    int inktocode_scenario_index = -1;",
+            "    if (!(std::cin >> inktocode_scenario_index)) return 2;",
+            "    switch (inktocode_scenario_index)",
+            "    {",
+            *[f"        {case}" for case in cases],
+            "        default: return 3;",
+            "    }",
+            "}",
+        ]
+    )
+    return (
+        "#include <cstdio>\n"
+        "#include <fstream>\n"
+        "#include <iomanip>\n"
+        "#include <iostream>\n"
+        "#include <string>\n"
+        "#include <vector>\n\n"
+        f"{code}\n\n"
+        f"{_string_serializer_source()}\n\n"
+        f"{generated_main}\n"
+    )
+
+
 def _program_results(
     executable: Path,
     working_directory: Path,
@@ -1354,6 +1603,159 @@ def _function_results(
     return results
 
 
+def _object_results(
+    executable: Path,
+    working_directory: Path,
+    request: ObjectScenarioRunTestsRequest,
+    scenarios: list[PreparedObjectScenario],
+    *,
+    timeout_seconds: float,
+) -> list[ObjectScenarioTestResult]:
+    results: list[ObjectScenarioTestResult] = []
+    for scenario_index, (test, prepared) in enumerate(
+        zip(request.tests, scenarios, strict=True)
+    ):
+        output = _run_process(
+            executable,
+            working_directory,
+            f"{scenario_index}\n",
+            timeout_seconds=timeout_seconds,
+        )
+        constructor_completed = (
+            output.progress_index is not None
+            and output.progress_index >= 0
+        )
+        failed_step_index = (
+            output.progress_index
+            if constructor_completed
+            and output.progress_index is not None
+            and output.progress_index < len(prepared.steps)
+            else None
+        )
+        step_results: list[ObjectScenarioStepResult] = []
+        for step_index, (step_request, prepared_step) in enumerate(
+            zip(test.steps, prepared.steps, strict=True)
+        ):
+            metadata: dict[str, object] | None = None
+            raw_metadata = output.step_metadata[step_index]
+            if raw_metadata is not None:
+                try:
+                    decoded = json.loads(raw_metadata)
+                except json.JSONDecodeError:
+                    decoded = None
+                if isinstance(decoded, dict):
+                    metadata = decoded
+
+            if metadata is None:
+                status = (
+                    "failed"
+                    if failed_step_index == step_index
+                    else "not_executed"
+                )
+                step_results.append(
+                    ObjectScenarioStepResult(
+                        index=step_index,
+                        method_id=prepared_step.method.id,
+                        method=prepared_step.method.display,
+                        status=status,
+                        passed=False,
+                    )
+                )
+                continue
+
+            return_result: FunctionChannelResult | None = None
+            if prepared_step.method.return_value_type.kind != "void":
+                expected_return = step_request.expected_return or ""
+                actual_return = _metadata_value(
+                    prepared_step.method.return_value_type,
+                    metadata.get("return"),
+                )
+                return_match = _typed_match(
+                    prepared_step.method.return_value_type,
+                    expected_return,
+                    actual_return,
+                )
+                return_result = FunctionChannelResult(
+                    expected=expected_return,
+                    actual=actual_return,
+                    passed=return_match != "mismatch",
+                    match_type=return_match,
+                    mismatch_detail=(
+                        None
+                        if return_match != "mismatch"
+                        else _typed_mismatch_detail(
+                            prepared_step.method.return_value_type,
+                            expected_return,
+                            actual_return,
+                        )
+                    ),
+                )
+
+            stdout_result: FunctionChannelResult | None = None
+            if step_request.check_stdout:
+                expected_stdout = step_request.expected_stdout or ""
+                actual_stdout = output.step_stdout[step_index]
+                stdout_match = _classify_program_output_match(
+                    expected_stdout,
+                    actual_stdout,
+                    request.comparison_mode,
+                )
+                stdout_result = FunctionChannelResult(
+                    expected=expected_stdout,
+                    actual=actual_stdout,
+                    passed=stdout_match
+                    not in {"formatting_mismatch", "mismatch"},
+                    match_type=stdout_match,
+                )
+
+            channels = [
+                channel
+                for channel in (return_result, stdout_result)
+                if channel is not None
+            ]
+            passed = all(channel.passed for channel in channels)
+            step_results.append(
+                ObjectScenarioStepResult(
+                    index=step_index,
+                    method_id=prepared_step.method.id,
+                    method=prepared_step.method.display,
+                    status="completed",
+                    passed=passed,
+                    return_result=return_result,
+                    stdout_result=stdout_result,
+                )
+            )
+
+        runtime_ok = (
+            not output.timed_out
+            and not output.output_limited
+            and output.exit_code == 0
+            and constructor_completed
+            and output.progress_index == len(prepared.steps)
+        )
+        passed = runtime_ok and all(
+            step.passed for step in step_results
+        )
+        results.append(
+            ObjectScenarioTestResult(
+                name=test.name,
+                passed=passed,
+                class_name=prepared.object_class.name,
+                constructor=prepared.constructor.display,
+                constructor_arguments=test.constructor_arguments,
+                constructor_completed=constructor_completed,
+                failed_step_index=failed_step_index,
+                steps=step_results,
+                stderr=output.stderr,
+                exit_code=output.exit_code,
+                timed_out=output.timed_out,
+                output_limited=output.output_limited,
+                match_type="exact" if passed else "mismatch",
+            )
+        )
+    return results
+
+
 def _unsupported_response(analysis: FunctionAnalysis) -> RunTestsResponse:
     return RunTestsResponse(
         mode="unsupported",
@@ -1364,6 +1766,126 @@ def _unsupported_response(analysis: FunctionAnalysis) -> RunTestsResponse:
     )
 
 
+def _prepare_object_scenarios(
+    request: ObjectScenarioRunTestsRequest,
+) -> list[PreparedObjectScenario]:
+    analysis = analyze_object_scenarios(request.code)
+    prepared_scenarios: list[PreparedObjectScenario] = []
+    for scenario_index, test in enumerate(request.tests):
+        object_class = next(
+            (
+                candidate
+                for candidate in analysis.classes
+                if candidate.id == test.class_id
+            ),
+            None,
+        )
+        if object_class is None:
+            raise ValueError(
+                f"{test.name} selected a class that is no longer available."
+            )
+        constructor = next(
+            (
+                candidate
+                for candidate in object_class.constructors
+                if candidate.id == test.constructor_id
+            ),
+            None,
+        )
+        if constructor is None:
+            raise ValueError(
+                f"{test.name} selected a constructor that does not belong "
+                "to the selected class or is no longer public."
+            )
+        if len(test.constructor_arguments) != len(constructor.parameters):
+            raise ValueError(
+                f"{test.name} constructor requires "
+                f"{len(constructor.parameters)} argument(s)."
+            )
+        constructor_arguments = tuple(
+            _prepare_argument(
+                parameter.value_type,
+                argument,
+                f"{test.name} constructor argument {parameter.name}",
+                test_index=scenario_index,
+                parameter_index=parameter_index,
+            )
+            for parameter_index, (parameter, argument) in enumerate(
+                zip(
+                    constructor.parameters,
+                    test.constructor_arguments,
+                    strict=True,
+                )
+            )
+        )
+
+        prepared_steps: list[PreparedObjectStep] = []
+        for step_index, step in enumerate(test.steps):
+            method = next(
+                (
+                    candidate
+                    for candidate in object_class.methods
+                    if candidate.id == step.method_id
+                ),
+                None,
+            )
+            if method is None:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} selected a method "
+                    "that does not belong to the selected class or is no "
+                    "longer public."
+                )
+            if len(step.arguments) != len(method.parameters):
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} requires "
+                    f"{len(method.parameters)} argument(s)."
+                )
+            is_void = method.return_value_type.kind == "void"
+            if is_void and step.expected_return is not None:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} cannot provide an "
+                    "expected return for a void method."
+                )
+            if not is_void and step.expected_return is None:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} must provide an "
+                    "expected return value."
+                )
+            if not is_void:
+                _safe_value_literal(
+                    method.return_value_type,
+                    step.expected_return or "",
+                    f"{test.name} step {step_index + 1} expected return",
+                )
+            arguments = tuple(
+                _prepare_argument(
+                    parameter.value_type,
+                    argument,
+                    (
+                        f"{test.name} step {step_index + 1} "
+                        f"argument {parameter.name}"
+                    ),
+                    test_index=scenario_index,
+                    parameter_index=parameter_index,
+                )
+                for parameter_index, (parameter, argument) in enumerate(
+                    zip(method.parameters, step.arguments, strict=True)
+                )
+            )
+            prepared_steps.append(
+                PreparedObjectStep(method=method, arguments=arguments)
+            )
+        prepared_scenarios.append(
+            PreparedObjectScenario(
+                object_class=object_class,
+                constructor=constructor,
+                constructor_arguments=constructor_arguments,
+                steps=tuple(prepared_steps),
+            )
+        )
+    return prepared_scenarios
+
+
 def run_test_request(
     request: RunTestsRequest,
     *,
@@ -1371,16 +1893,31 @@ def run_test_request(
     compile_timeout_seconds: int = COMPILE_TIMEOUT_SECONDS,
     test_timeout_seconds: float = TEST_TIMEOUT_SECONDS,
 ) -> RunTestsResponse:
+    object_scenarios: list[PreparedObjectScenario] = []
     analysis = analyze_test_mode(request.code)
-    if analysis.mode == "unsupported":
-        return _unsupported_response(analysis)
-    if request.mode != analysis.mode:
-        return RunTestsResponse(
-            mode=analysis.mode,
-            success=False,
-            input_error="The source execution mode changed. Review the tests and retry.",
-            tests=[],
-        )
+    if isinstance(request, ObjectScenarioRunTestsRequest):
+        try:
+            object_scenarios = _prepare_object_scenarios(request)
+        except ValueError as error:
+            return RunTestsResponse(
+                mode="object",
+                success=False,
+                input_error=str(error),
+                tests=[],
+            )
+    else:
+        if analysis.mode == "unsupported":
+            return _unsupported_response(analysis)
+        if request.mode != analysis.mode:
+            return RunTestsResponse(
+                mode=analysis.mode,
+                success=False,
+                input_error=(
+                    "The source execution mode changed. "
+                    "Review the tests and retry."
+                ),
+                tests=[],
+            )
 
     arguments_by_test: list[list[HarnessArgument]] = []
     function = None
@@ -1619,7 +2156,9 @@ def run_test_request(
             working_directory = Path(directory)
             executable = working_directory / "program"
             source = (
-                _build_function_harness(
+                _build_object_harness(request.code, object_scenarios)
+                if isinstance(request, ObjectScenarioRunTestsRequest)
+                else _build_function_harness(
                     request.code,
                     function,
                     arguments_by_test,
@@ -1659,6 +2198,20 @@ def run_test_request(
                     mode="program",
                     success=all(result.passed for result in results),
                     tests=results,
+                )
+
+            if isinstance(request, ObjectScenarioRunTestsRequest):
+                object_results = _object_results(
+                    executable,
+                    working_directory,
+                    request,
+                    object_scenarios,
+                    timeout_seconds=test_timeout_seconds,
+                )
+                return RunTestsResponse(
+                    mode="object",
+                    success=all(result.passed for result in object_results),
+                    tests=object_results,
                 )
 
             function_results = _function_results(

@@ -34,14 +34,42 @@ class FunctionResponse(BaseModel):
     display: str
 
 
+class ObjectConstructorResponse(BaseModel):
+    id: str
+    display: str
+    parameters: list[FunctionParameterResponse]
+
+
+class ObjectMethodResponse(BaseModel):
+    id: str
+    name: str
+    display: str
+    parameters: list[FunctionParameterResponse]
+    return_type: str
+    return_type_metadata: FunctionTypeResponse
+    is_const: bool
+
+
+class ObjectClassResponse(BaseModel):
+    id: str
+    name: str
+    kind: Literal["class", "struct"]
+    constructors: list[ObjectConstructorResponse]
+    methods: list[ObjectMethodResponse]
+
+
 class SourceModeRequest(BaseModel):
     code: str = Field(min_length=1, max_length=1_000_000)
     language: Literal["cpp"]
 
 
 class SourceModeResponse(BaseModel):
-    mode: Literal["program", "function", "unsupported"]
+    mode: Literal["program", "function", "object", "unsupported"]
     functions: list[FunctionResponse] = Field(default_factory=list)
+    classes: list[ObjectClassResponse] = Field(default_factory=list)
+    available_modes: list[
+        Literal["program", "function", "object"]
+    ] = Field(default_factory=list)
     message: str | None = None
 
 
@@ -128,8 +156,48 @@ class FunctionRunTestsRequest(BaseModel):
     tests: list[FunctionTestCase] = Field(min_length=1, max_length=10)
 
 
+class ObjectScenarioStep(BaseModel):
+    method_id: str = Field(min_length=1, max_length=500)
+    arguments: list[str] = Field(max_length=20)
+    expected_return: str | None = Field(default=None, max_length=1_000)
+    check_stdout: bool = False
+    expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
+
+    @model_validator(mode="after")
+    def validate_stdout(self) -> "ObjectScenarioStep":
+        if self.check_stdout and self.expected_stdout is None:
+            raise ValueError(
+                "Method-output checking requires expected stdout."
+            )
+        if not self.check_stdout and self.expected_stdout is not None:
+            raise ValueError(
+                "Expected stdout requires method-output checking."
+            )
+        return self
+
+
+class ObjectScenarioTestCase(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    class_id: str = Field(min_length=1, max_length=200)
+    constructor_id: str = Field(min_length=1, max_length=500)
+    constructor_arguments: list[str] = Field(max_length=20)
+    steps: list[ObjectScenarioStep] = Field(min_length=1, max_length=20)
+
+
+class ObjectScenarioRunTestsRequest(BaseModel):
+    mode: Literal["object"]
+    code: str = Field(min_length=1, max_length=1_000_000)
+    language: Literal["cpp"]
+    comparison_mode: Literal["whitespace_tolerant", "exact"] = (
+        "whitespace_tolerant"
+    )
+    tests: list[ObjectScenarioTestCase] = Field(min_length=1, max_length=10)
+
+
 RunTestsRequest = Annotated[
-    ProgramRunTestsRequest | FunctionRunTestsRequest,
+    ProgramRunTestsRequest
+    | FunctionRunTestsRequest
+    | ObjectScenarioRunTestsRequest,
     Field(discriminator="mode"),
 ]
 
@@ -235,8 +303,34 @@ class FunctionCombinedTestResult(BaseModel):
     match_type: Literal["exact", "mismatch"]
 
 
+class ObjectScenarioStepResult(BaseModel):
+    index: int
+    method_id: str
+    method: str
+    status: Literal["completed", "failed", "not_executed"]
+    passed: bool
+    return_result: FunctionChannelResult | None = None
+    stdout_result: FunctionChannelResult | None = None
+
+
+class ObjectScenarioTestResult(BaseModel):
+    name: str
+    passed: bool
+    class_name: str
+    constructor: str
+    constructor_arguments: list[str]
+    constructor_completed: bool
+    failed_step_index: int | None = None
+    steps: list[ObjectScenarioStepResult]
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    output_limited: bool
+    match_type: Literal["exact", "mismatch"]
+
+
 class RunTestsResponse(BaseModel):
-    mode: Literal["program", "function", "unsupported"]
+    mode: Literal["program", "function", "object", "unsupported"]
     success: bool
     compile_error: str | None = None
     input_error: str | None = None
@@ -247,5 +341,6 @@ class RunTestsResponse(BaseModel):
         | FunctionOutputTestResult
         | FunctionMutationTestResult
         | FunctionCombinedTestResult
+        | ObjectScenarioTestResult
         | ProgramTestResult
     ]

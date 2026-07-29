@@ -50,6 +50,33 @@ export type ObjectClass = {
   kind: "class" | "struct";
   constructors: ObjectConstructor[];
   methods: ObjectMethod[];
+  operators: ObjectOperator[];
+};
+
+export type ObjectOperatorParameter = {
+  name: string;
+  type: string;
+  operand_kind: "value" | "object" | "stream";
+  object_class_id: string | null;
+  type_metadata: FunctionTypeMetadata | null;
+};
+
+export type ObjectOperator = {
+  id: string;
+  symbol: string;
+  display: string;
+  kind: "member" | "standalone";
+  declaring_class_id: string | null;
+  parameters: ObjectOperatorParameter[];
+  return_type: string;
+  return_kind:
+    | "value"
+    | "object_value"
+    | "mutation_reference"
+    | "stream_reference";
+  return_object_class_id: string | null;
+  return_type_metadata: FunctionTypeMetadata | null;
+  is_const: boolean;
 };
 
 export type TestModeAnalysis = {
@@ -98,12 +125,22 @@ export type FunctionCombinedTestInput = {
 
 export type ObjectScenarioTestInput = {
   name: string;
-  class_id: string;
-  constructor_id: string;
-  constructor_arguments: string[];
-  steps: Array<{
-    method_id: string;
+  objects: Array<{
+    object_id: string;
+    name: string;
+    class_id: string;
+    constructor_id: string;
     arguments: string[];
+  }>;
+  steps: Array<{
+    step_type: "method" | "observer" | "operator";
+    method_id?: string;
+    operator_id?: string;
+    target_object_id: string;
+    arguments: string[];
+    operands: string[];
+    result_object_id?: string;
+    result_name?: string;
     expected_return?: string;
     check_stdout: boolean;
     expected_stdout?: string;
@@ -176,11 +213,16 @@ export type ObjectScenarioTestResult = ResultBase & {
   constructor: string;
   constructor_arguments: string[];
   constructor_completed: boolean;
+  constructed_objects: string[];
   failed_step_index: number | null;
   steps: Array<{
     index: number;
-    method_id: string;
+    method_id: string | null;
+    step_type: "method" | "observer" | "operator";
+    operator_id: string | null;
     method: string;
+    expression: string | null;
+    result_object_name: string | null;
     status: "completed" | "failed" | "not_executed";
     passed: boolean;
     return_result: FunctionChannelResult | null;
@@ -295,6 +337,43 @@ function isObjectClass(value: unknown): value is ObjectClass {
         typeof method.is_const === "boolean" &&
         isFunctionTypeMetadata(method.return_type_metadata) &&
         validParameters(method.parameters),
+    ) &&
+    Array.isArray(objectClass.operators) &&
+    objectClass.operators.every(
+      (operator) =>
+        operator !== null &&
+        typeof operator === "object" &&
+        typeof operator.id === "string" &&
+        typeof operator.symbol === "string" &&
+        typeof operator.display === "string" &&
+        ["member", "standalone"].includes(operator.kind) &&
+        (operator.declaring_class_id === null ||
+          typeof operator.declaring_class_id === "string") &&
+        Array.isArray(operator.parameters) &&
+        operator.parameters.every(
+          (parameter) =>
+            parameter !== null &&
+            typeof parameter === "object" &&
+            typeof parameter.name === "string" &&
+            typeof parameter.type === "string" &&
+            ["value", "object", "stream"].includes(parameter.operand_kind) &&
+            (parameter.object_class_id === null ||
+              typeof parameter.object_class_id === "string") &&
+            (parameter.type_metadata === null ||
+              isFunctionTypeMetadata(parameter.type_metadata)),
+        ) &&
+        typeof operator.return_type === "string" &&
+        [
+          "value",
+          "object_value",
+          "mutation_reference",
+          "stream_reference",
+        ].includes(operator.return_kind) &&
+        (operator.return_object_class_id === null ||
+          typeof operator.return_object_class_id === "string") &&
+        (operator.return_type_metadata === null ||
+          isFunctionTypeMetadata(operator.return_type_metadata)) &&
+        typeof operator.is_const === "boolean",
     )
   );
 }
@@ -412,6 +491,10 @@ function isTestResult(
       (argument) => typeof argument === "string",
     ) &&
     typeof objectResult.constructor_completed === "boolean" &&
+    Array.isArray(objectResult.constructed_objects) &&
+    objectResult.constructed_objects.every(
+      (item) => typeof item === "string",
+    ) &&
     (objectResult.failed_step_index === null ||
       typeof objectResult.failed_step_index === "number") &&
     Array.isArray(objectResult.steps) &&
@@ -420,8 +503,13 @@ function isTestResult(
         step !== null &&
         typeof step === "object" &&
         typeof step.index === "number" &&
-        typeof step.method_id === "string" &&
+        ["method", "observer", "operator"].includes(step.step_type) &&
+        (step.method_id === null || typeof step.method_id === "string") &&
+        (step.operator_id === null || typeof step.operator_id === "string") &&
         typeof step.method === "string" &&
+        (step.expression === null || typeof step.expression === "string") &&
+        (step.result_object_name === null ||
+          typeof step.result_object_name === "string") &&
         ["completed", "failed", "not_executed"].includes(step.status) &&
         typeof step.passed === "boolean" &&
         (step.return_result === null ||

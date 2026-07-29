@@ -50,12 +50,37 @@ class ObjectMethodResponse(BaseModel):
     is_const: bool
 
 
+class ObjectOperatorParameterResponse(BaseModel):
+    name: str
+    type: str
+    operand_kind: Literal["value", "object", "stream"]
+    object_class_id: str | None = None
+    type_metadata: FunctionTypeResponse | None = None
+
+
+class ObjectOperatorResponse(BaseModel):
+    id: str
+    symbol: str
+    display: str
+    kind: Literal["member", "standalone"]
+    declaring_class_id: str | None = None
+    parameters: list[ObjectOperatorParameterResponse]
+    return_type: str
+    return_kind: Literal[
+        "value", "object_value", "mutation_reference", "stream_reference"
+    ]
+    return_object_class_id: str | None = None
+    return_type_metadata: FunctionTypeResponse | None = None
+    is_const: bool
+
+
 class ObjectClassResponse(BaseModel):
     id: str
     name: str
     kind: Literal["class", "struct"]
     constructors: list[ObjectConstructorResponse]
     methods: list[ObjectMethodResponse]
+    operators: list[ObjectOperatorResponse] = Field(default_factory=list)
 
 
 class SourceModeRequest(BaseModel):
@@ -157,14 +182,24 @@ class FunctionRunTestsRequest(BaseModel):
 
 
 class ObjectScenarioStep(BaseModel):
-    method_id: str = Field(min_length=1, max_length=500)
-    arguments: list[str] = Field(max_length=20)
+    step_type: Literal["method", "observer", "operator"] = "method"
+    method_id: str | None = Field(default=None, max_length=500)
+    operator_id: str | None = Field(default=None, max_length=700)
+    target_object_id: str | None = Field(default=None, max_length=100)
+    arguments: list[str] = Field(default_factory=list, max_length=20)
+    operands: list[str] = Field(default_factory=list, max_length=20)
+    result_object_id: str | None = Field(default=None, max_length=100)
+    result_name: str | None = Field(default=None, max_length=100)
     expected_return: str | None = Field(default=None, max_length=1_000)
     check_stdout: bool = False
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
 
     @model_validator(mode="after")
     def validate_stdout(self) -> "ObjectScenarioStep":
+        if self.step_type in {"method", "observer"} and not self.method_id:
+            raise ValueError("Method steps require a method identifier.")
+        if self.step_type == "operator" and not self.operator_id:
+            raise ValueError("Operator steps require an operator identifier.")
         if self.check_stdout and self.expected_stdout is None:
             raise ValueError(
                 "Method-output checking requires expected stdout."
@@ -176,12 +211,37 @@ class ObjectScenarioStep(BaseModel):
         return self
 
 
-class ObjectScenarioTestCase(BaseModel):
+class ObjectScenarioObject(BaseModel):
+    object_id: str = Field(min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=100)
     class_id: str = Field(min_length=1, max_length=200)
     constructor_id: str = Field(min_length=1, max_length=500)
-    constructor_arguments: list[str] = Field(max_length=20)
+    arguments: list[str] = Field(max_length=20)
+
+
+class ObjectScenarioTestCase(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    objects: list[ObjectScenarioObject] | None = Field(
+        default=None, min_length=1, max_length=5
+    )
+    class_id: str | None = Field(default=None, max_length=200)
+    constructor_id: str | None = Field(default=None, max_length=500)
+    constructor_arguments: list[str] | None = Field(
+        default=None, max_length=20
+    )
     steps: list[ObjectScenarioStep] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_object_shape(self) -> "ObjectScenarioTestCase":
+        if self.objects is None and not (
+            self.class_id
+            and self.constructor_id
+            and self.constructor_arguments is not None
+        ):
+            raise ValueError("Provide scenario objects.")
+        if self.objects is not None and self.class_id is not None:
+            raise ValueError("Use either objects or the legacy object fields.")
+        return self
 
 
 class ObjectScenarioRunTestsRequest(BaseModel):
@@ -305,8 +365,12 @@ class FunctionCombinedTestResult(BaseModel):
 
 class ObjectScenarioStepResult(BaseModel):
     index: int
-    method_id: str
+    step_type: Literal["method", "observer", "operator"] = "method"
+    method_id: str | None = None
+    operator_id: str | None = None
     method: str
+    expression: str | None = None
+    result_object_name: str | None = None
     status: Literal["completed", "failed", "not_executed"]
     passed: bool
     return_result: FunctionChannelResult | None = None
@@ -320,6 +384,7 @@ class ObjectScenarioTestResult(BaseModel):
     constructor: str
     constructor_arguments: list[str]
     constructor_completed: bool
+    constructed_objects: list[str] = Field(default_factory=list)
     failed_step_index: int | None = None
     steps: list[ObjectScenarioStepResult]
     stderr: str

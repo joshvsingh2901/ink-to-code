@@ -10,6 +10,8 @@ from app.schemas.test_execution import (
     ObjectClassResponse,
     ObjectConstructorResponse,
     ObjectMethodResponse,
+    ObjectOperatorParameterResponse,
+    ObjectOperatorResponse,
     RunTestsRequest,
     RunTestsResponse,
     SourceModeRequest,
@@ -123,6 +125,47 @@ async def analyze_source_mode(
                         is_const=method.is_const,
                     )
                     for method in object_class.methods
+                ],
+                operators=[
+                    ObjectOperatorResponse(
+                        id=operator.id,
+                        symbol=operator.symbol,
+                        display=operator.display,
+                        kind=operator.kind,
+                        declaring_class_id=operator.declaring_class_id,
+                        parameters=[
+                            ObjectOperatorParameterResponse(
+                                name=parameter.name,
+                                type=parameter.display_type,
+                                operand_kind=(
+                                    "stream"
+                                    if parameter.is_stream
+                                    else "object"
+                                    if parameter.object_class_id
+                                    else "value"
+                                ),
+                                object_class_id=parameter.object_class_id,
+                                type_metadata=(
+                                    type_response(parameter.value_type)
+                                    if parameter.value_type
+                                    else None
+                                ),
+                            )
+                            for parameter in operator.parameters
+                        ],
+                        return_type=operator.return_display_type,
+                        return_kind=operator.return_kind,
+                        return_object_class_id=(
+                            operator.return_object_class_id
+                        ),
+                        return_type_metadata=(
+                            type_response(operator.return_value_type)
+                            if operator.return_value_type
+                            else None
+                        ),
+                        is_const=operator.is_const,
+                    )
+                    for operator in object_class.operators
                 ],
             )
             for object_class in object_analysis.classes

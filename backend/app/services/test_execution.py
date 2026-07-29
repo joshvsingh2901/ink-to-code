@@ -44,6 +44,7 @@ from app.services.object_analysis import (
     ObjectClass,
     ObjectConstructor,
     ObjectMethod,
+    ObjectOperator,
     analyze_object_scenarios,
 )
 
@@ -81,15 +82,28 @@ class HarnessArgument:
 
 @dataclass(frozen=True)
 class PreparedObjectStep:
-    method: ObjectMethod
+    method: ObjectMethod | None
     arguments: tuple[HarnessArgument, ...]
+    target_object_id: str
+    operator: ObjectOperator | None = None
+    operand_expressions: tuple[str, ...] = ()
+    result_object_id: str | None = None
+    result_name: str | None = None
+    expression: str = ""
+
+
+@dataclass(frozen=True)
+class PreparedScenarioObject:
+    object_id: str
+    name: str
+    object_class: ObjectClass
+    constructor: ObjectConstructor
+    constructor_arguments: tuple[HarnessArgument, ...]
 
 
 @dataclass(frozen=True)
 class PreparedObjectScenario:
-    object_class: ObjectClass
-    constructor: ObjectConstructor
-    constructor_arguments: tuple[HarnessArgument, ...]
+    objects: tuple[PreparedScenarioObject, ...]
     steps: tuple[PreparedObjectStep, ...]
 
 
@@ -1077,12 +1091,9 @@ def _build_object_harness(
     for scenario_index, scenario in enumerate(scenarios):
         constructor_declarations = " ".join(
             declaration
-            for argument in scenario.constructor_arguments
+            for scenario_object in scenario.objects
+            for argument in scenario_object.constructor_arguments
             for declaration in argument.declarations
-        )
-        constructor_expressions = ", ".join(
-            argument.expression
-            for argument in scenario.constructor_arguments
         )
         statements = [
             constructor_declarations,
@@ -1094,13 +1105,27 @@ def _build_object_harness(
             ),
             "std::streambuf* inktocode_constructor_original = "
             "std::cout.rdbuf(inktocode_constructor_output.rdbuf());",
-            (
-                f"{scenario.object_class.name} inktocode_object"
-                f"{{{constructor_expressions}}};"
-            ),
+            *[
+                (
+                    f"{scenario_object.object_class.name} "
+                    f"inktocode_object_{object_index}{{"
+                    + ", ".join(
+                        argument.expression
+                        for argument in scenario_object.constructor_arguments
+                    )
+                    + "};"
+                )
+                for object_index, scenario_object in enumerate(
+                    scenario.objects
+                )
+            ],
             "std::cout.rdbuf(inktocode_constructor_original);",
             "inktocode_constructor_output.close();",
         ]
+        object_variables = {
+            scenario_object.object_id: f"inktocode_object_{index}"
+            for index, scenario_object in enumerate(scenario.objects)
+        }
         for step_index, step in enumerate(scenario.steps):
             declarations = " ".join(
                 declaration
@@ -1110,20 +1135,60 @@ def _build_object_harness(
             expressions = ", ".join(
                 argument.expression for argument in step.arguments
             )
-            call = f"inktocode_object.{step.method.name}({expressions})"
+            target = object_variables[step.target_object_id]
+            if step.method is not None:
+                call = f"{target}.{step.method.name}({expressions})"
+                return_type = step.method.return_value_type
+                object_result_type = None
+                suppress_return = return_type.kind == "void"
+            else:
+                operator = step.operator
+                if operator is None:
+                    raise ValueError("Prepared operator step has no operator.")
+                operands = [
+                    object_variables.get(operand, operand)
+                    for operand in step.operand_expressions
+                ]
+                if operator.symbol == "<<":
+                    call = f"std::cout << {operands[-1]}"
+                elif operator.kind == "member":
+                    operand_text = ", ".join(operands)
+                    if operator.symbol == "[]":
+                        call = f"{target}[{operand_text}]"
+                    elif operator.symbol == "()":
+                        call = f"{target}({operand_text})"
+                    else:
+                        call = f"{target} {operator.symbol} {operands[0]}"
+                else:
+                    call = (
+                        f" {operator.symbol} ".join(operands)
+                        if len(operands) == 2
+                        else f"operator{operator.symbol}({', '.join(operands)})"
+                    )
+                return_type = operator.return_value_type
+                object_result_type = operator.return_object_class_id
+                suppress_return = operator.return_kind in {
+                    "mutation_reference",
+                    "stream_reference",
+                }
             result_name = f"inktocode_step_{step_index}_result"
-            call_statement = (
-                f"{call};"
-                if step.method.return_value_type.kind == "void"
-                else f"auto {result_name} = {call};"
-            )
+            if object_result_type:
+                result_variable = f"inktocode_result_{step_index}"
+                call_statement = (
+                    f"{object_result_type} {result_variable} = {call};"
+                )
+                if step.result_object_id:
+                    object_variables[step.result_object_id] = result_variable
+            else:
+                call_statement = (
+                    f"{call};"
+                    if suppress_return
+                    else f"auto {result_name} = {call};"
+                )
             serialized_return = (
                 'std::cout << "null";'
-                if step.method.return_value_type.kind == "void"
-                else _serialized_value_output(
-                    result_name,
-                    step.method.return_value_type,
-                )
+                if suppress_return or object_result_type
+                else _serialized_value_output(result_name, return_type)
             )
             statements.extend(
                 [
@@ -1655,8 +1720,24 @@ def _object_results(
                 step_results.append(
                     ObjectScenarioStepResult(
                         index=step_index,
-                        method_id=prepared_step.method.id,
-                        method=prepared_step.method.display,
+                        step_type=step_request.step_type,
+                        method_id=(
+                            prepared_step.method.id
+                            if prepared_step.method
+                            else None
+                        ),
+                        operator_id=(
+                            prepared_step.operator.id
+                            if prepared_step.operator
+                            else None
+                        ),
+                        method=(
+                            prepared_step.method.display
+                            if prepared_step.method
+                            else prepared_step.operator.display
+                        ),
+                        expression=prepared_step.expression,
+                        result_object_name=prepared_step.result_name,
                         status=status,
                         passed=False,
                     )
@@ -1664,14 +1745,22 @@ def _object_results(
                 continue
 
             return_result: FunctionChannelResult | None = None
-            if prepared_step.method.return_value_type.kind != "void":
+            result_type = (
+                prepared_step.method.return_value_type
+                if prepared_step.method
+                else prepared_step.operator.return_value_type
+                if prepared_step.operator
+                and prepared_step.operator.return_kind == "value"
+                else None
+            )
+            if result_type is not None and result_type.kind != "void":
                 expected_return = step_request.expected_return or ""
                 actual_return = _metadata_value(
-                    prepared_step.method.return_value_type,
+                    result_type,
                     metadata.get("return"),
                 )
                 return_match = _typed_match(
-                    prepared_step.method.return_value_type,
+                    result_type,
                     expected_return,
                     actual_return,
                 )
@@ -1684,7 +1773,7 @@ def _object_results(
                         None
                         if return_match != "mismatch"
                         else _typed_mismatch_detail(
-                            prepared_step.method.return_value_type,
+                            result_type,
                             expected_return,
                             actual_return,
                         )
@@ -1717,8 +1806,22 @@ def _object_results(
             step_results.append(
                 ObjectScenarioStepResult(
                     index=step_index,
-                    method_id=prepared_step.method.id,
-                    method=prepared_step.method.display,
+                    step_type=step_request.step_type,
+                    method_id=(
+                        prepared_step.method.id if prepared_step.method else None
+                    ),
+                    operator_id=(
+                        prepared_step.operator.id
+                        if prepared_step.operator
+                        else None
+                    ),
+                    method=(
+                        prepared_step.method.display
+                        if prepared_step.method
+                        else prepared_step.operator.display
+                    ),
+                    expression=prepared_step.expression,
+                    result_object_name=prepared_step.result_name,
                     status="completed",
                     passed=passed,
                     return_result=return_result,
@@ -1740,10 +1843,32 @@ def _object_results(
             ObjectScenarioTestResult(
                 name=test.name,
                 passed=passed,
-                class_name=prepared.object_class.name,
-                constructor=prepared.constructor.display,
-                constructor_arguments=test.constructor_arguments,
+                class_name=prepared.objects[0].object_class.name,
+                constructor=prepared.objects[0].constructor.display,
+                constructor_arguments=(
+                    test.constructor_arguments
+                    if test.constructor_arguments is not None
+                    else test.objects[0].arguments
+                ),
                 constructor_completed=constructor_completed,
+                constructed_objects=[
+                    (
+                        f"{item.name} = {item.constructor.display}"
+                        f"({', '.join(requested.arguments)})"
+                    )
+                    for item, requested in zip(
+                        prepared.objects,
+                        test.objects
+                        or [
+                            type(
+                                "LegacyObject",
+                                (),
+                                {"arguments": test.constructor_arguments or []},
+                            )()
+                        ],
+                        strict=True,
+                    )
+                ],
                 failed_step_index=failed_step_index,
                 steps=step_results,
                 stderr=output.stderr,
@@ -1772,114 +1897,298 @@ def _prepare_object_scenarios(
     analysis = analyze_object_scenarios(request.code)
     prepared_scenarios: list[PreparedObjectScenario] = []
     for scenario_index, test in enumerate(request.tests):
-        object_class = next(
-            (
-                candidate
-                for candidate in analysis.classes
-                if candidate.id == test.class_id
-            ),
-            None,
-        )
-        if object_class is None:
-            raise ValueError(
-                f"{test.name} selected a class that is no longer available."
-            )
-        constructor = next(
-            (
-                candidate
-                for candidate in object_class.constructors
-                if candidate.id == test.constructor_id
-            ),
-            None,
-        )
-        if constructor is None:
-            raise ValueError(
-                f"{test.name} selected a constructor that does not belong "
-                "to the selected class or is no longer public."
-            )
-        if len(test.constructor_arguments) != len(constructor.parameters):
-            raise ValueError(
-                f"{test.name} constructor requires "
-                f"{len(constructor.parameters)} argument(s)."
-            )
-        constructor_arguments = tuple(
-            _prepare_argument(
-                parameter.value_type,
-                argument,
-                f"{test.name} constructor argument {parameter.name}",
-                test_index=scenario_index,
-                parameter_index=parameter_index,
-            )
-            for parameter_index, (parameter, argument) in enumerate(
-                zip(
-                    constructor.parameters,
-                    test.constructor_arguments,
-                    strict=True,
-                )
-            )
-        )
-
-        prepared_steps: list[PreparedObjectStep] = []
-        for step_index, step in enumerate(test.steps):
-            method = next(
+        requested_objects = test.objects
+        if requested_objects is None:
+            requested_objects = [
+                type(
+                    "LegacyObject",
+                    (),
+                    {
+                        "object_id": "legacy-object",
+                        "name": "object",
+                        "class_id": test.class_id,
+                        "constructor_id": test.constructor_id,
+                        "arguments": test.constructor_arguments,
+                    },
+                )()
+            ]
+        if len({item.object_id for item in requested_objects}) != len(
+            requested_objects
+        ):
+            raise ValueError(f"{test.name} has duplicate object identifiers.")
+        if len({item.name for item in requested_objects}) != len(
+            requested_objects
+        ):
+            raise ValueError(f"{test.name} object names must be unique.")
+        prepared_objects: list[PreparedScenarioObject] = []
+        available_objects: dict[str, tuple[str, str]] = {}
+        used_names = {item.name for item in requested_objects}
+        for object_index, item in enumerate(requested_objects):
+            object_class = next(
                 (
                     candidate
-                    for candidate in object_class.methods
-                    if candidate.id == step.method_id
+                    for candidate in analysis.classes
+                    if candidate.id == item.class_id
                 ),
                 None,
             )
-            if method is None:
+            if object_class is None:
                 raise ValueError(
-                    f"{test.name} step {step_index + 1} selected a method "
-                    "that does not belong to the selected class or is no "
-                    "longer public."
+                    f"{test.name} selected a class that is no longer available."
                 )
-            if len(step.arguments) != len(method.parameters):
+            constructor = next(
+                (
+                    candidate
+                    for candidate in object_class.constructors
+                    if candidate.id == item.constructor_id
+                ),
+                None,
+            )
+            if constructor is None:
                 raise ValueError(
-                    f"{test.name} step {step_index + 1} requires "
-                    f"{len(method.parameters)} argument(s)."
+                    f"{test.name} selected a stale or wrong-class constructor."
                 )
-            is_void = method.return_value_type.kind == "void"
-            if is_void and step.expected_return is not None:
+            if len(item.arguments) != len(constructor.parameters):
                 raise ValueError(
-                    f"{test.name} step {step_index + 1} cannot provide an "
-                    "expected return for a void method."
-                )
-            if not is_void and step.expected_return is None:
-                raise ValueError(
-                    f"{test.name} step {step_index + 1} must provide an "
-                    "expected return value."
-                )
-            if not is_void:
-                _safe_value_literal(
-                    method.return_value_type,
-                    step.expected_return or "",
-                    f"{test.name} step {step_index + 1} expected return",
+                    f"{test.name} object {item.name} constructor requires "
+                    f"{len(constructor.parameters)} argument(s)."
                 )
             arguments = tuple(
                 _prepare_argument(
                     parameter.value_type,
                     argument,
-                    (
-                        f"{test.name} step {step_index + 1} "
-                        f"argument {parameter.name}"
-                    ),
+                    f"{test.name} constructor argument {parameter.name}",
                     test_index=scenario_index,
-                    parameter_index=parameter_index,
+                    parameter_index=object_index * 20 + parameter_index,
                 )
                 for parameter_index, (parameter, argument) in enumerate(
-                    zip(method.parameters, step.arguments, strict=True)
+                    zip(constructor.parameters, item.arguments, strict=True)
                 )
             )
+            prepared_objects.append(
+                PreparedScenarioObject(
+                    object_id=item.object_id,
+                    name=item.name,
+                    object_class=object_class,
+                    constructor=constructor,
+                    constructor_arguments=arguments,
+                )
+            )
+            available_objects[item.object_id] = (object_class.id, item.name)
+        prepared_steps: list[PreparedObjectStep] = []
+        for step_index, step in enumerate(test.steps):
+            target_id = step.target_object_id or requested_objects[0].object_id
+            target = available_objects.get(target_id)
+            if target is None:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} references a stale object."
+                )
+            target_class = next(
+                item for item in analysis.classes if item.id == target[0]
+            )
+            if step.step_type in {"method", "observer"}:
+                method = next(
+                    (
+                        candidate
+                        for candidate in target_class.methods
+                        if candidate.id == step.method_id
+                    ),
+                    None,
+                )
+                if method is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected a stale "
+                        "or wrong-class method."
+                    )
+                if len(step.arguments) != len(method.parameters):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} requires "
+                        f"{len(method.parameters)} argument(s)."
+                    )
+                is_void = method.return_value_type.kind == "void"
+                if is_void == (step.expected_return is not None):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} has an invalid "
+                        "expected return."
+                    )
+                if not is_void:
+                    _safe_value_literal(
+                        method.return_value_type,
+                        step.expected_return or "",
+                        f"{test.name} step {step_index + 1} expected return",
+                    )
+                arguments = tuple(
+                    _prepare_argument(
+                        parameter.value_type,
+                        argument,
+                        f"{test.name} step {step_index + 1} argument",
+                        test_index=scenario_index,
+                        parameter_index=step_index * 20 + parameter_index,
+                    )
+                    for parameter_index, (parameter, argument) in enumerate(
+                        zip(method.parameters, step.arguments, strict=True)
+                    )
+                )
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=method,
+                        arguments=arguments,
+                        target_object_id=target_id,
+                        expression=f"{target[1]}.{method.name}()",
+                    )
+                )
+                continue
+            operator = next(
+                (
+                    candidate
+                    for object_class in analysis.classes
+                    for candidate in object_class.operators
+                    if candidate.id == step.operator_id
+                ),
+                None,
+            )
+            if operator is None:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} selected a stale operator."
+                )
+            if (
+                operator.kind == "member"
+                and operator.declaring_class_id != target_class.id
+            ):
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} has the wrong target type."
+                )
+            editable_parameters = [
+                parameter
+                for parameter in operator.parameters
+                if not parameter.is_stream
+            ]
+            supplied = step.operands
+            if operator.kind == "member":
+                expected_count = len(editable_parameters)
+            else:
+                expected_count = len(editable_parameters)
+            if len(supplied) != expected_count:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} requires "
+                    f"{expected_count} operand(s)."
+                )
+            operand_expressions: list[str] = []
+            declarations: list[HarnessArgument] = []
+            for operand_index, (parameter, supplied_value) in enumerate(
+                zip(editable_parameters, supplied, strict=True)
+            ):
+                if parameter.object_class_id:
+                    referenced = available_objects.get(supplied_value)
+                    if referenced is None:
+                        raise ValueError(
+                            f"{test.name} step {step_index + 1} references "
+                            "an unavailable object operand."
+                        )
+                    if referenced[0] != parameter.object_class_id:
+                        raise ValueError(
+                            f"{test.name} step {step_index + 1} has the wrong "
+                            "object operand type."
+                        )
+                    operand_expressions.append(supplied_value)
+                elif parameter.value_type:
+                    prepared_argument = _prepare_argument(
+                        parameter.value_type,
+                        supplied_value,
+                        f"{test.name} step {step_index + 1} operand",
+                        test_index=scenario_index,
+                        parameter_index=step_index * 20 + operand_index,
+                    )
+                    declarations.append(prepared_argument)
+                    operand_expressions.append(prepared_argument.expression)
+            if operator.kind == "standalone" and operator.symbol != "<<":
+                participating = [
+                    available_objects.get(value)
+                    for value in operand_expressions
+                    if value in available_objects
+                ]
+                if not participating:
+                    raise ValueError("Standalone operator has no object operand.")
+            if operator.return_kind == "value":
+                if step.expected_return is None or operator.return_value_type is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} requires an expected value."
+                    )
+                _safe_value_literal(
+                    operator.return_value_type,
+                    step.expected_return,
+                    f"{test.name} step {step_index + 1} expected return",
+                )
+            elif operator.return_kind == "object_value":
+                if step.expected_return is not None:
+                    raise ValueError(
+                        "Object-valued operator results must use observers."
+                    )
+                if not step.result_object_id or not step.result_name:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} must name its object result."
+                    )
+                if (
+                    step.result_object_id in available_objects
+                    or step.result_name in used_names
+                ):
+                    raise ValueError("Object result identifiers and names must be unique.")
+                available_objects[step.result_object_id] = (
+                    operator.return_object_class_id or "",
+                    step.result_name,
+                )
+                used_names.add(step.result_name)
+            elif step.expected_return is not None:
+                raise ValueError("Reference and stream operator returns are not values.")
+            if operator.symbol == "<<" and not step.check_stdout:
+                raise ValueError("Stream-output operators require expected output.")
+            readable_operands = [
+                available_objects[value][1]
+                if value in available_objects
+                else supplied_value
+                for value, supplied_value in zip(
+                    operand_expressions, supplied, strict=True
+                )
+            ]
+            if operator.symbol == "<<":
+                readable_expression = f"print {readable_operands[-1]}"
+            elif operator.kind == "member":
+                if operator.symbol == "[]":
+                    readable_expression = (
+                        f"{target[1]}[{', '.join(readable_operands)}]"
+                    )
+                elif operator.symbol == "()":
+                    readable_expression = (
+                        f"{target[1]}({', '.join(readable_operands)})"
+                    )
+                else:
+                    readable_expression = (
+                        f"{target[1]} {operator.symbol} "
+                        f"{readable_operands[0]}"
+                    )
+            else:
+                readable_expression = (
+                    f" {operator.symbol} ".join(readable_operands)
+                )
+            if step.result_name:
+                readable_expression = (
+                    f"{step.result_name} = {readable_expression}"
+                )
             prepared_steps.append(
-                PreparedObjectStep(method=method, arguments=arguments)
+                PreparedObjectStep(
+                    method=None,
+                    arguments=tuple(declarations),
+                    target_object_id=target_id,
+                    operator=operator,
+                    operand_expressions=tuple(operand_expressions),
+                    result_object_id=step.result_object_id,
+                    result_name=step.result_name,
+                    expression=readable_expression,
+                )
             )
         prepared_scenarios.append(
             PreparedObjectScenario(
-                object_class=object_class,
-                constructor=constructor,
-                constructor_arguments=constructor_arguments,
+                objects=tuple(prepared_objects),
                 steps=tuple(prepared_steps),
             )
         )

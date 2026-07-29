@@ -1,16 +1,28 @@
 "use client";
 
 import type {
-  FunctionParameter,
-  FunctionTypeMetadata,
   ObjectClass,
-  ObjectMethod,
+  ObjectOperatorParameter,
 } from "@/lib/testExecution";
+
+export type EditableScenarioObject = {
+  id: string;
+  name: string;
+  class_id: string;
+  constructor_id: string;
+  arguments: string[];
+};
 
 export type EditableObjectStep = {
   id: string;
+  step_type: "method" | "observer" | "operator";
+  target_object_id: string;
   method_id: string;
+  operator_id: string;
   arguments: string[];
+  operands: string[];
+  result_object_id: string;
+  result_name: string;
   expected_return: string;
   check_stdout: boolean;
   expected_stdout: string;
@@ -19,9 +31,7 @@ export type EditableObjectStep = {
 export type EditableObjectScenario = {
   id: string;
   name: string;
-  class_id: string;
-  constructor_id: string;
-  constructor_arguments: string[];
+  objects: EditableScenarioObject[];
   steps: EditableObjectStep[];
 };
 
@@ -32,97 +42,73 @@ type Props = {
   onChange: (scenarios: EditableObjectScenario[]) => void;
 };
 
-function placeholder(metadata: FunctionTypeMetadata) {
-  if (metadata.vector_depth === 2) return "[[1, 2], [3, 4]]";
-  if (metadata.kind === "vector" || metadata.kind === "array") {
-    return metadata.element_type === "std::string"
-      ? '["hello", "world"]'
-      : "[1, 2, 3]";
-  }
+function newObject(classes: ObjectClass[], index: number): EditableScenarioObject {
+  const objectClass = classes.length === 1 ? classes[0] : null;
+  const constructor =
+    objectClass?.constructors.length === 1 ? objectClass.constructors[0] : null;
+  return {
+    id: `object-${crypto.randomUUID()}`,
+    name: index === 0 ? "object" : `object${index + 1}`,
+    class_id: objectClass?.id ?? "",
+    constructor_id: constructor?.id ?? "",
+    arguments: constructor?.parameters.map(() => "") ?? [],
+  };
+}
+
+function newStep(targetId: string): EditableObjectStep {
+  return {
+    id: `step-${crypto.randomUUID()}`,
+    step_type: "method",
+    target_object_id: targetId,
+    method_id: "",
+    operator_id: "",
+    arguments: [],
+    operands: [],
+    result_object_id: "",
+    result_name: "",
+    expected_return: "",
+    check_stdout: false,
+    expected_stdout: "",
+  };
 }
 
 function ValueField({
   id,
-  parameter,
+  label,
+  type,
   value,
+  placeholder,
+  helperText,
   onChange,
 }: {
   id: string;
-  parameter: FunctionParameter;
+  label: string;
+  type: string;
   value: string;
+  placeholder?: string;
+  helperText?: string;
   onChange: (value: string) => void;
 }) {
-  const classes =
-    "mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200";
   return (
     <div className="min-w-0">
       <label htmlFor={id} className="block text-xs font-medium text-slate-700">
-        <span className="block">{parameter.name}</span>
+        <span className="block">{label}</span>
         <span className="block text-[11px] font-normal text-slate-500">
-          {parameter.type_metadata.display_type}
+          {type}
         </span>
       </label>
-      {parameter.type_metadata.vector_depth === 2 ? (
-        <textarea
-          id={id}
-          rows={3}
-          maxLength={1_000}
-          value={value}
-          placeholder={placeholder(parameter.type_metadata)}
-          onChange={(event) => onChange(event.target.value)}
-          className={`${classes} resize-y leading-5`}
-        />
-      ) : (
-        <input
-          id={id}
-          maxLength={1_000}
-          value={value}
-          placeholder={placeholder(parameter.type_metadata)}
-          onChange={(event) => onChange(event.target.value)}
-          className={classes}
-        />
-      )}
-    </div>
-  );
-}
-
-function ReturnField({
-  id,
-  method,
-  value,
-  onChange,
-}: {
-  id: string;
-  method: ObjectMethod;
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  const classes =
-    "mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200";
-  return (
-    <div className="mt-3">
-      <label htmlFor={id} className="block text-xs font-medium text-slate-600">
-        Expected return — {method.return_type_metadata.display_type}
-      </label>
-      {method.return_type_metadata.vector_depth === 2 ? (
-        <textarea
-          id={id}
-          rows={3}
-          maxLength={1_000}
-          value={value}
-          placeholder={placeholder(method.return_type_metadata)}
-          onChange={(event) => onChange(event.target.value)}
-          className={`${classes} resize-y leading-5`}
-        />
-      ) : (
-        <input
-          id={id}
-          maxLength={1_000}
-          value={value}
-          placeholder={placeholder(method.return_type_metadata)}
-          onChange={(event) => onChange(event.target.value)}
-          className={classes}
-        />
+      <input
+        id={id}
+        value={value}
+        maxLength={1_000}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+        className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-200"
+      />
+      {helperText && (
+        <p className="mt-1 text-[11px] leading-4 text-slate-500">
+          {helperText}
+        </p>
       )}
     </div>
   );
@@ -134,7 +120,7 @@ export function ObjectScenarioTests({
   disabled,
   onChange,
 }: Props) {
-  function update(
+  function updateScenario(
     scenarioId: string,
     change: (scenario: EditableObjectScenario) => EditableObjectScenario,
   ) {
@@ -145,34 +131,29 @@ export function ObjectScenarioTests({
     );
   }
 
-  function addScenario() {
-    const objectClass = classes.length === 1 ? classes[0] : null;
-    const constructor =
-      objectClass?.constructors.length === 1
-        ? objectClass.constructors[0]
-        : null;
-    onChange([
-      ...scenarios,
-      {
-        id: `scenario-${crypto.randomUUID()}`,
-        name: `Scenario ${scenarios.length + 1}`,
-        class_id: objectClass?.id ?? "",
-        constructor_id: constructor?.id ?? "",
-        constructor_arguments: constructor?.parameters.map(() => "") ?? [],
-        steps: [],
-      },
-    ]);
-  }
-
   return (
     <div className="mt-3 space-y-3">
       {scenarios.map((scenario, scenarioIndex) => {
-        const objectClass = classes.find(
-          (candidate) => candidate.id === scenario.class_id,
-        );
-        const constructor = objectClass?.constructors.find(
-          (candidate) => candidate.id === scenario.constructor_id,
-        );
+        const availableObjects = [
+          ...scenario.objects,
+          ...scenario.steps.flatMap((step) =>
+            step.result_object_id && step.result_name
+              ? [
+                  {
+                    id: step.result_object_id,
+                    name: step.result_name,
+                    class_id:
+                      classes
+                        .flatMap((item) => item.operators)
+                        .find((item) => item.id === step.operator_id)
+                        ?.return_object_class_id ?? "",
+                    constructor_id: "",
+                    arguments: [],
+                  },
+                ]
+              : [],
+          ),
+        ];
         return (
           <fieldset
             key={scenario.id}
@@ -181,15 +162,12 @@ export function ObjectScenarioTests({
           >
             <legend className="sr-only">Scenario {scenarioIndex + 1}</legend>
             <div className="flex items-center gap-2">
-              <label htmlFor={`${scenario.id}-name`} className="sr-only">
-                Scenario name
-              </label>
               <input
-                id={`${scenario.id}-name`}
+                aria-label="Scenario name"
                 value={scenario.name}
                 maxLength={100}
                 onChange={(event) =>
-                  update(scenario.id, (current) => ({
+                  updateScenario(scenario.id, (current) => ({
                     ...current,
                     name: event.target.value,
                   }))
@@ -199,351 +177,576 @@ export function ObjectScenarioTests({
               <button
                 type="button"
                 onClick={() =>
-                  onChange(
-                    scenarios.filter((candidate) => candidate.id !== scenario.id),
-                  )
+                  onChange(scenarios.filter((item) => item.id !== scenario.id))
                 }
-                className="rounded-md px-2 py-1.5 text-xs text-slate-500 hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-2 focus-visible:outline-slate-900"
+                className="rounded px-2 py-1 text-xs text-slate-500 hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-2 focus-visible:outline-slate-900"
               >
                 Remove
               </button>
             </div>
-            <label
-              htmlFor={`${scenario.id}-class`}
-              className="mt-3 block text-xs font-medium text-slate-600"
-            >
-              Class
-            </label>
-            <select
-              id={`${scenario.id}-class`}
-              value={scenario.class_id}
-              onChange={(event) => {
-                const nextClass = classes.find(
-                  (candidate) => candidate.id === event.target.value,
+
+            <div className="mt-4 flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-slate-700">Objects</p>
+              <button
+                type="button"
+                disabled={scenario.objects.length >= 5}
+                onClick={() =>
+                  updateScenario(scenario.id, (current) => ({
+                    ...current,
+                    objects: [
+                      ...current.objects,
+                      newObject(classes, current.objects.length),
+                    ],
+                  }))
+                }
+                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700 focus-visible:outline-2 focus-visible:outline-slate-900 disabled:opacity-40"
+              >
+                Add object
+              </button>
+            </div>
+            <div className="mt-2 space-y-2">
+              {scenario.objects.map((object, objectIndex) => {
+                const objectClass = classes.find(
+                  (item) => item.id === object.class_id,
                 );
-                const nextConstructor =
-                  nextClass?.constructors.length === 1
-                    ? nextClass.constructors[0]
-                    : null;
-                update(scenario.id, (current) => ({
-                  ...current,
-                  class_id: nextClass?.id ?? "",
-                  constructor_id: nextConstructor?.id ?? "",
-                  constructor_arguments:
-                    nextConstructor?.parameters.map(() => "") ?? [],
-                  steps: [],
-                }));
-              }}
-              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-200"
-            >
-              <option value="">Choose a class</option>
-              {classes.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.name}
-                </option>
-              ))}
-            </select>
-            {objectClass && (
-              <>
-                <label
-                  htmlFor={`${scenario.id}-constructor`}
-                  className="mt-3 block text-xs font-medium text-slate-600"
-                >
-                  Constructor
-                </label>
-                <select
-                  id={`${scenario.id}-constructor`}
-                  value={scenario.constructor_id}
-                  onChange={(event) => {
-                    const nextConstructor = objectClass.constructors.find(
-                      (candidate) => candidate.id === event.target.value,
-                    );
-                    update(scenario.id, (current) => ({
-                      ...current,
-                      constructor_id: nextConstructor?.id ?? "",
-                      constructor_arguments:
-                        nextConstructor?.parameters.map(() => "") ?? [],
-                    }));
-                  }}
-                  className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                >
-                  <option value="">Choose a constructor</option>
-                  {objectClass.constructors.map((candidate) => (
-                    <option key={candidate.id} value={candidate.id}>
-                      {candidate.display}
-                    </option>
-                  ))}
-                </select>
-              </>
-            )}
-            {constructor && (
-              <>
-                <p className="mt-3 text-xs font-medium text-slate-600">
-                  Constructor arguments
-                </p>
-                <div className="mt-1.5 space-y-2">
-                  {constructor.parameters.map((parameter, index) => (
-                    <ValueField
-                      key={`${scenario.id}-constructor-${index}`}
-                      id={`${scenario.id}-constructor-${index}`}
-                      parameter={parameter}
-                      value={scenario.constructor_arguments[index] ?? ""}
-                      onChange={(value) =>
-                        update(scenario.id, (current) => ({
-                          ...current,
-                          constructor_arguments:
-                            current.constructor_arguments.map(
-                              (argument, argumentIndex) =>
-                                argumentIndex === index ? value : argument,
-                            ),
-                        }))
-                      }
-                    />
-                  ))}
-                  {constructor.parameters.length === 0 && (
-                    <p className="text-xs text-slate-500">
-                      This constructor takes no arguments.
-                    </p>
-                  )}
-                </div>
-                <div className="mt-4 flex items-center justify-between gap-2">
-                  <p className="text-xs font-medium text-slate-700">
-                    Scenario steps
-                  </p>
-                  <button
-                    type="button"
-                    disabled={scenario.steps.length >= 20}
-                    onClick={() => {
-                      const method =
-                        objectClass!.methods.length === 1
-                          ? objectClass!.methods[0]
-                          : null;
-                      update(scenario.id, (current) => ({
-                        ...current,
-                        steps: [
-                          ...current.steps,
-                          {
-                            id: `step-${crypto.randomUUID()}`,
-                            method_id: method?.id ?? "",
-                            arguments: method?.parameters.map(() => "") ?? [],
-                            expected_return: "",
-                            check_stdout: false,
-                            expected_stdout: "",
-                          },
-                        ],
-                      }));
-                    }}
-                    className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-slate-900 disabled:opacity-50"
+                const constructor = objectClass?.constructors.find(
+                  (item) => item.id === object.constructor_id,
+                );
+                const replaceObject = (
+                  change: (item: EditableScenarioObject) => EditableScenarioObject,
+                ) =>
+                  updateScenario(scenario.id, (current) => ({
+                    ...current,
+                    objects: current.objects.map((item) =>
+                      item.id === object.id ? change(item) : item,
+                    ),
+                    steps: current.steps.filter(
+                      (step) =>
+                        step.target_object_id !== object.id &&
+                        !step.operands.includes(object.id),
+                    ),
+                  }));
+                return (
+                  <div
+                    key={object.id}
+                    className="rounded-md border border-slate-200 p-2.5"
                   >
-                    Add method call
-                  </button>
-                </div>
-                <div className="mt-2 space-y-2">
-                  {scenario.steps.map((step, stepIndex) => {
-                    const method = objectClass!.methods.find(
-                      (candidate) => candidate.id === step.method_id,
-                    );
-                    const replaceStep = (
-                      change: (current: EditableObjectStep) => EditableObjectStep,
-                    ) =>
-                      update(scenario.id, (current) => ({
-                        ...current,
-                        steps: current.steps.map((candidate) =>
-                          candidate.id === step.id
-                            ? change(candidate)
-                            : candidate,
-                        ),
-                      }));
-                    return (
-                      <div
-                        key={step.id}
-                        className="rounded-md border border-slate-200 p-2.5"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-xs font-semibold text-slate-700">
-                            Step {stepIndex + 1}
-                          </p>
-                          <div className="flex gap-1">
-                            {(["up", "down"] as const).map((direction) => {
-                              const disabledMove =
-                                direction === "up"
-                                  ? stepIndex === 0
-                                  : stepIndex === scenario.steps.length - 1;
-                              return (
-                                <button
-                                  key={direction}
-                                  type="button"
-                                  disabled={disabledMove}
-                                  title={`Move step ${direction}`}
-                                  aria-label={`Move step ${stepIndex + 1} ${direction}`}
-                                  onClick={() =>
-                                    update(scenario.id, (current) => {
-                                      const steps = [...current.steps];
-                                      const otherIndex =
-                                        direction === "up"
-                                          ? stepIndex - 1
-                                          : stepIndex + 1;
-                                      [steps[stepIndex], steps[otherIndex]] = [
-                                        steps[otherIndex],
-                                        steps[stepIndex],
-                                      ];
-                                      return { ...current, steps };
-                                    })
-                                  }
-                                  className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-slate-900 disabled:opacity-30"
-                                >
-                                  {direction === "up" ? "↑" : "↓"}
-                                </button>
-                              );
-                            })}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                update(scenario.id, (current) => ({
-                                  ...current,
-                                  steps: current.steps.filter(
-                                    (candidate) => candidate.id !== step.id,
-                                  ),
-                                }))
-                              }
-                              className="rounded px-1.5 py-1 text-[11px] text-slate-500 hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-2 focus-visible:outline-slate-900"
-                            >
-                              Remove
-                            </button>
-                          </div>
-                        </div>
-                        <label
-                          htmlFor={`${step.id}-method`}
-                          className="mt-2 block text-[11px] font-medium text-slate-600"
-                        >
-                          Method
-                        </label>
-                        <select
-                          id={`${step.id}-method`}
-                          value={step.method_id}
-                          onChange={(event) => {
-                            const nextMethod = objectClass!.methods.find(
-                              (candidate) => candidate.id === event.target.value,
-                            );
-                            replaceStep((current) => ({
+                    <div className="flex items-center gap-2">
+                      <input
+                        aria-label={`Object ${objectIndex + 1} name`}
+                        value={object.name}
+                        maxLength={100}
+                        onChange={(event) =>
+                          replaceObject((current) => ({
+                            ...current,
+                            name: event.target.value,
+                          }))
+                        }
+                        className="min-w-0 flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-slate-200"
+                      />
+                      {scenario.objects.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateScenario(scenario.id, (current) => ({
                               ...current,
-                              method_id: nextMethod?.id ?? "",
-                              arguments:
-                                nextMethod?.parameters.map(() => "") ?? [],
-                              expected_return: "",
-                              check_stdout: false,
-                              expected_stdout: "",
+                              objects: current.objects.filter(
+                                (item) => item.id !== object.id,
+                              ),
+                              steps: current.steps.filter(
+                                (step) =>
+                                  step.target_object_id !== object.id &&
+                                  !step.operands.includes(object.id),
+                              ),
+                            }))
+                          }
+                          className="text-[11px] text-slate-500 hover:text-rose-700"
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                    <div className="mt-2 grid gap-2">
+                      <select
+                        aria-label={`${object.name} class`}
+                        value={object.class_id}
+                        onChange={(event) => {
+                          const nextClass = classes.find(
+                            (item) => item.id === event.target.value,
+                          );
+                          const nextConstructor =
+                            nextClass?.constructors.length === 1
+                              ? nextClass.constructors[0]
+                              : null;
+                          replaceObject((current) => ({
+                            ...current,
+                            class_id: nextClass?.id ?? "",
+                            constructor_id: nextConstructor?.id ?? "",
+                            arguments:
+                              nextConstructor?.parameters.map(() => "") ?? [],
+                          }));
+                        }}
+                        className="w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-slate-200"
+                      >
+                        <option value="">Choose a class</option>
+                        {classes.map((item) => (
+                          <option key={item.id} value={item.id}>
+                            {item.name}
+                          </option>
+                        ))}
+                      </select>
+                      {objectClass && (
+                        <select
+                          aria-label={`${object.name} constructor`}
+                          value={object.constructor_id}
+                          onChange={(event) => {
+                            const next = objectClass.constructors.find(
+                              (item) => item.id === event.target.value,
+                            );
+                            replaceObject((current) => ({
+                              ...current,
+                              constructor_id: next?.id ?? "",
+                              arguments: next?.parameters.map(() => "") ?? [],
                             }));
                           }}
-                          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                          className="w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-slate-200"
                         >
-                          <option value="">Choose a method</option>
-                          {objectClass!.methods.map((candidate) => (
-                            <option key={candidate.id} value={candidate.id}>
-                              {candidate.display}
+                          <option value="">Choose a constructor</option>
+                          {objectClass.constructors.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.display}
                             </option>
                           ))}
                         </select>
-                        {method && (
-                          <>
-                            <div className="mt-3 space-y-2">
-                              {method.parameters.map((parameter, index) => (
-                                <ValueField
-                                  key={`${step.id}-argument-${index}`}
-                                  id={`${step.id}-argument-${index}`}
-                                  parameter={parameter}
-                                  value={step.arguments[index] ?? ""}
-                                  onChange={(value) =>
-                                    replaceStep((current) => ({
-                                      ...current,
-                                      arguments: current.arguments.map(
-                                        (argument, argumentIndex) =>
-                                          argumentIndex === index
-                                            ? value
-                                            : argument,
-                                      ),
-                                    }))
-                                  }
-                                />
-                              ))}
-                            </div>
-                            {method.return_type_metadata.kind !== "void" && (
-                              <ReturnField
-                                id={`${step.id}-expected-return`}
-                                method={method}
-                                value={step.expected_return}
-                                onChange={(value) =>
-                                  replaceStep((current) => ({
-                                    ...current,
-                                    expected_return: value,
-                                  }))
-                                }
-                              />
-                            )}
-                            <label className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-600">
-                              <input
-                                type="checkbox"
-                                checked={step.check_stdout}
-                                onChange={(event) =>
-                                  replaceStep((current) => ({
-                                    ...current,
-                                    check_stdout: event.target.checked,
-                                    expected_stdout: event.target.checked
-                                      ? current.expected_stdout
-                                      : "",
-                                  }))
-                                }
-                                className="size-3.5 rounded border-slate-300 text-slate-800 focus:ring-slate-300"
-                              />
-                              Check method output
-                            </label>
-                            {step.check_stdout && (
-                              <>
-                                <label
-                                  htmlFor={`${step.id}-expected-output`}
-                                  className="mt-2 block text-xs font-medium text-slate-600"
-                                >
-                                  Expected output
-                                </label>
-                                <textarea
-                                  id={`${step.id}-expected-output`}
-                                  rows={2}
-                                  maxLength={64 * 1024}
-                                  value={step.expected_stdout}
-                                  onChange={(event) =>
-                                    replaceStep((current) => ({
-                                      ...current,
-                                      expected_stdout: event.target.value,
-                                    }))
-                                  }
-                                  className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                />
-                              </>
-                            )}
-                          </>
-                        )}
+                      )}
+                      {constructor?.parameters.map((parameter, index) => (
+                        <ValueField
+                          key={`${object.id}-${index}`}
+                          id={`${object.id}-${index}`}
+                          label={parameter.name}
+                          type={parameter.type_metadata.display_type}
+                          value={object.arguments[index] ?? ""}
+                          onChange={(value) =>
+                            replaceObject((current) => ({
+                              ...current,
+                              arguments: current.arguments.map(
+                                (argument, argumentIndex) =>
+                                  argumentIndex === index ? value : argument,
+                              ),
+                            }))
+                          }
+                        />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-4 flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-slate-700">
+                Scenario steps
+              </p>
+              <button
+                type="button"
+                disabled={!scenario.objects.length || scenario.steps.length >= 20}
+                onClick={() =>
+                  updateScenario(scenario.id, (current) => ({
+                    ...current,
+                    steps: [
+                      ...current.steps,
+                      newStep(current.objects[0]?.id ?? ""),
+                    ],
+                  }))
+                }
+                className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700 focus-visible:outline-2 focus-visible:outline-slate-900 disabled:opacity-40"
+              >
+                Add step
+              </button>
+            </div>
+            <div className="mt-2 space-y-2">
+              {scenario.steps.map((step, stepIndex) => {
+                const priorObjects = availableObjects.filter((item) => {
+                  const creator = scenario.steps.findIndex(
+                    (candidate) => candidate.result_object_id === item.id,
+                  );
+                  return creator < 0 || creator < stepIndex;
+                });
+                const target = priorObjects.find(
+                  (item) => item.id === step.target_object_id,
+                );
+                const targetClass = classes.find(
+                  (item) => item.id === target?.class_id,
+                );
+                const operator = classes
+                  .flatMap((item) => item.operators)
+                  .find((item) => item.id === step.operator_id);
+                const method = targetClass?.methods.find(
+                  (item) => item.id === step.method_id,
+                );
+                const operatorParameters =
+                  operator?.parameters.filter(
+                    (item) => item.operand_kind !== "stream",
+                  ) ?? [];
+                const replaceStep = (
+                  change: (item: EditableObjectStep) => EditableObjectStep,
+                ) =>
+                  updateScenario(scenario.id, (current) => ({
+                    ...current,
+                    steps: current.steps.map((item) =>
+                      item.id === step.id ? change(item) : item,
+                    ),
+                  }));
+                return (
+                  <div
+                    key={step.id}
+                    className="rounded-md border border-slate-200 p-2.5"
+                  >
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs font-semibold">Step {stepIndex + 1}</p>
+                      <div className="flex gap-1">
+                        <button
+                          type="button"
+                          disabled={stepIndex === 0}
+                          aria-label={`Move step ${stepIndex + 1} up`}
+                          onClick={() =>
+                            updateScenario(scenario.id, (current) => {
+                              const steps = [...current.steps];
+                              [steps[stepIndex - 1], steps[stepIndex]] = [
+                                steps[stepIndex],
+                                steps[stepIndex - 1],
+                              ];
+                              return { ...current, steps };
+                            })
+                          }
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          disabled={stepIndex === scenario.steps.length - 1}
+                          aria-label={`Move step ${stepIndex + 1} down`}
+                          onClick={() =>
+                            updateScenario(scenario.id, (current) => {
+                              const steps = [...current.steps];
+                              [steps[stepIndex], steps[stepIndex + 1]] = [
+                                steps[stepIndex + 1],
+                                steps[stepIndex],
+                              ];
+                              return { ...current, steps };
+                            })
+                          }
+                        >
+                          ↓
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateScenario(scenario.id, (current) => ({
+                              ...current,
+                              steps: current.steps.filter(
+                                (item) =>
+                                  item.id !== step.id &&
+                                  item.target_object_id !==
+                                    step.result_object_id &&
+                                  !item.operands.includes(
+                                    step.result_object_id,
+                                  ),
+                              ),
+                            }))
+                          }
+                          className="text-[11px] text-slate-500 hover:text-rose-700"
+                        >
+                          Remove
+                        </button>
                       </div>
-                    );
-                  })}
-                  {scenario.steps.length === 0 && (
-                    <p className="text-xs leading-5 text-slate-500">
-                      Add at least one method call.
-                    </p>
-                  )}
-                </div>
-              </>
-            )}
+                    </div>
+                    <select
+                      aria-label={`Step ${stepIndex + 1} type`}
+                      value={step.step_type}
+                      onChange={(event) =>
+                        replaceStep((current) => ({
+                          ...newStep(current.target_object_id),
+                          id: current.id,
+                          step_type: event.target.value as
+                            | "method"
+                            | "observer"
+                            | "operator",
+                        }))
+                      }
+                      className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                    >
+                      <option value="method">Method call</option>
+                      <option value="observer">Observer method call</option>
+                      <option value="operator">Operator call</option>
+                    </select>
+                    <select
+                      aria-label={`Step ${stepIndex + 1} target object`}
+                      value={step.target_object_id}
+                      onChange={(event) =>
+                        replaceStep((current) => ({
+                          ...newStep(event.target.value),
+                          id: current.id,
+                          step_type: current.step_type,
+                        }))
+                      }
+                      className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                    >
+                      <option value="">Choose an object</option>
+                      {priorObjects.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </select>
+                    {step.step_type !== "operator" ? (
+                      <>
+                        <select
+                          aria-label={`Step ${stepIndex + 1} method`}
+                          value={step.method_id}
+                          onChange={(event) => {
+                            const next = targetClass?.methods.find(
+                              (item) => item.id === event.target.value,
+                            );
+                            replaceStep((current) => ({
+                              ...current,
+                              method_id: next?.id ?? "",
+                              arguments: next?.parameters.map(() => "") ?? [],
+                              expected_return: "",
+                            }));
+                          }}
+                          className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                        >
+                          <option value="">Choose a method</option>
+                          {targetClass?.methods.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.display}
+                            </option>
+                          ))}
+                        </select>
+                        {method?.parameters.map((parameter, index) => (
+                          <ValueField
+                            key={`${step.id}-argument-${index}`}
+                            id={`${step.id}-argument-${index}`}
+                            label={parameter.name}
+                            type={parameter.type_metadata.display_type}
+                            value={step.arguments[index] ?? ""}
+                            onChange={(value) =>
+                              replaceStep((current) => ({
+                                ...current,
+                                arguments: current.arguments.map(
+                                  (item, itemIndex) =>
+                                    itemIndex === index ? value : item,
+                                ),
+                              }))
+                            }
+                          />
+                        ))}
+                      </>
+                    ) : (
+                      <>
+                        <select
+                          aria-label={`Step ${stepIndex + 1} operator`}
+                          value={step.operator_id}
+                          onChange={(event) => {
+                            const next = classes
+                              .flatMap((item) => item.operators)
+                              .find((item) => item.id === event.target.value);
+                            replaceStep((current) => ({
+                              ...current,
+                              operator_id: next?.id ?? "",
+                              operands:
+                                next?.parameters
+                                  .filter(
+                                    (item) => item.operand_kind !== "stream",
+                                  )
+                                  .map(() => "") ?? [],
+                              expected_return: "",
+                              check_stdout: next?.symbol === "<<",
+                              expected_stdout: "",
+                              result_object_id:
+                                next?.return_kind === "object_value"
+                                  ? `result-${crypto.randomUUID()}`
+                                  : "",
+                              result_name: "",
+                            }));
+                          }}
+                          className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                        >
+                          <option value="">Choose an operator</option>
+                          {classes
+                            .flatMap((item) => item.operators)
+                            .filter(
+                              (item, index, all) =>
+                                all.findIndex(
+                                  (candidate) => candidate.id === item.id,
+                                ) === index &&
+                                (item.kind === "standalone" ||
+                                  item.declaring_class_id === target?.class_id),
+                            )
+                            .map((item) => (
+                              <option key={item.id} value={item.id}>
+                                {item.display}
+                              </option>
+                            ))}
+                        </select>
+                        {operatorParameters.map((parameter, index) => (
+                          <OperandField
+                            key={`${step.id}-operand-${index}`}
+                            id={`${step.id}-operand-${index}`}
+                            parameter={parameter}
+                            value={step.operands[index] ?? ""}
+                            objects={priorObjects}
+                            onChange={(value) =>
+                              replaceStep((current) => ({
+                                ...current,
+                                operands: current.operands.map(
+                                  (item, itemIndex) =>
+                                    itemIndex === index ? value : item,
+                                ),
+                              }))
+                            }
+                          />
+                        ))}
+                        {operator?.return_kind === "object_value" && (
+                          <ValueField
+                            id={`${step.id}-result-name`}
+                            label="Returned object name"
+                            type={operator.return_type}
+                            value={step.result_name}
+                            placeholder="e.g. result"
+                            helperText="Use this name to reference the returned object in later steps."
+                            onChange={(value) =>
+                              replaceStep((current) => ({
+                                ...current,
+                                result_name: value,
+                              }))
+                            }
+                          />
+                        )}
+                      </>
+                    )}
+                    {((method &&
+                      method.return_type_metadata.kind !== "void") ||
+                      operator?.return_kind === "value") && (
+                      <ValueField
+                        id={`${step.id}-expected-return`}
+                        label="Expected value"
+                        type={
+                          method?.return_type_metadata.display_type ??
+                          operator?.return_type ??
+                          ""
+                        }
+                        value={step.expected_return}
+                        onChange={(value) =>
+                          replaceStep((current) => ({
+                            ...current,
+                            expected_return: value,
+                          }))
+                        }
+                      />
+                    )}
+                    <label className="mt-2 flex items-center gap-2 text-xs text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={step.check_stdout}
+                        disabled={operator?.symbol === "<<"}
+                        onChange={(event) =>
+                          replaceStep((current) => ({
+                            ...current,
+                            check_stdout: event.target.checked,
+                            expected_stdout: event.target.checked
+                              ? current.expected_stdout
+                              : "",
+                          }))
+                        }
+                      />
+                      Check method output
+                    </label>
+                    {step.check_stdout && (
+                      <textarea
+                        aria-label="Expected output"
+                        value={step.expected_stdout}
+                        rows={2}
+                        onChange={(event) =>
+                          replaceStep((current) => ({
+                            ...current,
+                            expected_stdout: event.target.value,
+                          }))
+                        }
+                        className="mt-1 w-full rounded-md border border-slate-300 p-2 font-mono text-xs"
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </fieldset>
         );
       })}
       <button
         type="button"
         disabled={disabled || scenarios.length >= 10}
-        onClick={addScenario}
-        className="w-full rounded-md border border-dashed border-slate-300 px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-slate-900 disabled:opacity-50"
+        onClick={() =>
+          onChange([
+            ...scenarios,
+            {
+              id: `scenario-${crypto.randomUUID()}`,
+              name: `Scenario ${scenarios.length + 1}`,
+              objects: [newObject(classes, 0)],
+              steps: [],
+            },
+          ])
+        }
+        className="w-full rounded-md border border-dashed border-slate-300 px-3 py-2 text-xs font-semibold text-slate-600"
       >
         Add scenario
       </button>
     </div>
+  );
+}
+
+function OperandField({
+  id,
+  parameter,
+  value,
+  objects,
+  onChange,
+}: {
+  id: string;
+  parameter: ObjectOperatorParameter;
+  value: string;
+  objects: EditableScenarioObject[];
+  onChange: (value: string) => void;
+}) {
+  if (parameter.operand_kind === "object") {
+    return (
+      <label className="mt-2 block text-xs text-slate-700">
+        {parameter.name} <span className="text-slate-500">{parameter.type}</span>
+        <select
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+        >
+          <option value="">Choose an object</option>
+          {objects
+            .filter((item) => item.class_id === parameter.object_class_id)
+            .map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+        </select>
+      </label>
+    );
+  }
+  return (
+    <ValueField
+      id={id}
+      label={parameter.name}
+      type={parameter.type}
+      value={value}
+      onChange={onChange}
+    />
   );
 }

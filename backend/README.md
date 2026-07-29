@@ -210,9 +210,31 @@ later steps not executed. Object state is observed only through public method
 calls; the harness never accesses fields or rewrites the student's class.
 
 This first stage supports inline definitions and existing safe value and const
-reference types. It excludes inheritance, virtual dispatch, operators, static
-methods, implicit special members, expected exceptions, multiple interacting
-objects, and separate header/source definitions.
+reference types. It excludes inheritance, virtual dispatch, static methods,
+implicit special members, expected exceptions, arbitrary object interactions,
+and separate header/source definitions.
+
+### Operator-overload scenarios
+
+Object scenarios may construct up to five named objects and execute structured
+member or standalone operator calls. Supported operators are `+`, `-`, `*`,
+`/`, `+=`, `-=`, `*=`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `[]`, `()`, and
+stream output with `<<`. Operator identifiers include member/standalone kind,
+participating class, symbol, ordered parameter types, const qualification, and
+return type.
+
+Custom objects returned by value can be stored under a unique scenario-local
+identifier and used only by later steps. Their private state is never
+serialized; later public observer calls verify the result. Mutation operators
+continue using their target object. Scalar results use the existing type-aware
+comparison, and `operator<<` uses isolated per-step stdout comparison.
+
+The runner constructs initial objects once in listed order and stops the whole
+scenario after the first runtime failure, marking later steps not executed.
+Assignment, increment/decrement, conversion, pointer-return, custom-object
+reference-result storage, short-circuit, comma, allocation, and spaceship
+operators remain unsupported. `<=>` is intentionally deferred because it
+requires a dedicated comparison-category result model.
 
 ## Tests
 

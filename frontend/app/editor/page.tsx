@@ -75,9 +75,15 @@ const INITIAL_TEST_CASE: EditableTestCase = {
 const INITIAL_OBJECT_SCENARIO: EditableObjectScenario = {
   id: "scenario-1",
   name: "Scenario 1",
-  class_id: "",
-  constructor_id: "",
-  constructor_arguments: [],
+  objects: [
+    {
+      id: "object-1",
+      name: "object",
+      class_id: "",
+      constructor_id: "",
+      arguments: [],
+    },
+  ],
   steps: [],
 };
 
@@ -378,39 +384,37 @@ export default function EditorPage() {
           }
           setObjectScenarios((current) =>
             current.map((scenario) => {
-              const objectClass =
-                analysis.classes.find(
-                  (candidate) => candidate.id === scenario.class_id,
-                ) ??
-                (analysis.classes.length === 1 ? analysis.classes[0] : null);
-              const constructor =
-                objectClass?.constructors.find(
-                  (candidate) => candidate.id === scenario.constructor_id,
-                ) ??
-                (objectClass?.constructors.length === 1
-                  ? objectClass.constructors[0]
-                  : null);
-              const sameConstructor =
-                constructor?.id === scenario.constructor_id;
               return {
                 ...scenario,
-                class_id: objectClass?.id ?? "",
-                constructor_id: constructor?.id ?? "",
-                constructor_arguments: constructor
-                  ? constructor.parameters.map((_, index) =>
-                      sameConstructor
-                        ? (scenario.constructor_arguments[index] ?? "")
-                        : "",
-                    )
-                  : [],
-                steps:
-                  objectClass?.id === scenario.class_id
-                    ? scenario.steps.filter((step) =>
-                        objectClass.methods.some(
-                          (method) => method.id === step.method_id,
-                        ),
-                      )
-                    : [],
+                objects: scenario.objects.map((object) => {
+                  const objectClass =
+                    analysis.classes.find(
+                      (candidate) => candidate.id === object.class_id,
+                    ) ??
+                    (analysis.classes.length === 1
+                      ? analysis.classes[0]
+                      : null);
+                  const constructor =
+                    objectClass?.constructors.find(
+                      (candidate) =>
+                        candidate.id === object.constructor_id,
+                    ) ??
+                    (objectClass?.constructors.length === 1
+                      ? objectClass.constructors[0]
+                      : null);
+                  const unchanged =
+                    constructor?.id === object.constructor_id;
+                  return {
+                    ...object,
+                    class_id: objectClass?.id ?? "",
+                    constructor_id: constructor?.id ?? "",
+                    arguments:
+                      constructor?.parameters.map((_, index) =>
+                        unchanged ? (object.arguments[index] ?? "") : "",
+                      ) ?? [],
+                  };
+                }),
+                steps: scenario.steps,
               };
             }),
           );
@@ -680,24 +684,52 @@ export default function EditorPage() {
                 code: currentCode,
                 language: "cpp" as const,
                 comparison_mode: comparisonMode,
-                tests: objectScenarios.map((scenario) => {
-                  const objectClass = testMode.classes.find(
-                    (candidate) => candidate.id === scenario.class_id,
-                  );
-                  return {
+                tests: objectScenarios.map((scenario) => ({
                     name: scenario.name,
-                    class_id: scenario.class_id,
-                    constructor_id: scenario.constructor_id,
-                    constructor_arguments: scenario.constructor_arguments,
+                    objects: scenario.objects.map((object) => ({
+                      object_id: object.id,
+                      name: object.name,
+                      class_id: object.class_id,
+                      constructor_id: object.constructor_id,
+                      arguments: object.arguments,
+                    })),
                     steps: scenario.steps.map((step) => {
-                      const method = objectClass?.methods.find(
-                        (candidate) => candidate.id === step.method_id,
+                      const operator = testMode.classes
+                        .flatMap((item) => item.operators)
+                        .find((item) => item.id === step.operator_id);
+                      const targetClass = testMode.classes.find(
+                        (item) =>
+                          item.id ===
+                          scenario.objects.find(
+                            (object) =>
+                              object.id === step.target_object_id,
+                          )?.class_id,
+                      );
+                      const method = targetClass?.methods.find(
+                        (item) => item.id === step.method_id,
                       );
                       return {
-                        method_id: step.method_id,
+                        step_type: step.step_type,
+                        target_object_id: step.target_object_id,
+                        ...(step.step_type !== "operator"
+                          ? { method_id: step.method_id }
+                          : {
+                              operator_id: step.operator_id,
+                              operands: step.operands,
+                              ...(operator?.return_kind === "object_value"
+                                ? {
+                                    result_object_id: step.result_object_id,
+                                    result_name: step.result_name,
+                                  }
+                                : {}),
+                        }),
                         arguments: step.arguments,
+                        operands: step.operands,
                         check_stdout: step.check_stdout,
-                        ...(method?.return_type_metadata.kind !== "void"
+                        ...((step.step_type !== "operator" &&
+                          method?.return_type_metadata.kind !== "void") ||
+                        (step.step_type === "operator" &&
+                          operator?.return_kind === "value")
                           ? { expected_return: step.expected_return }
                           : {}),
                         ...(step.check_stdout
@@ -705,8 +737,7 @@ export default function EditorPage() {
                           : {}),
                       };
                     }),
-                  };
-                }),
+                  })),
               }
             : {
               mode: "program" as const,
@@ -927,10 +958,18 @@ export default function EditorPage() {
     objectScenarios.length > 0 &&
     objectScenarios.every(
       (scenario) =>
-        scenario.class_id &&
-        scenario.constructor_id &&
+        scenario.objects.length > 0 &&
+        scenario.objects.every(
+          (object) => object.class_id && object.constructor_id && object.name,
+        ) &&
         scenario.steps.length > 0 &&
-        scenario.steps.every((step) => step.method_id),
+        scenario.steps.every(
+          (step) =>
+            step.target_object_id &&
+            (step.step_type !== "operator"
+              ? step.method_id
+              : step.operator_id),
+        ),
     );
   const isCleanCompileSuccess =
     compileResult?.success === true &&
@@ -1933,12 +1972,14 @@ export default function EditorPage() {
                                     ? "Constructed"
                                     : "Construction failed"}
                                 </p>
-                                <p className="mt-1 break-words font-mono text-xs text-slate-800">
-                                  {result.constructor}
-                                  {result.constructor_arguments.length > 0
-                                    ? ` with ${result.constructor_arguments.join(", ")}`
-                                    : ""}
-                                </p>
+                                {result.constructed_objects.map((item) => (
+                                  <p
+                                    key={item}
+                                    className="mt-1 break-words font-mono text-xs text-slate-800"
+                                  >
+                                    {item}
+                                  </p>
+                                ))}
                               </div>
                               {result.steps.map((step) => (
                                 <div
@@ -1951,7 +1992,10 @@ export default function EditorPage() {
                                         Step {step.index + 1}
                                       </p>
                                       <p className="mt-0.5 break-words font-mono text-xs text-slate-800">
-                                        {step.method}
+                                        {step.expression || step.method}
+                                        {step.result_object_name
+                                          ? ` → ${step.result_object_name}`
+                                          : ""}
                                       </p>
                                     </div>
                                     <span

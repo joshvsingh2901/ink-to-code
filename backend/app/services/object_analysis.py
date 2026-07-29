@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from app.services.function_analysis import (
@@ -30,12 +30,39 @@ class ObjectMethod:
 
 
 @dataclass(frozen=True)
+class OperatorParameter:
+    name: str
+    display_type: str
+    value_type: ValueType | None = None
+    object_class_id: str | None = None
+    is_stream: bool = False
+
+
+@dataclass(frozen=True)
+class ObjectOperator:
+    id: str
+    symbol: str
+    display: str
+    kind: Literal["member", "standalone"]
+    declaring_class_id: str | None
+    parameters: tuple[OperatorParameter, ...]
+    return_display_type: str
+    return_value_type: ValueType | None
+    return_object_class_id: str | None
+    return_kind: Literal[
+        "value", "object_value", "mutation_reference", "stream_reference"
+    ]
+    is_const: bool
+
+
+@dataclass(frozen=True)
 class ObjectClass:
     id: str
     name: str
     kind: Literal["class", "struct"]
     constructors: tuple[ObjectConstructor, ...]
     methods: tuple[ObjectMethod, ...]
+    operators: tuple[ObjectOperator, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,6 +79,129 @@ _ACCESS_LABEL = re.compile(r"(public|private|protected)\s*:")
 _METHOD_PREFIX = re.compile(
     r"(?P<return_type>.+?)\s+(?P<name>[A-Za-z_]\w*)$"
 )
+_OPERATOR_PREFIX = re.compile(
+    r"(?P<return_type>.+?)\s+operator\s*"
+    r"(?P<symbol><=>|<<|\+=|-=|\*=|==|!=|<=|>=|\+|-|\*|/|<|>|\[\]|\(\))$"
+)
+_SUPPORTED_OPERATORS = {
+    "+", "-", "*", "/", "+=", "-=", "*=", "==", "!=", "<", "<=", ">",
+    ">=", "[]", "()", "<<",
+}
+
+
+def _operator_parameter(
+    source: str,
+    class_names: set[str],
+    *,
+    unqualified_types_allowed: bool,
+) -> OperatorParameter | None:
+    normalized = " ".join(source.strip().split())
+    match = re.fullmatch(
+        r"(?P<type>.+?)(?P<name>[A-Za-z_]\w*)", normalized
+    )
+    if match is None:
+        return None
+    raw_type = match.group("type").strip()
+    name = match.group("name")
+    compact = re.sub(r"\s+", "", raw_type)
+    if compact in {"std::ostream&", "ostream&"}:
+        return OperatorParameter(
+            name=name,
+            display_type=raw_type,
+            is_stream=True,
+        )
+    base = compact.replace("const", "").replace("&", "")
+    if "*" not in compact and base in class_names:
+        return OperatorParameter(
+            name=name,
+            display_type=raw_type,
+            object_class_id=base,
+        )
+    parsed, _ = _parse_parameters(
+        f"{raw_type} {name}",
+        unqualified_vector_allowed=unqualified_types_allowed,
+    )
+    if parsed is None or len(parsed) != 1:
+        return None
+    return OperatorParameter(
+        name=name,
+        display_type=raw_type,
+        value_type=parsed[0].value_type,
+    )
+
+
+def _operator_return(
+    source: str,
+    class_names: set[str],
+    *,
+    unqualified_types_allowed: bool,
+) -> tuple[
+    str,
+    ValueType | None,
+    str | None,
+    Literal[
+        "value", "object_value", "mutation_reference", "stream_reference"
+    ],
+] | None:
+    raw = " ".join(source.strip().split())
+    compact = re.sub(r"\s+", "", raw)
+    if compact in {"std::ostream&", "ostream&"}:
+        return raw, None, None, "stream_reference"
+    base = compact.replace("const", "").replace("&", "")
+    if "*" in compact:
+        return None
+    if base in class_names:
+        return (
+            raw,
+            None,
+            base,
+            "mutation_reference" if "&" in compact else "object_value",
+        )
+    value_type, _ = _parse_value_type(
+        raw,
+        allow_reference=True,
+        unqualified_vector_allowed=unqualified_types_allowed,
+    )
+    if value_type is None:
+        return None
+    return raw, value_type, None, "value"
+
+
+def _operator_shape_supported(
+    symbol: str,
+    kind: Literal["member", "standalone"],
+    parameters: tuple[OperatorParameter, ...],
+    return_kind: str,
+) -> bool:
+    if symbol in {"+=", "-=", "*="}:
+        return (
+            kind == "member"
+            and len(parameters) == 1
+            and return_kind == "mutation_reference"
+        )
+    if return_kind == "mutation_reference":
+        return False
+    if symbol == "<<":
+        return (
+            kind == "standalone"
+            and len(parameters) == 2
+            and parameters[0].is_stream
+            and parameters[1].object_class_id is not None
+            and return_kind == "stream_reference"
+        )
+    if return_kind == "stream_reference":
+        return False
+    if symbol == "[]":
+        return (
+            kind == "member"
+            and len(parameters) == 1
+            and parameters[0].value_type is not None
+            and parameters[0].value_type.scalar_type
+            in {"int", "long", "long long"}
+        )
+    if symbol == "()":
+        return kind == "member"
+    return len(parameters) == (1 if kind == "member" else 2)
 def _matching_delimiter(
     source: str,
     start: int,
@@ -73,6 +223,32 @@ def _canonical_parameters(parameters: tuple[FunctionParameter, ...]) -> str:
     return ",".join(
         parameter.value_type.canonical_type for parameter in parameters
     )
+
+
+def _split_parameters(source: str) -> list[str]:
+    if not source.strip():
+        return []
+    parts: list[str] = []
+    start = 0
+    angle = square = parenthesis = 0
+    for index, character in enumerate(source):
+        if character == "<":
+            angle += 1
+        elif character == ">":
+            angle = max(0, angle - 1)
+        elif character == "[":
+            square += 1
+        elif character == "]":
+            square = max(0, square - 1)
+        elif character == "(":
+            parenthesis += 1
+        elif character == ")":
+            parenthesis = max(0, parenthesis - 1)
+        elif character == "," and not (angle or square or parenthesis):
+            parts.append(source[start:index].strip())
+            start = index + 1
+    parts.append(source[start:].strip())
+    return parts
 
 
 def _find_definition_brace(
@@ -120,9 +296,11 @@ def _analyze_class_members(
     body: str,
     *,
     unqualified_types_allowed: bool,
+    class_names: set[str],
 ) -> tuple[
     tuple[ObjectConstructor, ...],
     tuple[ObjectMethod, ...],
+    tuple[ObjectOperator, ...],
 ]:
     depths = _brace_depths(body)
     labels = [
@@ -133,6 +311,7 @@ def _analyze_class_members(
     default_access = "public" if kind == "struct" else "private"
     constructors: list[ObjectConstructor] = []
     methods: list[ObjectMethod] = []
+    operators: list[ObjectOperator] = []
     segment_start = 0
     position = 0
 
@@ -156,6 +335,9 @@ def _analyze_class_members(
         close_parenthesis = _matching_delimiter(body, position, "(", ")")
         if close_parenthesis is None:
             break
+        if body[segment_start:position].rstrip().endswith("operator"):
+            position = close_parenthesis + 1
+            continue
         definition = _find_definition_brace(body, close_parenthesis)
         if definition is None:
             position = close_parenthesis + 1
@@ -168,10 +350,77 @@ def _analyze_class_members(
         position = body_end + 1
         segment_start = position
 
+        is_friend = prefix.startswith("friend ")
+        operator_prefix = prefix.removeprefix("friend ").strip()
+        operator_match = _OPERATOR_PREFIX.fullmatch(operator_prefix)
+        if operator_match is not None:
+            symbol = operator_match.group("symbol")
+            if symbol not in _SUPPORTED_OPERATORS:
+                continue
+            if not is_friend and access != "public":
+                continue
+            raw_parameters = _split_parameters(parameters_source)
+            operator_parameters = tuple(
+                parameter
+                for raw_parameter in raw_parameters
+                if (
+                    parameter := _operator_parameter(
+                        raw_parameter,
+                        class_names,
+                        unqualified_types_allowed=unqualified_types_allowed,
+                    )
+                )
+                is not None
+            )
+            if len(operator_parameters) != len(raw_parameters):
+                continue
+            returned = _operator_return(
+                operator_match.group("return_type"),
+                class_names,
+                unqualified_types_allowed=unqualified_types_allowed,
+            )
+            if returned is None:
+                continue
+            return_display, return_value, return_object, return_kind = returned
+            kind: Literal["member", "standalone"] = (
+                "standalone" if is_friend else "member"
+            )
+            if not _operator_shape_supported(
+                symbol, kind, operator_parameters, return_kind
+            ):
+                continue
+            is_const = bool(re.search(r"\bconst\b", suffix)) and not is_friend
+            canonical_parameters = ",".join(
+                parameter.display_type.replace(" ", "")
+                for parameter in operator_parameters
+            )
+            const_suffix = " const" if is_const else ""
+            operator_id = (
+                f"{kind}:{class_name}::operator{symbol}"
+                f"({canonical_parameters}){const_suffix}->{return_display.replace(' ', '')}"
+            )
+            operators.append(
+                ObjectOperator(
+                    id=operator_id,
+                    symbol=symbol,
+                    display=(
+                        f"operator{symbol}({canonical_parameters})"
+                        f"{const_suffix} -> {return_display}"
+                    ),
+                    kind=kind,
+                    declaring_class_id=None if is_friend else class_name,
+                    parameters=operator_parameters,
+                    return_display_type=return_display,
+                    return_value_type=return_value,
+                    return_object_class_id=return_object,
+                    return_kind=return_kind,
+                    is_const=is_const,
+                )
+            )
+            continue
         if (
             access != "public"
             or "static" in prefix.split()
-            or "operator" in prefix
             or prefix.startswith("~")
             or "virtual" in prefix.split()
         ):
@@ -251,7 +500,134 @@ def _analyze_class_members(
         )
         not in ambiguous_const_overloads
     ]
-    return tuple(constructors), tuple(methods)
+    ambiguous_operator_const_overloads = {
+        (
+            operator.symbol,
+            tuple(parameter.display_type for parameter in operator.parameters),
+        )
+        for operator in operators
+        if operator.kind == "member"
+        and any(
+            candidate.kind == "member"
+            and candidate.symbol == operator.symbol
+            and tuple(
+                parameter.display_type for parameter in candidate.parameters
+            )
+            == tuple(
+                parameter.display_type for parameter in operator.parameters
+            )
+            and candidate.is_const != operator.is_const
+            for candidate in operators
+        )
+    }
+    operators = [
+        operator
+        for operator in operators
+        if (
+            operator.symbol,
+            tuple(parameter.display_type for parameter in operator.parameters),
+        )
+        not in ambiguous_operator_const_overloads
+    ]
+    return tuple(constructors), tuple(methods), tuple(operators)
+
+
+def _analyze_standalone_operators(
+    source: str,
+    class_names: set[str],
+    *,
+    unqualified_types_allowed: bool,
+) -> tuple[ObjectOperator, ...]:
+    depths = _brace_depths(source)
+    operators: list[ObjectOperator] = []
+    segment_start = 0
+    position = 0
+    while position < len(source):
+        if depths[position] != 0:
+            position += 1
+            continue
+        if source[position] in ";}":
+            segment_start = position + 1
+            position += 1
+            continue
+        if source[position] != "(":
+            position += 1
+            continue
+        close_parenthesis = _matching_delimiter(source, position, "(", ")")
+        if close_parenthesis is None:
+            break
+        definition = _find_definition_brace(source, close_parenthesis)
+        if definition is None:
+            position = close_parenthesis + 1
+            continue
+        _, body_end = definition
+        prefix = " ".join(source[segment_start:position].split())
+        operator_match = _OPERATOR_PREFIX.fullmatch(prefix)
+        parameters_source = source[position + 1:close_parenthesis]
+        position = body_end + 1
+        segment_start = position
+        if operator_match is None:
+            continue
+        symbol = operator_match.group("symbol")
+        raw_parameters = _split_parameters(parameters_source)
+        parameters = tuple(
+            parameter
+            for raw_parameter in raw_parameters
+            if (
+                parameter := _operator_parameter(
+                    raw_parameter,
+                    class_names,
+                    unqualified_types_allowed=unqualified_types_allowed,
+                )
+            )
+            is not None
+        )
+        if len(parameters) != len(raw_parameters):
+            continue
+        returned = _operator_return(
+            operator_match.group("return_type"),
+            class_names,
+            unqualified_types_allowed=unqualified_types_allowed,
+        )
+        if returned is None:
+            continue
+        participating = next(
+            (
+                parameter.object_class_id
+                for parameter in parameters
+                if parameter.object_class_id is not None
+            ),
+            None,
+        )
+        if participating is None:
+            continue
+        return_display, return_value, return_object, return_kind = returned
+        if not _operator_shape_supported(
+            symbol, "standalone", parameters, return_kind
+        ):
+            continue
+        canonical = ",".join(
+            parameter.display_type.replace(" ", "") for parameter in parameters
+        )
+        operators.append(
+            ObjectOperator(
+                id=(
+                    f"standalone:{participating}::operator{symbol}"
+                    f"({canonical})->{return_display.replace(' ', '')}"
+                ),
+                symbol=symbol,
+                display=f"operator{symbol}({canonical}) -> {return_display}",
+                kind="standalone",
+                declaring_class_id=None,
+                parameters=parameters,
+                return_display_type=return_display,
+                return_value_type=return_value,
+                return_object_class_id=return_object,
+                return_kind=return_kind,
+                is_const=False,
+            )
+        )
+    return tuple(operators)
 
 
 def analyze_object_scenarios(source: str) -> ObjectAnalysis:
@@ -260,6 +636,11 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
     unqualified_types_allowed = bool(
         re.search(r"\busing\s+namespace\s+std\s*;", masked)
     )
+    class_names = {
+        match.group("name")
+        for match in _CLASS_START.finditer(masked)
+        if depths[match.start()] == 0
+    }
     classes: list[ObjectClass] = []
     rejected_inheritance = False
 
@@ -274,13 +655,14 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
             continue
         kind = match.group("kind")
         name = match.group("name")
-        constructors, methods = _analyze_class_members(
+        constructors, methods, operators = _analyze_class_members(
             name,
             kind,
             masked[match.end():body_end],
             unqualified_types_allowed=unqualified_types_allowed,
+            class_names=class_names,
         )
-        if constructors and methods:
+        if constructors:
             classes.append(
                 ObjectClass(
                     id=name,
@@ -288,10 +670,37 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
                     kind=kind,
                     constructors=constructors,
                     methods=methods,
+                    operators=operators,
                 )
             )
 
     message = None
+    standalone = _analyze_standalone_operators(
+        masked,
+        class_names,
+        unqualified_types_allowed=unqualified_types_allowed,
+    )
+    if standalone:
+        classes = [
+            replace(
+                object_class,
+                operators=object_class.operators
+                + tuple(
+                    operator
+                    for operator in standalone
+                    if any(
+                        parameter.object_class_id == object_class.id
+                        for parameter in operator.parameters
+                    )
+                ),
+            )
+            for object_class in classes
+        ]
+    classes = [
+        object_class
+        for object_class in classes
+        if object_class.methods or object_class.operators
+    ]
     if not classes:
         message = (
             "Inheritance is unsupported in object scenarios."

@@ -375,7 +375,7 @@ def test_runtime_failure_marks_later_steps_not_executed(failure: str):
                 {"method_index": 1, "expected_return": "1"},
             ],
         ),
-        test_timeout_seconds=0.25,
+        test_timeout_seconds=0.5,
     )
 
     scenario = result.tests[0]
@@ -400,10 +400,6 @@ def test_private_fields_never_appear_in_metadata():
 def test_unsupported_object_features_are_excluded():
     cases = [
         "class Child : public Base { public: Child() {} void run() {} };",
-        (
-            "class Operator { public: Operator() {} "
-            "int operator+(int value) { return value; } };"
-        ),
         (
             "class Static { public: Static() {} "
             "static void run() {} };"

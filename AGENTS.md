@@ -471,9 +471,19 @@ The expected request should contain the current source code in structured JSON, 
 ## Object scenario testing
 
 - Function-mode testing may also test public class and struct behavior through object scenarios.
-- A scenario creates one object using a selected public constructor, then performs ordered public method calls.
+- A scenario creates one or more named objects using selected public constructors, then performs ordered public method or supported operator calls.
 - Object state must be observed only through public methods, return values, or stdout.
 - Private fields must never be accessed or exposed by the generated harness.
 - Constructors and methods must be identified by full signatures, not names alone.
 - The original Monaco source must remain unchanged.
-- Big Five automation, inheritance, operator testing, memory diagnostics, and multiple interacting objects remain separate future stages.
+- Big Five automation, inheritance, memory diagnostics, and arbitrary multi-object interactions remain separate future stages.
+
+## Operator-overload scenario testing
+
+- Object scenarios may test supported overloaded operators on user-defined classes and structs.
+- Operators must be identified by full signature and declaring type.
+- Scenarios may construct multiple named objects and store object-valued operator results.
+- Object state and operator results must be observed only through public methods, supported scalar returns, comparisons, or captured stdout.
+- Private and protected fields must never be accessed.
+- The original Monaco source must remain unchanged.
+- Automatic Big Five testing, inheritance, implicit conversions, memory diagnostics, and arbitrary expression evaluation remain separate stages.

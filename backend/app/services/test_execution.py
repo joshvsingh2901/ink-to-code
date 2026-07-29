@@ -132,6 +132,7 @@ def _function_response(signature: FunctionSignature) -> FunctionResponse:
             display_type=value_type.display_type,
             scalar_type=value_type.scalar_type,
             element_type=value_type.element_type,
+            vector_depth=value_type.vector_depth,
             passing=value_type.passing,
             size_parameter_name=value_type.size_parameter_name,
         )
@@ -395,6 +396,24 @@ def _vector_literal(
     element_type = value_type.element_type
     if element_type is None:
         raise ValueError(f"{label} uses an unsupported vector type.")
+    if value_type.vector_depth == 2:
+        rows = _typed_nested_vector_values(value_type, raw_value, label)
+        row_literals = [
+            "{" + ", ".join(
+                _literal_from_typed_value(
+                    element_type,
+                    element,
+                    f"{label} row {row_index + 1} "
+                    f"element {element_index + 1}",
+                )
+                for element_index, element in enumerate(row)
+            ) + "}"
+            for row_index, row in enumerate(rows)
+        ]
+        return (
+            f"std::vector<std::vector<{element_type}>>"
+            f"{{{', '.join(row_literals)}}}"
+        )
     elements = (
         _parse_string_vector(raw_value, label)
         if element_type == STRING_TYPE
@@ -405,6 +424,71 @@ def _vector_literal(
         for index, element in enumerate(elements)
     ]
     return f"std::vector<{element_type}>{{{', '.join(literals)}}}"
+
+
+def _literal_from_typed_value(
+    element_type: str,
+    value: int | float | bool | str,
+    label: str,
+) -> str:
+    if element_type == STRING_TYPE:
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be a string.")
+        raw_value = value
+    elif element_type == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{label} must be true or false.")
+        raw_value = "true" if value else "false"
+    elif element_type == "double":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label} must be a finite decimal double value.")
+        raw_value = repr(value)
+    else:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"{label} must be a signed decimal {element_type} value."
+            )
+        raw_value = str(value)
+    return _safe_literal(element_type, raw_value, label)
+
+
+def _typed_nested_vector_values(
+    value_type: ValueType,
+    raw_value: str,
+    label: str,
+) -> list[list[int | float | bool | str]]:
+    element_type = value_type.element_type
+    if element_type is None:
+        raise ValueError(f"{label} uses an unsupported nested-vector type.")
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"{label} must be a nested list such as [[1, 2], [3, 4]]."
+        ) from error
+    if not isinstance(parsed, list):
+        raise ValueError(f"{label} must be an outer list of row lists.")
+
+    rows: list[list[int | float | bool | str]] = []
+    for row_index, row in enumerate(parsed):
+        if not isinstance(row, list):
+            raise ValueError(
+                f"{label} row {row_index + 1} must be a list."
+            )
+        validated_row: list[int | float | bool | str] = []
+        for element_index, value in enumerate(row):
+            element_label = (
+                f"{label} row {row_index + 1} "
+                f"element {element_index + 1}"
+            )
+            _literal_from_typed_value(
+                element_type,
+                value,
+                element_label,
+            )
+            validated_row.append(value)
+        rows.append(validated_row)
+    return rows
 
 
 def _safe_value_literal(
@@ -434,6 +518,8 @@ def _prepare_argument(
         if value_type.kind == "vector":
             literal = _vector_literal(value_type, raw_value, label)
             storage_type = f"std::vector<{value_type.element_type}>"
+            if value_type.vector_depth == 2:
+                storage_type = f"std::vector<{storage_type}>"
         else:
             if value_type.scalar_type is None:
                 raise ValueError(f"{label} uses an unsupported mutable type.")
@@ -488,10 +574,15 @@ def _typed_vector_values(
     value_type: ValueType,
     raw_value: str,
     label: str,
-) -> list[int | float | bool | str]:
+) -> (
+    list[int | float | bool | str]
+    | list[list[int | float | bool | str]]
+):
     element_type = value_type.element_type
     if element_type is None:
         raise ValueError(f"{label} uses an unsupported vector type.")
+    if value_type.vector_depth == 2:
+        return _typed_nested_vector_values(value_type, raw_value, label)
     values: list[int | float | bool | str] = []
     elements = (
         _parse_string_vector(raw_value, label)
@@ -598,6 +689,50 @@ def _collection_output(
     )
 
 
+def _nested_collection_output(
+    expression: str,
+    element_type: str,
+) -> str:
+    value_expression = (
+        f"{expression}[inktocode_row_index][inktocode_element_index]"
+    )
+    if element_type == STRING_TYPE:
+        value_output = (
+            f"inktocode_write_quoted_string({value_expression});"
+        )
+    elif element_type == "bool":
+        value_output = (
+            f"std::cout << std::boolalpha << {value_expression};"
+        )
+    elif element_type == "double":
+        value_output = (
+            "std::cout << std::setprecision"
+            f"({DOUBLE_OUTPUT_PRECISION}) << {value_expression};"
+        )
+    else:
+        value_output = f"std::cout << {value_expression};"
+    return " ".join(
+        [
+            'std::cout << "[";',
+            "for (std::size_t inktocode_row_index = 0;",
+            f"inktocode_row_index < {expression}.size();",
+            "++inktocode_row_index) {",
+            'if (inktocode_row_index != 0) std::cout << ", ";',
+            'std::cout << "[";',
+            "for (std::size_t inktocode_element_index = 0;",
+            "inktocode_element_index < "
+            f"{expression}[inktocode_row_index].size();",
+            "++inktocode_element_index) {",
+            'if (inktocode_element_index != 0) std::cout << ", ";',
+            value_output,
+            "}",
+            'std::cout << "]";',
+            "}",
+            'std::cout << "]";',
+        ]
+    )
+
+
 def _string_serializer_source() -> str:
     return "\n".join(
         [
@@ -679,10 +814,20 @@ def _build_function_harness(
                             f"Mutable array {parameter.name} has no size."
                         )
                     length_expression = arguments[size_index].expression
-                serialized_value = _collection_output(
-                    mutable_expression,
-                    element_type,
-                    length_expression,
+                serialized_value = (
+                    _nested_collection_output(
+                        mutable_expression,
+                        element_type,
+                    )
+                    if (
+                        parameter.value_type.kind == "vector"
+                        and parameter.value_type.vector_depth == 2
+                    )
+                    else _collection_output(
+                        mutable_expression,
+                        element_type,
+                        length_expression,
+                    )
                 )
             elif parameter.value_type.scalar_type == STRING_TYPE:
                 serialized_value = (
@@ -720,10 +865,17 @@ def _build_function_harness(
                 element_type = function.return_value_type.element_type
                 if element_type is None:
                     raise ValueError("Return vector has no element type.")
-                serialized_return = _collection_output(
-                    "inktocode_return_value",
-                    element_type,
-                    "inktocode_return_value.size()",
+                serialized_return = (
+                    _nested_collection_output(
+                        "inktocode_return_value",
+                        element_type,
+                    )
+                    if function.return_value_type.vector_depth == 2
+                    else _collection_output(
+                        "inktocode_return_value",
+                        element_type,
+                        "inktocode_return_value.size()",
+                    )
                 )
             elif function.return_value_type.scalar_type == STRING_TYPE:
                 serialized_return = (
@@ -869,6 +1021,50 @@ def _typed_match(value_type: ValueType, expected: str, actual: str) -> str:
     return "exact" if expected == actual else "mismatch"
 
 
+def _typed_mismatch_detail(
+    value_type: ValueType,
+    expected: str,
+    actual: str,
+) -> str | None:
+    if value_type.kind != "vector" or value_type.vector_depth != 2:
+        return None
+    try:
+        expected_rows = _typed_nested_vector_values(
+            value_type,
+            expected,
+            "Expected value",
+        )
+        actual_rows = _typed_nested_vector_values(
+            value_type,
+            actual,
+            "Actual value",
+        )
+    except ValueError:
+        return "The nested-vector result could not be compared structurally."
+    if len(expected_rows) != len(actual_rows):
+        return (
+            f"Expected {len(expected_rows)} row(s), "
+            f"actual {len(actual_rows)}."
+        )
+    for row_index, (expected_row, actual_row) in enumerate(
+        zip(expected_rows, actual_rows, strict=True)
+    ):
+        if len(expected_row) != len(actual_row):
+            return (
+                f"Row {row_index + 1}: expected length "
+                f"{len(expected_row)}, actual length {len(actual_row)}."
+            )
+        for element_index, (expected_value, actual_value) in enumerate(
+            zip(expected_row, actual_row, strict=True)
+        ):
+            if expected_value != actual_value:
+                return (
+                    f"First mismatch at row {row_index + 1}, "
+                    f"element {element_index + 1}."
+                )
+    return None
+
+
 def _function_results(
     executable: Path,
     working_directory: Path,
@@ -927,6 +1123,7 @@ def _function_results(
         mutation_channel_results: list[
             FunctionMutationChannelResult
         ] = []
+        mutation_mismatch_details: dict[str, str] = {}
         for parameter in mutable_parameters:
             raw_value = (
                 raw_mutations.get(parameter.name)
@@ -942,6 +1139,17 @@ def _function_results(
                 )
                 != "mismatch"
             )
+            mutation_detail = (
+                None
+                if mutation_passed
+                else _typed_mismatch_detail(
+                    parameter.value_type,
+                    expected_values[parameter.name],
+                    actual_value,
+                )
+            )
+            if mutation_detail is not None:
+                mutation_mismatch_details[parameter.name] = mutation_detail
             parameter_index = next(
                 parameter_index
                 for parameter_index, candidate in enumerate(
@@ -957,6 +1165,7 @@ def _function_results(
                     expected_final=expected_values[parameter.name],
                     actual_final=actual_value,
                     passed=mutation_passed,
+                    mismatch_detail=mutation_detail,
                 )
             )
 
@@ -976,6 +1185,15 @@ def _function_results(
                 actual=actual_return,
                 passed=return_match != "mismatch",
                 match_type=return_match,
+                mismatch_detail=(
+                    None
+                    if return_match != "mismatch"
+                    else _typed_mismatch_detail(
+                        function.return_value_type,
+                        test.expected_return,
+                        actual_return,
+                    )
+                ),
             )
 
         check_stdout = (
@@ -1064,6 +1282,7 @@ def _function_results(
                     },
                     expected_final_arguments=expected_values,
                     actual_final_arguments=actual_values,
+                    mismatch_details=mutation_mismatch_details,
                     stderr=stderr,
                     exit_code=output.exit_code,
                     timed_out=output.timed_out,
@@ -1120,6 +1339,11 @@ def _function_results(
                 arguments=test.arguments,
                 expected_return=expected_return,
                 actual_return=actual_return,
+                mismatch_detail=(
+                    return_channel.mismatch_detail
+                    if return_channel is not None
+                    else None
+                ),
                 stderr=stderr,
                 exit_code=output.exit_code,
                 timed_out=output.timed_out,

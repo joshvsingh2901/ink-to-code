@@ -356,7 +356,8 @@ The expected request should contain the current source code in structured JSON, 
 - Function-mode tests may support selected `std::vector` parameter and return types.
 - Vector test values must be entered as data, never as arbitrary C++ expressions.
 - The backend must validate and safely convert vector elements into generated C++ literals.
-- The initial vector implementation supports one-dimensional vectors only.
+- Vector testing supports one-dimensional vectors and explicitly supported
+  two-dimensional nested vectors only.
 - Supported element types are `int`, `long`, `long long`, `double`, and `bool`.
 - Vector parameters may be passed by value, const reference, or supported
   non-const reference mutation.
@@ -366,7 +367,8 @@ The expected request should contain the current source code in structured JSON, 
 
 ## String function testing
 
-- Function-mode tests may support `std::string` and `std::vector<std::string>`.
+- Function-mode tests may support `std::string`, `std::vector<std::string>`,
+  and `std::vector<std::vector<std::string>>`.
 - String arguments are data, never arbitrary C++ expressions.
 - Strings must support spaces and escaped quotes safely.
 - Vector-of-string inputs must use a clear quoted format such as `["hello", "world"]`.
@@ -412,7 +414,8 @@ The expected request should contain the current source code in structured JSON, 
 ## Vector and array mutation testing
 
 - Function-mode tests may inspect mutations to supported non-const vector references and C-style array parameters.
-- Supported mutable vectors are one-dimensional vectors of existing supported element types.
+- Supported mutable vectors include one-dimensional vectors and supported
+  two-dimensional nested vectors of existing element types.
 - Supported mutable arrays are one-dimensional numeric C-style arrays with an explicit size parameter.
 - Tests provide initial values and expected final values.
 - The generated harness must serialize mutated arguments after the function call.
@@ -453,3 +456,14 @@ The expected request should contain the current source code in structured JSON, 
 - The harness must allocate safe local storage and pass its address to the function.
 - Null-pointer testing, pointer ownership, returned pointers, pointer arithmetic, and pointer-to-pointer parameters remain unsupported.
 - Ambiguous pointers must be rejected rather than guessed.
+
+## Nested vector testing
+
+- Function-mode tests may support two-dimensional nested vectors.
+- Supported forms are `std::vector<std::vector<T>>` and mutable references to them.
+- Supported inner element types match the existing scalar/vector types.
+- Inputs may be rectangular or jagged.
+- Empty outer vectors and empty inner rows are valid.
+- Mutable nested vectors require an initial value and expected final value.
+- Nested vectors must be parsed and compared structurally.
+- Deeper nesting, vectors of custom types, raw 2D arrays, and pointer-to-pointer matrices remain unsupported.

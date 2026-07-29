@@ -67,16 +67,26 @@ expressions are never accepted. A temporary harness calls the unchanged user
 target. Bool returns print as `true` or `false`, and doubles use 17 significant
 digits without fuzzy comparison.
 
-Function tests also support one-dimensional `std::vector<T>` parameters and
-returns where `T` is `int`, `long`, `long long`, `double`, or `bool`. Parameters
-may be passed by value or by const reference; vector returns must be by value.
+Function tests support one-dimensional `std::vector<T>` and two-dimensional
+`std::vector<std::vector<T>>` parameters and returns where `T` is `int`,
+`long`, `long long`, `double`, `bool`, or `std::string`. Parameters may be
+passed by value, const reference, or supported mutable reference; vector
+returns must be by value.
 Unqualified `vector<T>` is accepted only when the source contains
 `using namespace std;`. Inputs may use `[1, 2, 3]`, `1, 2, 3`, or `1 2 3`;
 `[]` represents an empty vector. Elements are validated as data and converted
 to safe literals before harness generation. Results use canonical
 `[1, 2, 3]` serialization and exact typed sequence comparison with no fuzzy
-numeric tolerance. Nested vectors, unsupported element types, vector pointers,
-and unsupported reference types are not supported.
+numeric tolerance.
+
+Nested vectors use strict JSON-style outer and row lists such as
+`[[1, 2], [3, 4]]`. Rectangular, jagged, empty outer, and empty-row shapes are
+preserved. Every row and innermost value is validated before safe C++ literals
+are generated. Results serialize canonically without flattening and compare
+outer length, each row length, row order, element order, and exact typed values.
+Structural mismatches report the first useful row or element location when
+available. Nesting deeper than two levels, unsupported/custom elements, vector
+pointers, and unsupported reference types remain unsupported.
 
 Function tests support one-dimensional numeric C-style array parameters written
 as `T values[]` or `T* values`, where `T` is `int`, `long`, `long long`,
@@ -110,16 +120,17 @@ pointer-to-pointer parameters, custom pointees, and pointer returns are
 rejected. This deterministic signature classification does not attempt
 general pointer ownership or memory-safety analysis.
 
-Function mode supports `std::string` and one-dimensional
-`std::vector<std::string>` parameters by value or const reference, with returns
-by value. A scalar string field is the complete string value and does not
-require C++ quotation marks. String vectors require JSON-style quoted-list
-syntax such as `["hello", "hello world"]`; `[]` is empty. Quotes, backslashes,
-newlines, tabs, carriage returns, and control bytes are escaped before safe C++
-literals are generated. Scalar strings compare exact contents.
+Function mode supports `std::string`, `std::vector<std::string>`, and
+`std::vector<std::vector<std::string>>`. A scalar string field is the complete
+string value and does not require C++ quotation marks. String vectors require
+JSON-style quoted-list syntax such as `["hello", "hello world"]`; nested
+strings use row lists such as `[["one", "two"], ["three"]]`. Quotes,
+backslashes, newlines, tabs, carriage returns, and control bytes are escaped
+before safe C++ literals are generated. Scalar strings compare exact contents.
 `vector<string>` results serialize canonically as `["hello", "world"]` and
-compare exact element contents, order, and length. Character pointers, character
-arrays, string pointers, and nested vectors remain unsupported.
+compare exact element contents, order, and length. Character pointers,
+character arrays, string pointers, and deeper vector nesting remain
+unsupported.
 
 Function mode supports one or more mutable outputs on supported targets. These
 may combine scalar references (`int&`, `long&`, `long long&`, `double&`,

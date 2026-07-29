@@ -12,6 +12,7 @@ class ValueType:
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
+    vector_depth: Literal[1, 2] | None = None
     passing: Literal[
         "value",
         "const_reference",
@@ -39,6 +40,8 @@ class ValueType:
                 else base
             )
         base = f"std::vector<{self.element_type}>"
+        if self.vector_depth == 2:
+            base = f"std::vector<{base}>"
         if self.passing == "mutable_reference":
             return f"{base}&"
         return (
@@ -95,7 +98,7 @@ class FunctionAnalysis:
 
 _FUNCTION_DEFINITION = re.compile(
     r"(?P<return_type>"
-    r"(?:const\s+)?(?:std::)?vector\s*<[^<>]+>\s*(?:const\s*)?[&*]?"
+    r"(?:const\s+)?(?:std::)?vector\s*<[^{}();]+>\s*(?:const\s*)?[&*]?"
     r"|(?:const\s+)?(?:std::)?string\s*(?:const\s*)?[&*]?"
     r"|(?:const\s+)?(?:long\s+long|long|int|double|bool)\s*"
     r"(?:const\s*)?&&?"
@@ -135,8 +138,11 @@ _SIZE_PARAMETER_NAMES = {"size", "count", "length", "n", "len"}
 _INTEGRAL_TYPES = {"int", "long", "long long"}
 _VECTOR_TYPE = re.compile(
     r"(?P<prefix_const>const\s+)?"
-    r"(?P<qualified>std::)?vector\s*<\s*(?P<element>[^<>]+)\s*>\s*"
+    r"(?P<qualified>std::)?vector\s*<\s*(?P<element>.+)\s*>\s*"
     r"(?P<suffix_const>const\s*)?(?P<modifier>[&*])?"
+)
+_VECTOR_ELEMENT_TYPE = re.compile(
+    r"(?P<qualified>std::)?vector\s*<\s*(?P<element>.+)\s*>"
 )
 _STRING_TYPE = re.compile(
     r"(?P<prefix_const>const\s+)?"
@@ -363,6 +369,26 @@ def _parse_value_type(
             "Unqualified vector types require `using namespace std;`.",
         )
     raw_element_type = " ".join(vector_match.group("element").split())
+    nested_match = _VECTOR_ELEMENT_TYPE.fullmatch(raw_element_type)
+    vector_depth: Literal[1, 2] = 1
+    if nested_match is not None:
+        if (
+            nested_match.group("qualified") is None
+            and not unqualified_vector_allowed
+        ):
+            return (
+                None,
+                "Unqualified vector types require `using namespace std;`.",
+            )
+        vector_depth = 2
+        raw_element_type = " ".join(
+            nested_match.group("element").split()
+        )
+        if "vector" in raw_element_type:
+            return (
+                None,
+                "Vector nesting deeper than two levels is unsupported.",
+            )
     if raw_element_type in SUPPORTED_SCALAR_TYPES:
         element_type = raw_element_type
     elif raw_element_type in {"string", STRING_TYPE}:
@@ -405,6 +431,8 @@ def _parse_value_type(
         passing = "value"
 
     base = f"std::vector<{element_type}>"
+    if vector_depth == 2:
+        base = f"std::vector<{base}>"
     display_type = (
         f"const {base}&"
         if passing == "const_reference"
@@ -417,6 +445,7 @@ def _parse_value_type(
             kind="vector",
             display_type=display_type,
             element_type=element_type,
+            vector_depth=vector_depth,
             passing=passing,
         ),
         None,

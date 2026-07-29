@@ -412,9 +412,10 @@ def test_mode_endpoint_returns_function_metadata():
             "return_type_metadata": {
                 "kind": "scalar",
                 "display_type": "int",
-                "scalar_type": "int",
-                "element_type": None,
-                "passing": "value",
+                    "scalar_type": "int",
+                    "element_type": None,
+                    "vector_depth": None,
+                    "passing": "value",
                 "size_parameter_name": None,
             },
             "parameters": [
@@ -426,6 +427,7 @@ def test_mode_endpoint_returns_function_metadata():
                         "display_type": "int",
                         "scalar_type": "int",
                         "element_type": None,
+                        "vector_depth": None,
                         "passing": "value",
                         "size_parameter_name": None,
                     },
@@ -438,6 +440,7 @@ def test_mode_endpoint_returns_function_metadata():
                         "display_type": "int",
                         "scalar_type": "int",
                         "element_type": None,
+                        "vector_depth": None,
                         "passing": "value",
                         "size_parameter_name": None,
                     },
@@ -749,10 +752,6 @@ def test_invalid_expected_vector_is_rejected_before_compilation(monkeypatch):
 @pytest.mark.parametrize(
     ("source", "message"),
     [
-        (
-            "int size(std::vector<std::vector<int>> values) { return 0; }",
-            "Unsupported vector",
-        ),
         (
             "int size(std::vector<int>* values) { return 0; }",
             "Vector pointer",
@@ -2986,3 +2985,317 @@ def test_numeric_pointer_with_size_remains_array_backed():
     assert value_type.kind == "array"
     assert value_type.passing == "array_pointer"
     assert value_type.size_parameter_name == "size"
+
+
+def test_nested_vector_metadata_distinguishes_two_dimensions():
+    analysis = analyze_test_mode(
+        "#include <vector>\n"
+        "std::vector<std::vector<int>> transform("
+        "const std::vector<std::vector<int>>& grid) { return grid; }"
+    )
+
+    assert analysis.mode == "function"
+    function = analysis.functions[0]
+    assert function.return_value_type.vector_depth == 2
+    assert function.return_value_type.element_type == "int"
+    assert function.return_value_type.display_type == (
+        "std::vector<std::vector<int>>"
+    )
+    parameter = function.parameters[0].value_type
+    assert parameter.vector_depth == 2
+    assert parameter.passing == "const_reference"
+    assert function.id == (
+        "transform(const std::vector<std::vector<int>>&)"
+        "->std::vector<std::vector<int>>"
+    )
+
+
+def test_unqualified_nested_vectors_require_namespace_use():
+    supported = analyze_test_mode(
+        "#include <vector>\nusing namespace std;\n"
+        "int count(vector<vector<int>> values) { return values.size(); }"
+    )
+    unsupported = analyze_test_mode(
+        "#include <vector>\n"
+        "int count(vector<vector<int>> values) { return values.size(); }"
+    )
+
+    assert supported.mode == "function"
+    assert supported.functions[0].parameters[0].value_type.vector_depth == 2
+    assert unsupported.mode == "unsupported"
+    assert "using namespace std" in (unsupported.message or "")
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("source", "argument", "expected"),
+    [
+        (
+            "#include <vector>\n"
+            "int sum(std::vector<std::vector<int>> grid) "
+            "{ int result = 0; for (auto row : grid) "
+            "for (int value : row) result += value; return result; }",
+            "[[1, 2], [3, 4]]",
+            "10",
+        ),
+        (
+            "#include <vector>\n"
+            "int count(std::vector<std::vector<int>> grid) "
+            "{ int result = 0; for (auto row : grid) "
+            "result += row.size(); return result; }",
+            "[[1], [2, 3], []]",
+            "3",
+        ),
+        (
+            "#include <vector>\n"
+            "int count(std::vector<std::vector<int>> grid) "
+            "{ return grid.size(); }",
+            "[]",
+            "0",
+        ),
+        (
+            "#include <vector>\n"
+            "int count(std::vector<std::vector<int>> grid) "
+            "{ return grid[0].size() + grid[1].size(); }",
+            "[[], [1, 2]]",
+            "2",
+        ),
+    ],
+)
+def test_nested_vector_inputs_support_jagged_and_empty_shapes(
+    source: str,
+    argument: str,
+    expected: str,
+):
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[argument],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("source", "argument", "expected"),
+    [
+        (
+            "#include <vector>\n"
+            "std::vector<std::vector<int>> identity("
+            "std::vector<std::vector<int>> value) { return value; }",
+            "[[1, 2], [3]]",
+            "[[1, 2], [3]]",
+        ),
+        (
+            "#include <string>\n#include <vector>\n"
+            "std::vector<std::vector<std::string>> identity("
+            "std::vector<std::vector<std::string>> value) { return value; }",
+            '[["one", "two"], ["three"]]',
+            '[["one", "two"], ["three"]]',
+        ),
+        (
+            "#include <vector>\n"
+            "std::vector<std::vector<double>> identity("
+            "std::vector<std::vector<double>> value) { return value; }",
+            "[[1.5], [2, 3.25]]",
+            "[[1.5], [2, 3.25]]",
+        ),
+        (
+            "#include <vector>\n"
+            "std::vector<std::vector<bool>> identity("
+            "std::vector<std::vector<bool>> value) { return value; }",
+            "[[true, false], []]",
+            "[[true, false], []]",
+        ),
+    ],
+)
+def test_nested_vector_returns_are_structural(
+    source: str,
+    argument: str,
+    expected: str,
+):
+    result = run_test_request(
+        vector_request(
+            source,
+            arguments=[argument],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_return == expected
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_mutable_nested_vector_and_ordinary_scalar():
+    result = run_test_request(
+        combined_request(
+            "#include <vector>\n"
+            "void add(std::vector<std::vector<int>>& grid, int amount) "
+            "{ for (auto& row : grid) for (int& value : row) "
+            "value += amount; }",
+            arguments=["[[1, 2], [3]]", "2"],
+            expected_mutations=[("grid", "[[3, 4], [5]]")],
+        )
+    )
+
+    assert result.success is True
+    assert result.tests[0].actual_final_arguments == {
+        "grid": "[[3, 4], [5]]"
+    }
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_two_mutable_nested_vectors():
+    result = run_test_request(
+        combined_request(
+            "#include <utility>\n#include <vector>\n"
+            "void swapGrids(std::vector<std::vector<int>>& first, "
+            "std::vector<std::vector<int>>& second) "
+            "{ std::swap(first, second); }",
+            arguments=["[[1], [2]]", "[[3, 4]]"],
+            expected_mutations=[
+                ("first", "[[3, 4]]"),
+                ("second", "[[1], [2]]"),
+            ],
+        )
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_nested_mutation_combines_with_return_and_stdout():
+    result = run_test_request(
+        combined_request(
+            "#include <iostream>\n#include <vector>\n"
+            "int update(std::vector<std::vector<int>>& grid) "
+            "{ grid[0][0] += 1; std::cout << grid[0][0]; "
+            "return grid.size(); }",
+            arguments=["[[1, 2], [3]]"],
+            expected_return="2",
+            expected_stdout="2",
+            check_stdout=True,
+            expected_mutations=[("grid", "[[2, 2], [3]]")],
+        )
+    )
+
+    combined = result.tests[0]
+    assert result.success is True
+    assert combined.return_result.passed is True
+    assert combined.stdout_result.passed is True
+    assert combined.mutation_results[0].passed is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+@pytest.mark.parametrize(
+    ("expected", "detail"),
+    [
+        ("[[1], [2]]", "Expected 2 row(s), actual 1"),
+        ("[[1, 2, 3]]", "Row 1: expected length 3, actual length 2"),
+        ("[[1, 9]]", "row 1, element 2"),
+    ],
+)
+def test_nested_return_mismatch_has_structural_detail(
+    expected: str,
+    detail: str,
+):
+    result = run_test_request(
+        vector_request(
+            "#include <vector>\n"
+            "std::vector<std::vector<int>> value() { return {{1, 2}}; }",
+            arguments=[],
+            expected_return=expected,
+        )
+    )
+
+    assert result.success is False
+    assert result.tests[0].match_type == "mismatch"
+    assert detail in (result.tests[0].mismatch_detail or "")
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_nested_mutation_mismatch_has_structural_detail():
+    result = run_test_request(
+        combined_request(
+            "#include <vector>\n"
+            "void update(std::vector<std::vector<int>>& grid) "
+            "{ grid[0].push_back(3); }",
+            arguments=["[[1, 2]]"],
+            expected_mutations=[("grid", "[[1, 2]]")],
+        )
+    )
+
+    assert result.success is False
+    assert "Row 1: expected length 2, actual length 3" in (
+        result.tests[0].mismatch_details["grid"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("[1, 2]", "row 1 must be a list"),
+        ("[[1], 2]", "row 2 must be a list"),
+        ("[[1, true]]", "signed decimal int"),
+        ("[[1], [bad]]", "nested list"),
+        ("[[1], [2]", "nested list"),
+    ],
+)
+def test_malformed_nested_literals_are_rejected_before_compile(
+    value: str,
+    message: str,
+    monkeypatch,
+):
+    invoked = False
+
+    def unexpected_compile(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+
+    monkeypatch.setattr(test_execution, "_compile_executable", unexpected_compile)
+    result = run_test_request(
+        vector_request(
+            "#include <vector>\n"
+            "int count(std::vector<std::vector<int>> value) { return 0; }",
+            arguments=[value],
+            expected_return="0",
+        )
+    )
+
+    assert message in (result.input_error or "")
+    assert invoked is False
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "#include <vector>\n"
+            "int f(std::vector<std::vector<std::vector<int>>> value) "
+            "{ return 0; }",
+            "deeper than two",
+        ),
+        (
+            "#include <vector>\n"
+            "int f(std::vector<std::vector<Custom>> value) { return 0; }",
+            "Unsupported vector element type",
+        ),
+        (
+            "#include <vector>\n"
+            "int f(std::vector<std::vector<int*>> value) { return 0; }",
+            "Unsupported vector element type",
+        ),
+    ],
+)
+def test_unsupported_nested_vector_types_are_clear(
+    source: str,
+    message: str,
+):
+    analysis = analyze_test_mode(source)
+
+    assert analysis.mode == "unsupported"
+    assert message in (analysis.message or "")

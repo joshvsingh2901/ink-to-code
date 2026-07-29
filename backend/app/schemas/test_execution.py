@@ -8,6 +8,7 @@ class FunctionTypeResponse(BaseModel):
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
+    vector_depth: Literal[1, 2] | None = None
     passing: Literal[
         "value",
         "const_reference",
@@ -156,6 +157,7 @@ class FunctionTestResult(BaseModel):
     arguments: list[str]
     expected_return: str
     actual_return: str
+    mismatch_detail: str | None = None
     stderr: str
     exit_code: int | None
     timed_out: bool
@@ -187,6 +189,7 @@ class FunctionMutationTestResult(BaseModel):
     initial_arguments: dict[str, str]
     expected_final_arguments: dict[str, str]
     actual_final_arguments: dict[str, str]
+    mismatch_details: dict[str, str] = Field(default_factory=dict)
     stderr: str
     exit_code: int | None
     timed_out: bool
@@ -198,6 +201,7 @@ class FunctionChannelResult(BaseModel):
     expected: str
     actual: str
     passed: bool
+    mismatch_detail: str | None = None
     match_type: Literal[
         "exact",
         "whitespace_normalized",
@@ -212,6 +216,7 @@ class FunctionMutationChannelResult(BaseModel):
     expected_final: str
     actual_final: str
     passed: bool
+    mismatch_detail: str | None = None
 
 
 class FunctionCombinedTestResult(BaseModel):

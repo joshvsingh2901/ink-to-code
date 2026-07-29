@@ -9,6 +9,7 @@ export type FunctionTypeMetadata = {
   display_type: string;
   scalar_type: string | null;
   element_type: string | null;
+  vector_depth: 1 | 2 | null;
   passing:
     | "value"
     | "const_reference"
@@ -92,6 +93,7 @@ export type FunctionTestResult = ResultBase & {
   arguments: string[];
   expected_return: string;
   actual_return: string;
+  mismatch_detail: string | null;
 };
 
 export type FunctionOutputTestResult = ResultBase & {
@@ -104,6 +106,7 @@ export type FunctionMutationTestResult = ResultBase & {
   initial_arguments: Record<string, string>;
   expected_final_arguments: Record<string, string>;
   actual_final_arguments: Record<string, string>;
+  mismatch_details: Record<string, string>;
 };
 
 export type FunctionChannelResult = {
@@ -111,6 +114,7 @@ export type FunctionChannelResult = {
   actual: string;
   passed: boolean;
   match_type: ResultBase["match_type"];
+  mismatch_detail: string | null;
 };
 
 export type FunctionCombinedTestResult = ResultBase & {
@@ -123,6 +127,7 @@ export type FunctionCombinedTestResult = ResultBase & {
     expected_final: string;
     actual_final: string;
     passed: boolean;
+    mismatch_detail: string | null;
   }>;
 };
 
@@ -199,6 +204,9 @@ function isFunctionTypeMetadata(
       typeof metadata.scalar_type === "string") &&
     (metadata.element_type === null ||
       typeof metadata.element_type === "string") &&
+    (metadata.vector_depth === null ||
+      metadata.vector_depth === 1 ||
+      metadata.vector_depth === 2) &&
     [
       "value",
       "const_reference",
@@ -253,7 +261,9 @@ function isTestResult(
     Array.isArray(result.arguments) &&
     result.arguments.every((argument) => typeof argument === "string") &&
     typeof result.expected_return === "string" &&
-    typeof result.actual_return === "string";
+    typeof result.actual_return === "string" &&
+    (result.mismatch_detail === null ||
+      typeof result.mismatch_detail === "string");
   const functionOutputResult =
     Array.isArray(result.arguments) &&
     result.arguments.every((argument) => typeof argument === "string") &&
@@ -263,7 +273,8 @@ function isTestResult(
   const mutationResult =
     isStringRecord(mutation.initial_arguments) &&
     isStringRecord(mutation.expected_final_arguments) &&
-    isStringRecord(mutation.actual_final_arguments);
+    isStringRecord(mutation.actual_final_arguments) &&
+    isStringRecord(mutation.mismatch_details);
   const combined = value as Partial<FunctionCombinedTestResult>;
   const combinedResult =
     Array.isArray(combined.arguments) &&
@@ -280,7 +291,9 @@ function isTestResult(
         typeof item.initial === "string" &&
         typeof item.expected_final === "string" &&
         typeof item.actual_final === "string" &&
-        typeof item.passed === "boolean",
+        typeof item.passed === "boolean" &&
+        (item.mismatch_detail === null ||
+          typeof item.mismatch_detail === "string"),
     );
   return (
     programResult ||
@@ -300,6 +313,8 @@ function isFunctionChannelResult(
     typeof channel.expected === "string" &&
     typeof channel.actual === "string" &&
     typeof channel.passed === "boolean" &&
+    (channel.mismatch_detail === null ||
+      typeof channel.mismatch_detail === "string") &&
     isMatchType(channel.match_type)
   );
 }

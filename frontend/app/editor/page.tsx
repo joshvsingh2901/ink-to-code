@@ -1343,41 +1343,72 @@ export default function EditorPage() {
                                           Initial value
                                         </p>
                                       )}
-                                      <input
-                                        id={`${test.id}-argument-${parameterIndex}`}
-                                        value={
-                                          test.arguments[parameterIndex] ?? ""
-                                        }
-                                        maxLength={1_000}
-                                        placeholder={
-                                          parameter.type_metadata.kind ===
-                                            "vector" ||
-                                          parameter.type_metadata.kind ===
-                                            "array"
-                                            ? parameter.type_metadata
-                                                .element_type === "std::string"
-                                              ? '["hello", "world"]'
-                                              : "[1, 2, 3]"
-                                            : undefined
-                                        }
-                                        onChange={(event) =>
-                                          updateTestArgument(
-                                            test.id,
-                                            parameterIndex,
-                                            event.target.value,
-                                          )
-                                        }
-                                        className="w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                      />
+                                      {parameter.type_metadata.vector_depth ===
+                                      2 ? (
+                                        <textarea
+                                          id={`${test.id}-argument-${parameterIndex}`}
+                                          value={
+                                            test.arguments[parameterIndex] ?? ""
+                                          }
+                                          maxLength={1_000}
+                                          rows={4}
+                                          placeholder={
+                                            parameter.type_metadata
+                                              .element_type === "std::string"
+                                              ? '[["hello"], ["world"]]'
+                                              : "[[1, 2], [3, 4]]"
+                                          }
+                                          onChange={(event) =>
+                                            updateTestArgument(
+                                              test.id,
+                                              parameterIndex,
+                                              event.target.value,
+                                            )
+                                          }
+                                          className="w-full min-w-0 resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                        />
+                                      ) : (
+                                        <input
+                                          id={`${test.id}-argument-${parameterIndex}`}
+                                          value={
+                                            test.arguments[parameterIndex] ?? ""
+                                          }
+                                          maxLength={1_000}
+                                          placeholder={
+                                            parameter.type_metadata.kind ===
+                                              "vector" ||
+                                            parameter.type_metadata.kind ===
+                                              "array"
+                                              ? parameter.type_metadata
+                                                  .element_type ===
+                                                "std::string"
+                                                ? '["hello", "world"]'
+                                                : "[1, 2, 3]"
+                                              : undefined
+                                          }
+                                          onChange={(event) =>
+                                            updateTestArgument(
+                                              test.id,
+                                              parameterIndex,
+                                              event.target.value,
+                                            )
+                                          }
+                                          className="w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                        />
+                                      )}
                                       {(parameter.type_metadata.kind ===
                                         "vector" ||
                                         parameter.type_metadata.kind ===
                                           "array") && (
                                         <p className="mt-1 text-[11px] text-slate-500">
                                           {parameter.type_metadata
-                                            .element_type === "std::string"
-                                            ? 'Enter values like ["hello", "world"]'
-                                            : "Enter values like [1, 2, 3]"}
+                                            .vector_depth === 2
+                                            ? "Enter rows like [[1, 2], [3, 4]]"
+                                            : parameter.type_metadata
+                                                  .element_type ===
+                                                "std::string"
+                                              ? 'Enter values like ["hello", "world"]'
+                                              : "Enter values like [1, 2, 3]"}
                                           </p>
                                       )}
                                     </div>
@@ -1403,28 +1434,47 @@ export default function EditorPage() {
                                       .display_type
                                   }
                                 </label>
-                                <input
-                                  id={`${test.id}-expected-return`}
-                                  value={test.expected_return}
-                                  placeholder={
-                                    selectedFunction.return_type_metadata
-                                      .kind === "vector"
-                                      ? selectedFunction.return_type_metadata
-                                          .element_type === "std::string"
-                                        ? '["hello", "world"]'
-                                        : "[1, 2, 3]"
-                                      : undefined
-                                  }
-                                  maxLength={1_000}
-                                  onChange={(event) =>
-                                    updateTestCase(
-                                      test.id,
-                                      "expected_return",
-                                      event.target.value,
-                                    )
-                                  }
-                                  className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                />
+                                {selectedFunction.return_type_metadata
+                                  .vector_depth === 2 ? (
+                                  <textarea
+                                    id={`${test.id}-expected-return`}
+                                    value={test.expected_return}
+                                    placeholder="[[1, 2], [3, 4]]"
+                                    maxLength={1_000}
+                                    rows={4}
+                                    onChange={(event) =>
+                                      updateTestCase(
+                                        test.id,
+                                        "expected_return",
+                                        event.target.value,
+                                      )
+                                    }
+                                    className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                  />
+                                ) : (
+                                  <input
+                                    id={`${test.id}-expected-return`}
+                                    value={test.expected_return}
+                                    placeholder={
+                                      selectedFunction.return_type_metadata
+                                        .kind === "vector"
+                                        ? selectedFunction.return_type_metadata
+                                            .element_type === "std::string"
+                                          ? '["hello", "world"]'
+                                          : "[1, 2, 3]"
+                                        : undefined
+                                    }
+                                    maxLength={1_000}
+                                    onChange={(event) =>
+                                      updateTestCase(
+                                        test.id,
+                                        "expected_return",
+                                        event.target.value,
+                                      )
+                                    }
+                                    className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                  />
+                                )}
                                 {selectedFunction.return_type_metadata.kind ===
                                   "vector" && (
                                   <p className="mt-1 text-[11px] text-slate-500">
@@ -1503,23 +1553,46 @@ export default function EditorPage() {
                                             Expected final value
                                           </span>
                                         </label>
-                                        <input
-                                          id={`${test.id}-expected-final-${parameterIndex}`}
-                                          value={
-                                            test.expected_final_arguments[
-                                              parameter.name
-                                            ] ?? ""
-                                          }
-                                          maxLength={1_000}
-                                          onChange={(event) =>
-                                            updateExpectedFinalArgument(
-                                              test.id,
-                                              parameter.name,
-                                              event.target.value,
-                                            )
-                                          }
-                                          className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                        />
+                                        {parameter.type_metadata
+                                          .vector_depth === 2 ? (
+                                          <textarea
+                                            id={`${test.id}-expected-final-${parameterIndex}`}
+                                            value={
+                                              test.expected_final_arguments[
+                                                parameter.name
+                                              ] ?? ""
+                                            }
+                                            maxLength={1_000}
+                                            rows={4}
+                                            placeholder="[[1, 2], [3, 4]]"
+                                            onChange={(event) =>
+                                              updateExpectedFinalArgument(
+                                                test.id,
+                                                parameter.name,
+                                                event.target.value,
+                                              )
+                                            }
+                                            className="mt-1 w-full min-w-0 resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                          />
+                                        ) : (
+                                          <input
+                                            id={`${test.id}-expected-final-${parameterIndex}`}
+                                            value={
+                                              test.expected_final_arguments[
+                                                parameter.name
+                                              ] ?? ""
+                                            }
+                                            maxLength={1_000}
+                                            onChange={(event) =>
+                                              updateExpectedFinalArgument(
+                                                test.id,
+                                                parameter.name,
+                                                event.target.value,
+                                              )
+                                            }
+                                            className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                          />
+                                        )}
                                       </div>
                                     );
                                   })}
@@ -1701,6 +1774,11 @@ export default function EditorPage() {
                                       {result.return_result.actual || "(empty)"}
                                     </pre>
                                   </div>
+                                  {result.return_result.mismatch_detail && (
+                                    <p className="mt-1 text-[11px] text-rose-700">
+                                      {result.return_result.mismatch_detail}
+                                    </p>
+                                  )}
                                   {result.stdout_result?.match_type ===
                                     "whitespace_normalized" && (
                                     <p className="mt-1 text-[11px] text-slate-500">
@@ -1782,6 +1860,11 @@ export default function EditorPage() {
                                             Actual final:{" "}
                                             {mutation.actual_final}
                                           </dd>
+                                          {mutation.mismatch_detail && (
+                                            <dd className="mt-1 font-sans text-[11px] text-rose-700">
+                                              {mutation.mismatch_detail}
+                                            </dd>
+                                          )}
                                         </dl>
                                       ),
                                     )}
@@ -1822,6 +1905,15 @@ export default function EditorPage() {
                                         ] ?? "(empty)"}
                                       </dd>
                                     </div>
+                                    {result.mismatch_details[parameterName] && (
+                                      <div className="font-sans text-[11px] text-rose-700">
+                                        {
+                                          result.mismatch_details[
+                                            parameterName
+                                          ]
+                                        }
+                                      </div>
+                                    )}
                                   </dl>
                                 </div>
                               ))}
@@ -1878,6 +1970,12 @@ export default function EditorPage() {
                                   </pre>
                                 </div>
                               </div>
+                              {isFunctionReturnResult(result) &&
+                                result.mismatch_detail && (
+                                  <p className="text-[11px] text-rose-700">
+                                    {result.mismatch_detail}
+                                  </p>
+                                )}
                             </div>
                           )}
                           {result.timed_out ? (

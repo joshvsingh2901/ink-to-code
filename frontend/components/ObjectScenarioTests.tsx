@@ -15,7 +15,15 @@ export type EditableScenarioObject = {
 
 export type EditableObjectStep = {
   id: string;
-  step_type: "method" | "observer" | "operator";
+  step_type:
+    | "method"
+    | "observer"
+    | "operator"
+    | "copy_construct"
+    | "copy_assign"
+    | "self_assign"
+    | "move_construct"
+    | "move_assign";
   target_object_id: string;
   method_id: string;
   operator_id: string;
@@ -23,6 +31,8 @@ export type EditableObjectStep = {
   operands: string[];
   result_object_id: string;
   result_name: string;
+  special_member_id: string;
+  source_object_id: string;
   expected_return: string;
   check_stdout: boolean;
   expected_stdout: string;
@@ -66,6 +76,8 @@ function newStep(targetId: string): EditableObjectStep {
     operands: [],
     result_object_id: "",
     result_name: "",
+    special_member_id: "",
+    source_object_id: "",
     expected_return: "",
     check_stdout: false,
     expected_stdout: "",
@@ -134,26 +146,6 @@ export function ObjectScenarioTests({
   return (
     <div className="mt-3 space-y-3">
       {scenarios.map((scenario, scenarioIndex) => {
-        const availableObjects = [
-          ...scenario.objects,
-          ...scenario.steps.flatMap((step) =>
-            step.result_object_id && step.result_name
-              ? [
-                  {
-                    id: step.result_object_id,
-                    name: step.result_name,
-                    class_id:
-                      classes
-                        .flatMap((item) => item.operators)
-                        .find((item) => item.id === step.operator_id)
-                        ?.return_object_class_id ?? "",
-                    constructor_id: "",
-                    arguments: [],
-                  },
-                ]
-              : [],
-          ),
-        ];
         return (
           <fieldset
             key={scenario.id}
@@ -223,6 +215,7 @@ export function ObjectScenarioTests({
                     steps: current.steps.filter(
                       (step) =>
                         step.target_object_id !== object.id &&
+                        step.source_object_id !== object.id &&
                         !step.operands.includes(object.id),
                     ),
                   }));
@@ -256,6 +249,7 @@ export function ObjectScenarioTests({
                               steps: current.steps.filter(
                                 (step) =>
                                   step.target_object_id !== object.id &&
+                                  step.source_object_id !== object.id &&
                                   !step.operands.includes(object.id),
                               ),
                             }))
@@ -366,12 +360,41 @@ export function ObjectScenarioTests({
             </div>
             <div className="mt-2 space-y-2">
               {scenario.steps.map((step, stepIndex) => {
-                const priorObjects = availableObjects.filter((item) => {
-                  const creator = scenario.steps.findIndex(
-                    (candidate) => candidate.result_object_id === item.id,
+                const priorObjects = [...scenario.objects];
+                const movedFrom = new Set<string>();
+                for (const priorStep of scenario.steps.slice(0, stepIndex)) {
+                  const source = priorObjects.find(
+                    (item) => item.id === priorStep.source_object_id,
                   );
-                  return creator < 0 || creator < stepIndex;
-                });
+                  if (
+                    priorStep.result_object_id &&
+                    priorStep.result_name
+                  ) {
+                    const operatorClass = classes
+                      .flatMap((item) => item.operators)
+                      .find((item) => item.id === priorStep.operator_id)
+                      ?.return_object_class_id;
+                    priorObjects.push({
+                      id: priorStep.result_object_id,
+                      name: priorStep.result_name,
+                      class_id: operatorClass ?? source?.class_id ?? "",
+                      constructor_id: "",
+                      arguments: [],
+                    });
+                  }
+                  if (
+                    priorStep.step_type === "move_construct" ||
+                    priorStep.step_type === "move_assign"
+                  ) {
+                    movedFrom.add(priorStep.source_object_id);
+                  }
+                  if (
+                    priorStep.step_type === "copy_assign" ||
+                    priorStep.step_type === "move_assign"
+                  ) {
+                    movedFrom.delete(priorStep.target_object_id);
+                  }
+                }
                 const target = priorObjects.find(
                   (item) => item.id === step.target_object_id,
                 );
@@ -388,6 +411,9 @@ export function ObjectScenarioTests({
                   operator?.parameters.filter(
                     (item) => item.operand_kind !== "stream",
                   ) ?? [];
+                const specialMember = targetClass?.special_members.find(
+                  (item) => item.id === step.special_member_id,
+                );
                 const replaceStep = (
                   change: (item: EditableObjectStep) => EditableObjectStep,
                 ) =>
@@ -449,6 +475,8 @@ export function ObjectScenarioTests({
                                   item.id !== step.id &&
                                   item.target_object_id !==
                                     step.result_object_id &&
+                                  item.source_object_id !==
+                                    step.result_object_id &&
                                   !item.operands.includes(
                                     step.result_object_id,
                                   ),
@@ -464,21 +492,100 @@ export function ObjectScenarioTests({
                     <select
                       aria-label={`Step ${stepIndex + 1} type`}
                       value={step.step_type}
-                      onChange={(event) =>
-                        replaceStep((current) => ({
-                          ...newStep(current.target_object_id),
-                          id: current.id,
-                          step_type: event.target.value as
+                      onChange={(event) => {
+                        const nextType = event.target.value as
                             | "method"
                             | "observer"
-                            | "operator",
-                        }))
-                      }
+                            | "operator"
+                            | "copy_construct"
+                            | "copy_assign"
+                            | "self_assign"
+                            | "move_construct"
+                            | "move_assign";
+                        replaceStep((current) => {
+                          if (current.step_type === nextType) return current;
+                          if (
+                            ["method", "observer"].includes(
+                              current.step_type,
+                            ) &&
+                            ["method", "observer"].includes(nextType)
+                          ) {
+                            const selectedMethod =
+                              targetClass?.methods.find(
+                                (item) => item.id === current.method_id,
+                              );
+                            const observerCanUseMethod =
+                              nextType !== "observer" ||
+                              selectedMethod?.return_type_metadata.kind !==
+                                "void";
+                            return {
+                              ...newStep(current.target_object_id),
+                              id: current.id,
+                              step_type: nextType,
+                              method_id: observerCanUseMethod
+                                ? current.method_id
+                                : "",
+                              arguments: observerCanUseMethod
+                                ? current.arguments
+                                : [],
+                              expected_return:
+                                observerCanUseMethod &&
+                                selectedMethod?.return_type_metadata.kind !==
+                                  "void"
+                                  ? current.expected_return
+                                  : "",
+                              check_stdout: observerCanUseMethod
+                                ? current.check_stdout
+                                : false,
+                              expected_stdout:
+                                observerCanUseMethod &&
+                                current.check_stdout
+                                  ? current.expected_stdout
+                                  : "",
+                            };
+                          }
+                          return {
+                            ...newStep(current.target_object_id),
+                            id: current.id,
+                            step_type: nextType,
+                            source_object_id: [
+                              "copy_construct",
+                              "move_construct",
+                              "self_assign",
+                            ].includes(nextType)
+                              ? current.target_object_id
+                              : "",
+                          };
+                        });
+                      }}
                       className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
                     >
                       <option value="method">Method call</option>
                       <option value="observer">Observer method call</option>
                       <option value="operator">Operator call</option>
+                      {targetClass?.special_members.some(
+                        (item) => item.kind === "copy_constructor",
+                      ) && (
+                        <option value="copy_construct">Copy construct</option>
+                      )}
+                      {targetClass?.special_members.some(
+                        (item) => item.kind === "copy_assignment",
+                      ) && (
+                        <>
+                          <option value="copy_assign">Copy assign</option>
+                          <option value="self_assign">Self assign</option>
+                        </>
+                      )}
+                      {targetClass?.special_members.some(
+                        (item) => item.kind === "move_constructor",
+                      ) && (
+                        <option value="move_construct">Move construct</option>
+                      )}
+                      {targetClass?.special_members.some(
+                        (item) => item.kind === "move_assignment",
+                      ) && (
+                        <option value="move_assign">Move assign</option>
+                      )}
                     </select>
                     <select
                       aria-label={`Step ${stepIndex + 1} target object`}
@@ -488,18 +595,35 @@ export function ObjectScenarioTests({
                           ...newStep(event.target.value),
                           id: current.id,
                           step_type: current.step_type,
+                          source_object_id: [
+                            "copy_construct",
+                            "move_construct",
+                            "self_assign",
+                          ].includes(current.step_type)
+                            ? event.target.value
+                            : "",
                         }))
                       }
                       className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
                     >
                       <option value="">Choose an object</option>
                       {priorObjects.map((item) => (
-                        <option key={item.id} value={item.id}>
+                        <option
+                          key={item.id}
+                          value={item.id}
+                          disabled={
+                            movedFrom.has(item.id) &&
+                            !["copy_assign", "move_assign"].includes(
+                              step.step_type,
+                            )
+                          }
+                        >
                           {item.name}
+                          {movedFrom.has(item.id) ? " — moved from" : ""}
                         </option>
                       ))}
                     </select>
-                    {step.step_type !== "operator" ? (
+                    {["method", "observer"].includes(step.step_type) ? (
                       <>
                         <select
                           aria-label={`Step ${stepIndex + 1} method`}
@@ -512,17 +636,28 @@ export function ObjectScenarioTests({
                               ...current,
                               method_id: next?.id ?? "",
                               arguments: next?.parameters.map(() => "") ?? [],
-                              expected_return: "",
+                              expected_return:
+                                next?.return_type_metadata.kind === "void"
+                                  ? ""
+                                  : next?.id === current.method_id
+                                    ? current.expected_return
+                                    : "",
                             }));
                           }}
                           className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
                         >
                           <option value="">Choose a method</option>
-                          {targetClass?.methods.map((item) => (
+                          {targetClass?.methods
+                            .filter(
+                              (item) =>
+                                step.step_type !== "observer" ||
+                                item.return_type_metadata.kind !== "void",
+                            )
+                            .map((item) => (
                             <option key={item.id} value={item.id}>
                               {item.display}
                             </option>
-                          ))}
+                            ))}
                         </select>
                         {method?.parameters.map((parameter, index) => (
                           <ValueField
@@ -543,7 +678,7 @@ export function ObjectScenarioTests({
                           />
                         ))}
                       </>
-                    ) : (
+                    ) : step.step_type === "operator" ? (
                       <>
                         <select
                           aria-label={`Step ${stepIndex + 1} operator`}
@@ -625,6 +760,15 @@ export function ObjectScenarioTests({
                           />
                         )}
                       </>
+                    ) : (
+                      <SpecialMemberFields
+                        step={step}
+                        member={specialMember}
+                        targetClass={targetClass}
+                        objects={priorObjects}
+                        movedFrom={movedFrom}
+                        onChange={replaceStep}
+                      />
                     )}
                     {((method &&
                       method.return_type_metadata.kind !== "void") ||
@@ -702,6 +846,132 @@ export function ObjectScenarioTests({
       >
         Add scenario
       </button>
+    </div>
+  );
+}
+
+function SpecialMemberFields({
+  step,
+  member,
+  targetClass,
+  objects,
+  movedFrom,
+  onChange,
+}: {
+  step: EditableObjectStep;
+  member:
+    | NonNullable<ObjectClass["special_members"]>[number]
+    | undefined;
+  targetClass: ObjectClass | undefined;
+  objects: EditableScenarioObject[];
+  movedFrom: Set<string>;
+  onChange: (
+    change: (item: EditableObjectStep) => EditableObjectStep,
+  ) => void;
+}) {
+  const expectedKind = ({
+    copy_construct: "copy_constructor",
+    copy_assign: "copy_assignment",
+    self_assign: "copy_assignment",
+    move_construct: "move_constructor",
+    move_assign: "move_assignment",
+  } as Record<string, string>)[step.step_type];
+  const createsObject = ["copy_construct", "move_construct"].includes(
+    step.step_type,
+  );
+  const needsSource = ["copy_assign", "move_assign"].includes(step.step_type);
+  return (
+    <div className="mt-2 space-y-2">
+      {needsSource && (
+        <label className="block text-xs text-slate-700">
+          Source
+          <select
+            value={step.source_object_id}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                source_object_id: event.target.value,
+              }))
+            }
+            className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+          >
+            <option value="">Choose a source object</option>
+            {objects
+              .filter(
+                (item) =>
+                  item.class_id === targetClass?.id &&
+                  !movedFrom.has(item.id),
+              )
+              .map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+          </select>
+        </label>
+      )}
+      <label className="block text-xs text-slate-700">
+        Selected operation
+        <select
+          value={step.special_member_id}
+          onChange={(event) =>
+            onChange((current) => ({
+              ...current,
+              special_member_id: event.target.value,
+              result_object_id:
+                createsObject && !current.result_object_id
+                  ? `result-${crypto.randomUUID()}`
+                  : current.result_object_id,
+            }))
+          }
+          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+        >
+          <option value="">Choose an operation</option>
+          {targetClass?.special_members
+            .filter((item) => item.kind === expectedKind)
+            .map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.display}
+              </option>
+            ))}
+        </select>
+      </label>
+      {createsObject && (
+        <>
+          <ValueField
+            id={`${step.id}-special-result`}
+            label={
+              step.step_type === "copy_construct"
+                ? "Copied object name"
+                : "Moved object name"
+            }
+            type={targetClass?.name ?? ""}
+            value={step.result_name}
+            placeholder={
+              step.step_type === "copy_construct" ? "e.g. copied" : "e.g. moved"
+            }
+            onChange={(value) =>
+              onChange((current) => ({
+                ...current,
+                result_name: value,
+                result_object_id:
+                  current.result_object_id || `result-${crypto.randomUUID()}`,
+              }))
+            }
+          />
+          {step.step_type === "copy_construct" && (
+            <p className="text-[11px] leading-4 text-slate-500">
+              Add a mutating method call on one object, then add observer calls
+              for both objects to verify independence.
+            </p>
+          )}
+        </>
+      )}
+      {member?.is_defaulted && (
+        <p className="text-[11px] text-slate-500">
+          This special member is explicitly defaulted.
+        </p>
+      )}
     </div>
   );
 }

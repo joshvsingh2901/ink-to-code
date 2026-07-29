@@ -51,6 +51,19 @@ export type ObjectClass = {
   constructors: ObjectConstructor[];
   methods: ObjectMethod[];
   operators: ObjectOperator[];
+  special_members: ObjectSpecialMember[];
+};
+
+export type ObjectSpecialMember = {
+  id: string;
+  kind:
+    | "copy_constructor"
+    | "copy_assignment"
+    | "move_constructor"
+    | "move_assignment"
+    | "destructor";
+  display: string;
+  is_defaulted: boolean;
 };
 
 export type ObjectOperatorParameter = {
@@ -133,16 +146,26 @@ export type ObjectScenarioTestInput = {
     arguments: string[];
   }>;
   steps: Array<{
-    step_type: "method" | "observer" | "operator";
+    step_type:
+      | "method"
+      | "observer"
+      | "operator"
+      | "copy_construct"
+      | "copy_assign"
+      | "self_assign"
+      | "move_construct"
+      | "move_assign";
     method_id?: string;
     operator_id?: string;
     target_object_id: string;
-    arguments: string[];
-    operands: string[];
+    arguments?: string[];
+    operands?: string[];
     result_object_id?: string;
     result_name?: string;
+    special_member_id?: string;
+    source_object_id?: string;
     expected_return?: string;
-    check_stdout: boolean;
+    check_stdout?: boolean;
     expected_stdout?: string;
   }>;
 };
@@ -214,11 +237,21 @@ export type ObjectScenarioTestResult = ResultBase & {
   constructor_arguments: string[];
   constructor_completed: boolean;
   constructed_objects: string[];
+  moved_from_objects: string[];
+  destruction_failed: boolean;
   failed_step_index: number | null;
   steps: Array<{
     index: number;
     method_id: string | null;
-    step_type: "method" | "observer" | "operator";
+    step_type:
+      | "method"
+      | "observer"
+      | "operator"
+      | "copy_construct"
+      | "copy_assign"
+      | "self_assign"
+      | "move_construct"
+      | "move_assign";
     operator_id: string | null;
     method: string;
     expression: string | null;
@@ -374,6 +407,22 @@ function isObjectClass(value: unknown): value is ObjectClass {
         (operator.return_type_metadata === null ||
           isFunctionTypeMetadata(operator.return_type_metadata)) &&
         typeof operator.is_const === "boolean",
+    ) &&
+    Array.isArray(objectClass.special_members) &&
+    objectClass.special_members.every(
+      (member) =>
+        member !== null &&
+        typeof member === "object" &&
+        typeof member.id === "string" &&
+        [
+          "copy_constructor",
+          "copy_assignment",
+          "move_constructor",
+          "move_assignment",
+          "destructor",
+        ].includes(member.kind) &&
+        typeof member.display === "string" &&
+        typeof member.is_defaulted === "boolean",
     )
   );
 }
@@ -495,6 +544,11 @@ function isTestResult(
     objectResult.constructed_objects.every(
       (item) => typeof item === "string",
     ) &&
+    Array.isArray(objectResult.moved_from_objects) &&
+    objectResult.moved_from_objects.every(
+      (item) => typeof item === "string",
+    ) &&
+    typeof objectResult.destruction_failed === "boolean" &&
     (objectResult.failed_step_index === null ||
       typeof objectResult.failed_step_index === "number") &&
     Array.isArray(objectResult.steps) &&
@@ -503,7 +557,16 @@ function isTestResult(
         step !== null &&
         typeof step === "object" &&
         typeof step.index === "number" &&
-        ["method", "observer", "operator"].includes(step.step_type) &&
+        [
+          "method",
+          "observer",
+          "operator",
+          "copy_construct",
+          "copy_assign",
+          "self_assign",
+          "move_construct",
+          "move_assign",
+        ].includes(step.step_type) &&
         (step.method_id === null || typeof step.method_id === "string") &&
         (step.operator_id === null || typeof step.operator_id === "string") &&
         typeof step.method === "string" &&

@@ -56,6 +56,20 @@ class ObjectOperator:
 
 
 @dataclass(frozen=True)
+class ObjectSpecialMember:
+    id: str
+    kind: Literal[
+        "copy_constructor",
+        "copy_assignment",
+        "move_constructor",
+        "move_assignment",
+        "destructor",
+    ]
+    display: str
+    is_defaulted: bool = False
+
+
+@dataclass(frozen=True)
 class ObjectClass:
     id: str
     name: str
@@ -63,6 +77,7 @@ class ObjectClass:
     constructors: tuple[ObjectConstructor, ...]
     methods: tuple[ObjectMethod, ...]
     operators: tuple[ObjectOperator, ...] = ()
+    special_members: tuple[ObjectSpecialMember, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -290,6 +305,69 @@ def _member_access_at(
     return access
 
 
+def _special_member(
+    class_name: str,
+    prefix: str,
+    parameters_source: str,
+    suffix: str,
+) -> ObjectSpecialMember | None:
+    compact_parameters = re.sub(r"\s+", "", parameters_source)
+    normalized_prefix = re.sub(r"\s+", "", prefix)
+    is_defaulted = bool(re.search(r"=\s*default\b", suffix))
+    if re.search(r"=\s*delete\b", suffix):
+        return None
+    kind: Literal[
+        "copy_constructor",
+        "copy_assignment",
+        "move_constructor",
+        "move_assignment",
+        "destructor",
+    ] | None = None
+    display = ""
+    if normalized_prefix == class_name:
+        if re.fullmatch(
+            rf"const{re.escape(class_name)}&(?:[A-Za-z_]\w*)?",
+            compact_parameters,
+        ):
+            kind = "copy_constructor"
+            display = f"{class_name}::{class_name}(const {class_name}&)"
+        elif re.fullmatch(
+            rf"{re.escape(class_name)}&&(?:[A-Za-z_]\w*)?",
+            compact_parameters,
+        ):
+            kind = "move_constructor"
+            display = f"{class_name}::{class_name}({class_name}&&)"
+    elif normalized_prefix in {
+        f"{class_name}&operator=",
+        f"{class_name}const&operator=",
+    }:
+        if re.fullmatch(
+            rf"const{re.escape(class_name)}&(?:[A-Za-z_]\w*)?",
+            compact_parameters,
+        ):
+            kind = "copy_assignment"
+            display = (
+                f"{class_name}& {class_name}::operator=(const {class_name}&)"
+            )
+        elif re.fullmatch(
+            rf"{re.escape(class_name)}&&(?:[A-Za-z_]\w*)?",
+            compact_parameters,
+        ):
+            kind = "move_assignment"
+            display = f"{class_name}& {class_name}::operator=({class_name}&&)"
+    elif normalized_prefix == f"~{class_name}" and not compact_parameters:
+        kind = "destructor"
+        display = f"{class_name}::~{class_name}()"
+    if kind is None:
+        return None
+    return ObjectSpecialMember(
+        id=f"{kind}:{display.replace(' ', '')}",
+        kind=kind,
+        display=display + (" = default" if is_defaulted else ""),
+        is_defaulted=is_defaulted,
+    )
+
+
 def _analyze_class_members(
     class_name: str,
     kind: Literal["class", "struct"],
@@ -301,6 +379,7 @@ def _analyze_class_members(
     tuple[ObjectConstructor, ...],
     tuple[ObjectMethod, ...],
     tuple[ObjectOperator, ...],
+    tuple[ObjectSpecialMember, ...],
 ]:
     depths = _brace_depths(body)
     labels = [
@@ -312,6 +391,7 @@ def _analyze_class_members(
     constructors: list[ObjectConstructor] = []
     methods: list[ObjectMethod] = []
     operators: list[ObjectOperator] = []
+    special_members: list[ObjectSpecialMember] = []
     segment_start = 0
     position = 0
 
@@ -339,14 +419,43 @@ def _analyze_class_members(
             position = close_parenthesis + 1
             continue
         definition = _find_definition_brace(body, close_parenthesis)
+        prefix = " ".join(body[segment_start:position].split())
+        access = _member_access_at(labels, position, default_access)
+        tail_end = body.find(";", close_parenthesis)
+        definition_start = definition[0] if definition else len(body)
+        suffix_end = min(
+            tail_end if tail_end >= 0 else len(body),
+            definition_start,
+        )
+        declaration_suffix = body[close_parenthesis + 1:suffix_end]
+        special_member = _special_member(
+            class_name,
+            prefix,
+            body[position + 1:close_parenthesis],
+            declaration_suffix,
+        )
+        if special_member is not None:
+            if (
+                access == "public"
+                and (
+                    definition is not None
+                    or special_member.is_defaulted
+                    or special_member.kind == "destructor"
+                )
+            ):
+                special_members.append(special_member)
+            if definition is not None:
+                position = definition[1] + 1
+                segment_start = position
+            else:
+                position = close_parenthesis + 1
+            continue
         if definition is None:
             position = close_parenthesis + 1
             continue
         body_start, body_end = definition
-        prefix = " ".join(body[segment_start:position].split())
         suffix = " ".join(body[close_parenthesis + 1:body_start].split())
         parameters_source = body[position + 1:close_parenthesis]
-        access = _member_access_at(labels, position, default_access)
         position = body_end + 1
         segment_start = position
 
@@ -529,7 +638,25 @@ def _analyze_class_members(
         )
         not in ambiguous_operator_const_overloads
     ]
-    return tuple(constructors), tuple(methods), tuple(operators)
+    duplicate_special_ids = {
+        member.id
+        for member in special_members
+        if sum(
+            candidate.id == member.id for candidate in special_members
+        )
+        > 1
+    }
+    special_members = [
+        member
+        for member in special_members
+        if member.id not in duplicate_special_ids
+    ]
+    return (
+        tuple(constructors),
+        tuple(methods),
+        tuple(operators),
+        tuple(special_members),
+    )
 
 
 def _analyze_standalone_operators(
@@ -655,12 +782,14 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
             continue
         kind = match.group("kind")
         name = match.group("name")
-        constructors, methods, operators = _analyze_class_members(
+        constructors, methods, operators, special_members = (
+            _analyze_class_members(
             name,
             kind,
             masked[match.end():body_end],
             unqualified_types_allowed=unqualified_types_allowed,
             class_names=class_names,
+            )
         )
         if constructors:
             classes.append(
@@ -671,6 +800,7 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
                     constructors=constructors,
                     methods=methods,
                     operators=operators,
+                    special_members=special_members,
                 )
             )
 

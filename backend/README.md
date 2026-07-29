@@ -197,10 +197,11 @@ running arbitrary code for real users.
 ### Object scenario testing
 
 Object scenario mode discovers usable inline public constructors and public
-instance methods on classes and structs. Each scenario must select one class
-and one full-signature constructor, then provide at least one ordered method
-step. The harness constructs exactly one object, invokes each selected method
-once in the displayed order, and lets the object be destroyed naturally.
+instance methods on classes and structs. Each scenario selects one or more
+named objects with full-signature constructors, then provides at least one
+ordered method, operator, or special-member step. The harness constructs each
+initial object once, invokes each selected operation once in the displayed
+order, and lets every object be destroyed naturally.
 
 Non-void steps use the existing type-aware return comparison. Any step may
 optionally compare stdout using the selected exact or whitespace-tolerant mode.
@@ -235,6 +236,32 @@ Assignment, increment/decrement, conversion, pointer-return, custom-object
 reference-result storage, short-circuit, comma, allocation, and spaceship
 operators remain unsupported. `<=>` is intentionally deferred because it
 requires a dedicated comparison-category result model.
+
+### Big Five behavioral scenarios
+
+The analyzer reports explicitly defined or explicitly defaulted public copy
+constructors, copy assignments, move constructors, and move assignments using
+full-signature special-member IDs. Deleted, private, protected, ambiguous, and
+unimplemented declaration-only special members are excluded. Destructors are
+reported for informational metadata only.
+
+Structured steps perform copy construction, copy assignment, self-assignment,
+move construction, or move assignment directly against validated scenario
+objects. Copy/move construction creates a uniquely named object available only
+to later steps. Assignments retain their existing target. The generated
+harness uses ordinary C++ object operations and `std::move`; it never copies
+fields, bytes, or addresses.
+
+After a move, the source remains alive for natural destruction but is excluded
+from later method, observer, operator, copy, and move-source selection. The
+moved-to object remains available normally. If all step metadata completes but
+scope destruction terminates abnormally, the response classifies that as a
+destruction/runtime failure while preserving completed step results.
+
+This stage does not generate assertions automatically, inspect private state,
+compare addresses, count destructor calls, run sanitizers, or report leaks.
+Copy independence is verified only through user-selected mutations and public
+observer expectations.
 
 ## Tests
 

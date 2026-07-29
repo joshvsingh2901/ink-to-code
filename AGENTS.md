@@ -476,7 +476,7 @@ The expected request should contain the current source code in structured JSON, 
 - Private fields must never be accessed or exposed by the generated harness.
 - Constructors and methods must be identified by full signatures, not names alone.
 - The original Monaco source must remain unchanged.
-- Big Five automation, inheritance, memory diagnostics, and arbitrary multi-object interactions remain separate future stages.
+- Automatic Big Five generation, inheritance, memory diagnostics, and arbitrary multi-object interactions remain separate future stages.
 
 ## Operator-overload scenario testing
 
@@ -486,4 +486,15 @@ The expected request should contain the current source code in structured JSON, 
 - Object state and operator results must be observed only through public methods, supported scalar returns, comparisons, or captured stdout.
 - Private and protected fields must never be accessed.
 - The original Monaco source must remain unchanged.
-- Automatic Big Five testing, inheritance, implicit conversions, memory diagnostics, and arbitrary expression evaluation remain separate stages.
+- Automatic Big Five generation, inheritance, implicit conversions, memory diagnostics, and arbitrary expression evaluation remain separate stages.
+
+## Big Five behavioural testing
+
+- Object scenarios may test explicitly declared copy constructors, copy assignment operators, move constructors, and move assignment operators.
+- Big Five behavior must be tested through observable public methods, operator results, stdout, runtime stability, and object independence.
+- Private fields and raw memory addresses must never be exposed.
+- Copy scenarios must verify that copied objects can be modified independently when deep-copy behavior is expected.
+- Self-assignment must leave the object valid and observable.
+- Moved-to objects may be observed normally; moved-from objects may only be checked through explicitly safe public operations.
+- Destruction must occur naturally through scope.
+- Automatic leak detection and sanitizer reporting remain a separate memory-diagnostics stage.

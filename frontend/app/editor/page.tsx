@@ -684,7 +684,14 @@ export default function EditorPage() {
                 code: currentCode,
                 language: "cpp" as const,
                 comparison_mode: comparisonMode,
-                tests: objectScenarios.map((scenario) => ({
+                tests: objectScenarios.map((scenario) => {
+                  const classByObjectId = new Map(
+                    scenario.objects.map((object) => [
+                      object.id,
+                      object.class_id,
+                    ]),
+                  );
+                  return {
                     name: scenario.name,
                     objects: scenario.objects.map((object) => ({
                       object_id: object.id,
@@ -697,47 +704,81 @@ export default function EditorPage() {
                       const operator = testMode.classes
                         .flatMap((item) => item.operators)
                         .find((item) => item.id === step.operator_id);
+                      const targetClassId = classByObjectId.get(
+                        step.target_object_id,
+                      );
                       const targetClass = testMode.classes.find(
-                        (item) =>
-                          item.id ===
-                          scenario.objects.find(
-                            (object) =>
-                              object.id === step.target_object_id,
-                          )?.class_id,
+                        (item) => item.id === targetClassId,
                       );
                       const method = targetClass?.methods.find(
                         (item) => item.id === step.method_id,
                       );
-                      return {
-                        step_type: step.step_type,
-                        target_object_id: step.target_object_id,
-                        ...(step.step_type !== "operator"
-                          ? { method_id: step.method_id }
-                          : {
+                      const isMethodStep = ["method", "observer"].includes(
+                        step.step_type,
+                      );
+                      if (step.result_object_id) {
+                        const resultClassId =
+                          step.step_type === "operator"
+                            ? operator?.return_object_class_id
+                            : classByObjectId.get(step.source_object_id);
+                        if (resultClassId) {
+                          classByObjectId.set(
+                            step.result_object_id,
+                            resultClassId,
+                          );
+                        }
+                      }
+                      if (isMethodStep) {
+                        return {
+                          step_type: step.step_type,
+                          target_object_id: step.target_object_id,
+                          method_id: step.method_id,
+                          arguments: step.arguments,
+                          check_stdout: step.check_stdout,
+                          ...(method?.return_type_metadata.kind !== "void"
+                            ? { expected_return: step.expected_return }
+                            : {}),
+                          ...(step.check_stdout
+                            ? { expected_stdout: step.expected_stdout }
+                            : {}),
+                        };
+                      }
+                      if (step.step_type === "operator") {
+                        return {
+                          step_type: step.step_type,
+                          target_object_id: step.target_object_id,
                               operator_id: step.operator_id,
                               operands: step.operands,
+                          check_stdout: step.check_stdout,
                               ...(operator?.return_kind === "object_value"
                                 ? {
                                     result_object_id: step.result_object_id,
                                     result_name: step.result_name,
                                   }
                                 : {}),
-                        }),
-                        arguments: step.arguments,
-                        operands: step.operands,
-                        check_stdout: step.check_stdout,
-                        ...((step.step_type !== "operator" &&
-                          method?.return_type_metadata.kind !== "void") ||
-                        (step.step_type === "operator" &&
-                          operator?.return_kind === "value")
-                          ? { expected_return: step.expected_return }
-                          : {}),
-                        ...(step.check_stdout
+                          ...(operator?.return_kind === "value"
+                            ? { expected_return: step.expected_return }
+                            : {}),
+                          ...(step.check_stdout
                           ? { expected_stdout: step.expected_stdout }
+                          : {}),
+                        };
+                      }
+                      return {
+                        step_type: step.step_type,
+                        target_object_id: step.target_object_id,
+                        special_member_id: step.special_member_id,
+                        source_object_id: step.source_object_id,
+                        ...(step.result_object_id
+                          ? {
+                              result_object_id: step.result_object_id,
+                              result_name: step.result_name,
+                            }
                           : {}),
                       };
                     }),
-                  })),
+                  };
+                }),
               }
             : {
               mode: "program" as const,
@@ -966,9 +1007,11 @@ export default function EditorPage() {
         scenario.steps.every(
           (step) =>
             step.target_object_id &&
-            (step.step_type !== "operator"
+            (["method", "observer"].includes(step.step_type)
               ? step.method_id
-              : step.operator_id),
+              : step.step_type === "operator"
+                ? step.operator_id
+                : step.special_member_id),
         ),
     );
   const isCleanCompileSuccess =
@@ -1980,6 +2023,14 @@ export default function EditorPage() {
                                     {item}
                                   </p>
                                 ))}
+                                {result.moved_from_objects.map((item) => (
+                                  <p
+                                    key={`moved-${item}`}
+                                    className="mt-1 text-xs text-slate-500"
+                                  >
+                                    {item} — moved from
+                                  </p>
+                                ))}
                               </div>
                               {result.steps.map((step) => (
                                 <div
@@ -2053,6 +2104,12 @@ export default function EditorPage() {
                                     ))}
                                 </div>
                               ))}
+                              {result.destruction_failed && (
+                                <p className="border-t border-slate-200 pt-2 text-xs font-medium text-rose-700">
+                                  Scenario steps completed, but object
+                                  destruction failed.
+                                </p>
+                              )}
                             </div>
                           )}
                           {isFunctionCombinedResult(result) && (

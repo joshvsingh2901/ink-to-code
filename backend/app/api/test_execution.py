@@ -12,6 +12,7 @@ from app.schemas.test_execution import (
     ObjectMethodResponse,
     ObjectOperatorParameterResponse,
     ObjectOperatorResponse,
+    ObjectSpecialMemberResponse,
     RunTestsRequest,
     RunTestsResponse,
     SourceModeRequest,
@@ -166,6 +167,15 @@ async def analyze_source_mode(
                         is_const=operator.is_const,
                     )
                     for operator in object_class.operators
+                ],
+                special_members=[
+                    ObjectSpecialMemberResponse(
+                        id=member.id,
+                        kind=member.kind,
+                        display=member.display,
+                        is_defaulted=member.is_defaulted,
+                    )
+                    for member in object_class.special_members
                 ],
             )
             for object_class in object_analysis.classes

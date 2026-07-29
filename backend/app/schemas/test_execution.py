@@ -74,6 +74,19 @@ class ObjectOperatorResponse(BaseModel):
     is_const: bool
 
 
+class ObjectSpecialMemberResponse(BaseModel):
+    id: str
+    kind: Literal[
+        "copy_constructor",
+        "copy_assignment",
+        "move_constructor",
+        "move_assignment",
+        "destructor",
+    ]
+    display: str
+    is_defaulted: bool
+
+
 class ObjectClassResponse(BaseModel):
     id: str
     name: str
@@ -81,6 +94,9 @@ class ObjectClassResponse(BaseModel):
     constructors: list[ObjectConstructorResponse]
     methods: list[ObjectMethodResponse]
     operators: list[ObjectOperatorResponse] = Field(default_factory=list)
+    special_members: list[ObjectSpecialMemberResponse] = Field(
+        default_factory=list
+    )
 
 
 class SourceModeRequest(BaseModel):
@@ -182,7 +198,16 @@ class FunctionRunTestsRequest(BaseModel):
 
 
 class ObjectScenarioStep(BaseModel):
-    step_type: Literal["method", "observer", "operator"] = "method"
+    step_type: Literal[
+        "method",
+        "observer",
+        "operator",
+        "copy_construct",
+        "copy_assign",
+        "self_assign",
+        "move_construct",
+        "move_assign",
+    ] = "method"
     method_id: str | None = Field(default=None, max_length=500)
     operator_id: str | None = Field(default=None, max_length=700)
     target_object_id: str | None = Field(default=None, max_length=100)
@@ -190,6 +215,8 @@ class ObjectScenarioStep(BaseModel):
     operands: list[str] = Field(default_factory=list, max_length=20)
     result_object_id: str | None = Field(default=None, max_length=100)
     result_name: str | None = Field(default=None, max_length=100)
+    special_member_id: str | None = Field(default=None, max_length=700)
+    source_object_id: str | None = Field(default=None, max_length=100)
     expected_return: str | None = Field(default=None, max_length=1_000)
     check_stdout: bool = False
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
@@ -200,6 +227,16 @@ class ObjectScenarioStep(BaseModel):
             raise ValueError("Method steps require a method identifier.")
         if self.step_type == "operator" and not self.operator_id:
             raise ValueError("Operator steps require an operator identifier.")
+        if self.step_type in {
+            "copy_construct",
+            "copy_assign",
+            "self_assign",
+            "move_construct",
+            "move_assign",
+        } and not self.special_member_id:
+            raise ValueError(
+                "Big Five steps require a special-member identifier."
+            )
         if self.check_stdout and self.expected_stdout is None:
             raise ValueError(
                 "Method-output checking requires expected stdout."
@@ -365,7 +402,16 @@ class FunctionCombinedTestResult(BaseModel):
 
 class ObjectScenarioStepResult(BaseModel):
     index: int
-    step_type: Literal["method", "observer", "operator"] = "method"
+    step_type: Literal[
+        "method",
+        "observer",
+        "operator",
+        "copy_construct",
+        "copy_assign",
+        "self_assign",
+        "move_construct",
+        "move_assign",
+    ] = "method"
     method_id: str | None = None
     operator_id: str | None = None
     method: str
@@ -385,6 +431,8 @@ class ObjectScenarioTestResult(BaseModel):
     constructor_arguments: list[str]
     constructor_completed: bool
     constructed_objects: list[str] = Field(default_factory=list)
+    moved_from_objects: list[str] = Field(default_factory=list)
+    destruction_failed: bool = False
     failed_step_index: int | None = None
     steps: list[ObjectScenarioStepResult]
     stderr: str

@@ -45,6 +45,7 @@ from app.services.object_analysis import (
     ObjectConstructor,
     ObjectMethod,
     ObjectOperator,
+    ObjectSpecialMember,
     analyze_object_scenarios,
 )
 
@@ -90,6 +91,10 @@ class PreparedObjectStep:
     result_object_id: str | None = None
     result_name: str | None = None
     expression: str = ""
+    special_member: ObjectSpecialMember | None = None
+    source_object_id: str | None = None
+    step_type: str = "method"
+    result_object_class_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1136,7 +1141,35 @@ def _build_object_harness(
                 argument.expression for argument in step.arguments
             )
             target = object_variables[step.target_object_id]
-            if step.method is not None:
+            if step.special_member is not None:
+                source = (
+                    object_variables[step.source_object_id]
+                    if step.source_object_id
+                    else target
+                )
+                result_variable = f"inktocode_result_{step_index}"
+                if step.step_type == "copy_construct":
+                    call_statement = (
+                        f"{step.result_object_class_id} {result_variable}"
+                        f"{{{source}}};"
+                    )
+                elif step.step_type == "move_construct":
+                    call_statement = (
+                        f"{step.result_object_class_id} {result_variable}"
+                        f"{{std::move({source})}};"
+                    )
+                elif step.step_type == "copy_assign":
+                    call_statement = f"{target} = {source};"
+                elif step.step_type == "move_assign":
+                    call_statement = f"{target} = std::move({source});"
+                else:
+                    call_statement = f"{target} = {target};"
+                if step.result_object_id:
+                    object_variables[step.result_object_id] = result_variable
+                return_type = None
+                object_result_type = step.result_object_class_id
+                suppress_return = True
+            elif step.method is not None:
                 call = f"{target}.{step.method.name}({expressions})"
                 return_type = step.method.return_value_type
                 object_result_type = None
@@ -1172,7 +1205,9 @@ def _build_object_harness(
                     "stream_reference",
                 }
             result_name = f"inktocode_step_{step_index}_result"
-            if object_result_type:
+            if step.special_member is not None:
+                pass
+            elif object_result_type:
                 result_variable = f"inktocode_result_{step_index}"
                 call_statement = (
                     f"{object_result_type} {result_variable} = {call};"
@@ -1259,6 +1294,7 @@ def _build_object_harness(
         "#include <iomanip>\n"
         "#include <iostream>\n"
         "#include <string>\n"
+        "#include <utility>\n"
         "#include <vector>\n\n"
         f"{code}\n\n"
         f"{_string_serializer_source()}\n\n"
@@ -1735,6 +1771,8 @@ def _object_results(
                             prepared_step.method.display
                             if prepared_step.method
                             else prepared_step.operator.display
+                            if prepared_step.operator
+                            else prepared_step.special_member.display
                         ),
                         expression=prepared_step.expression,
                         result_object_name=prepared_step.result_name,
@@ -1819,6 +1857,8 @@ def _object_results(
                         prepared_step.method.display
                         if prepared_step.method
                         else prepared_step.operator.display
+                        if prepared_step.operator
+                        else prepared_step.special_member.display
                     ),
                     expression=prepared_step.expression,
                     result_object_name=prepared_step.result_name,
@@ -1838,6 +1878,23 @@ def _object_results(
         )
         passed = runtime_ok and all(
             step.passed for step in step_results
+        )
+        object_names = {
+            item.object_id: item.name for item in prepared.objects
+        }
+        moved_ids: set[str] = set()
+        for step in prepared.steps:
+            if step.result_object_id and step.result_name:
+                object_names[step.result_object_id] = step.result_name
+            if step.step_type in {"move_construct", "move_assign"}:
+                moved_ids.add(step.source_object_id or "")
+            if step.step_type in {"copy_assign", "move_assign"}:
+                moved_ids.discard(step.target_object_id)
+        destruction_failed = (
+            output.progress_index == len(prepared.steps)
+            and output.exit_code not in {0, None}
+            and not output.timed_out
+            and not output.output_limited
         )
         results.append(
             ObjectScenarioTestResult(
@@ -1869,6 +1926,12 @@ def _object_results(
                         strict=True,
                     )
                 ],
+                moved_from_objects=[
+                    object_names[object_id]
+                    for object_id in moved_ids
+                    if object_id in object_names
+                ],
+                destruction_failed=destruction_failed,
                 failed_step_index=failed_step_index,
                 steps=step_results,
                 stderr=output.stderr,
@@ -1976,6 +2039,7 @@ def _prepare_object_scenarios(
             )
             available_objects[item.object_id] = (object_class.id, item.name)
         prepared_steps: list[PreparedObjectStep] = []
+        moved_from: set[str] = set()
         for step_index, step in enumerate(test.steps):
             target_id = step.target_object_id or requested_objects[0].object_id
             target = available_objects.get(target_id)
@@ -1986,6 +2050,108 @@ def _prepare_object_scenarios(
             target_class = next(
                 item for item in analysis.classes if item.id == target[0]
             )
+            special_kinds = {
+                "copy_construct": "copy_constructor",
+                "copy_assign": "copy_assignment",
+                "self_assign": "copy_assignment",
+                "move_construct": "move_constructor",
+                "move_assign": "move_assignment",
+            }
+            if step.step_type in special_kinds:
+                source_id = (
+                    target_id
+                    if step.step_type == "self_assign"
+                    else step.source_object_id
+                )
+                source = (
+                    available_objects.get(source_id)
+                    if source_id is not None
+                    else None
+                )
+                if source is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} references a stale source object."
+                    )
+                if source_id in moved_from:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} cannot use a moved-from source."
+                    )
+                if source[0] != target[0]:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} requires matching object types."
+                    )
+                special_member = next(
+                    (
+                        member
+                        for member in target_class.special_members
+                        if member.id == step.special_member_id
+                        and member.kind == special_kinds[step.step_type]
+                    ),
+                    None,
+                )
+                if special_member is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected a stale or wrong special member."
+                    )
+                creates_object = step.step_type in {
+                    "copy_construct",
+                    "move_construct",
+                }
+                if creates_object:
+                    if not step.result_object_id or not step.result_name:
+                        raise ValueError(
+                            "Copy/move construction requires a named result object."
+                        )
+                    if (
+                        step.result_object_id in available_objects
+                        or step.result_name in used_names
+                    ):
+                        raise ValueError(
+                            "Special-member result identifiers and names must be unique."
+                        )
+                    available_objects[step.result_object_id] = (
+                        source[0],
+                        step.result_name,
+                    )
+                    used_names.add(step.result_name)
+                if step.step_type in {"move_construct", "move_assign"}:
+                    moved_from.add(source_id)
+                if step.step_type in {"copy_assign", "move_assign"}:
+                    moved_from.discard(target_id)
+                readable = {
+                    "copy_construct": (
+                        f"Copy constructed {step.result_name} from {source[1]}"
+                    ),
+                    "copy_assign": f"{target[1]} = {source[1]}",
+                    "self_assign": f"{target[1]} = {target[1]}",
+                    "move_construct": (
+                        f"Move constructed {step.result_name} from {source[1]}"
+                    ),
+                    "move_assign": (
+                        f"{target[1]} = move({source[1]})"
+                    ),
+                }[step.step_type]
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=None,
+                        arguments=(),
+                        target_object_id=target_id,
+                        special_member=special_member,
+                        source_object_id=source_id,
+                        result_object_id=step.result_object_id,
+                        result_name=step.result_name,
+                        expression=readable,
+                        step_type=step.step_type,
+                        result_object_class_id=(
+                            source[0] if creates_object else None
+                        ),
+                    )
+                )
+                continue
+            if target_id in moved_from:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} cannot use a moved-from object."
+                )
             if step.step_type in {"method", "observer"}:
                 method = next(
                     (
@@ -2035,6 +2201,7 @@ def _prepare_object_scenarios(
                         arguments=arguments,
                         target_object_id=target_id,
                         expression=f"{target[1]}.{method.name}()",
+                        step_type=step.step_type,
                     )
                 )
                 continue
@@ -2089,6 +2256,10 @@ def _prepare_object_scenarios(
                         raise ValueError(
                             f"{test.name} step {step_index + 1} has the wrong "
                             "object operand type."
+                        )
+                    if supplied_value in moved_from:
+                        raise ValueError(
+                            f"{test.name} step {step_index + 1} cannot use a moved-from operand."
                         )
                     operand_expressions.append(supplied_value)
                 elif parameter.value_type:
@@ -2184,6 +2355,7 @@ def _prepare_object_scenarios(
                     result_object_id=step.result_object_id,
                     result_name=step.result_name,
                     expression=readable_expression,
+                    step_type="operator",
                 )
             )
         prepared_scenarios.append(

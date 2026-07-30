@@ -16,6 +16,7 @@ import {
 import {
   analyzeTestMode,
   runCppTests,
+  RunTestsRequestError,
   type FunctionCombinedTestResult,
   type FunctionDescriptor,
   type FunctionMutationTestResult,
@@ -56,6 +57,19 @@ type EditableTestCase = {
   check_stdout: boolean;
 };
 type TestTargetKind = "program" | "function" | "object";
+type TestResult =
+  | ProgramTestResult
+  | FunctionTestResult
+  | FunctionOutputTestResult
+  | FunctionMutationTestResult
+  | FunctionCombinedTestResult
+  | ObjectScenarioTestResult;
+type ResultPresentation = {
+  label: "PASS" | "FAIL" | "MEMORY ISSUE" | "CHECK INCOMPLETE";
+  behaviorText: string;
+  memoryText: string | null;
+  tone: "success" | "failure" | "warning";
+};
 
 const COMPILER_MARKER_OWNER = "inktocode-compiler";
 const AUTO_COMPILE_DEBOUNCE_MS = 900;
@@ -173,6 +187,387 @@ function isObjectScenarioResult(
   return "steps" in result && "constructor_completed" in result;
 }
 
+function didBehaviorPass(result: TestResult) {
+  if (result.timed_out || result.output_limited) return false;
+  if (isObjectScenarioResult(result)) {
+    return (
+      result.constructor_completed &&
+      result.steps.every((step) => step.status === "completed" && step.passed)
+    );
+  }
+  if (isFunctionCombinedResult(result)) {
+    return (
+      (result.return_result?.passed ?? true) &&
+      (result.stdout_result?.passed ?? true) &&
+      result.mutation_results.every((mutation) => mutation.passed)
+    );
+  }
+  if (isFunctionMutationResult(result)) {
+    return Object.keys(result.mismatch_details).length === 0;
+  }
+  return (
+    result.match_type === "exact" ||
+    result.match_type === "whitespace_normalized"
+  );
+}
+
+function getResultPresentation(result: TestResult): ResultPresentation {
+  const behaviorPassed = didBehaviorPass(result);
+  if (!behaviorPassed) {
+    return {
+      label: "FAIL",
+      behaviorText: "Expected behaviour did not match",
+      memoryText: null,
+      tone: "failure",
+    };
+  }
+  if (!result.memory_check_enabled) {
+    return {
+      label: "PASS",
+      behaviorText: "Behaviour passed",
+      memoryText: null,
+      tone: "success",
+    };
+  }
+
+  const hasMemoryFailure =
+    result.memory_status === "leak" ||
+    result.memory_status === "use_after_free" ||
+    result.memory_status === "double_free" ||
+    result.memory_status === "invalid_free" ||
+    result.memory_status === "buffer_overflow" ||
+    result.memory_status === "undefined_behavior" ||
+    result.memory_status === "runtime_error" ||
+    result.memory_status === "unknown_memory_error" ||
+    result.memory_access_status === "failed" ||
+    result.undefined_behavior_status === "failed" ||
+    result.leak_status === "failed";
+  if (hasMemoryFailure) {
+    return {
+      label: "MEMORY ISSUE",
+      behaviorText: "Behaviour passed",
+      memoryText: "Memory check failed",
+      tone: "failure",
+    };
+  }
+
+  const isIncomplete =
+    result.memory_status === "partial" ||
+    result.memory_status === "unavailable" ||
+    result.memory_access_status === "unavailable" ||
+    result.undefined_behavior_status === "unavailable" ||
+    result.leak_status === "unavailable" ||
+    result.memory_access_status === "possible" ||
+    result.undefined_behavior_status === "possible" ||
+    result.leak_status === "possible";
+  if (isIncomplete) {
+    return {
+      label: "CHECK INCOMPLETE",
+      behaviorText: "Behaviour passed",
+      memoryText: "Memory diagnostics unavailable",
+      tone: "warning",
+    };
+  }
+  return {
+    label: "PASS",
+    behaviorText: "Behaviour passed",
+    memoryText: "Memory checks passed",
+    tone: "success",
+  };
+}
+
+function ExpandableResultSection({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className="mt-3">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+        className="text-xs font-medium text-slate-600 underline decoration-slate-300 underline-offset-4 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+      >
+        {expanded
+          ? label === "Show code"
+            ? "Hide code"
+            : `Hide ${label.toLowerCase()}`
+          : label}
+      </button>
+      {expanded && <div className="mt-2">{children}</div>}
+    </div>
+  );
+}
+
+function MemoryResultDetails({ result }: { result: TestResult }) {
+  if (!result.memory_check_enabled) return null;
+
+  const diagnosis = isObjectScenarioResult(result)
+    ? result.big_five_diagnosis
+    : null;
+  const memoryLine =
+    result.memory_status === "clean"
+      ? ["Passed", "No memory issues detected"] as const
+      : result.memory_status === "leak"
+        ? ["Failed", "Leak detected"] as const
+      : result.memory_status === "partial" ||
+          result.memory_status === "unavailable"
+        ? ["Incomplete", "Leak checking unavailable"] as const
+        : ["Failed", result.memory_summary ?? "Memory issue detected"] as const;
+  const firstRange = diagnosis?.suspicious_ranges[0] ?? null;
+  const statusLabel = (status: string) =>
+    status === "clean"
+      ? "Clean"
+      : status === "failed"
+        ? "Failed"
+        : status === "unavailable"
+          ? "Unavailable"
+          : status === "possible"
+            ? "Possible issue"
+            : "Not run";
+
+  return (
+    <>
+      <div className="mt-3 border-t border-slate-200 pt-3 text-xs">
+        <p className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="font-medium text-slate-700">Memory check</span>
+          <span
+            className={
+              memoryLine[0] === "Passed"
+                ? "font-medium text-emerald-700"
+                : memoryLine[0] === "Failed"
+                  ? "font-medium text-rose-700"
+                  : "font-medium text-amber-700"
+            }
+          >
+            {memoryLine[0]}
+          </span>
+          <span className="text-slate-500">{memoryLine[1]}</span>
+        </p>
+      </div>
+
+      {diagnosis && (
+        <section
+          aria-label="Big Five diagnosis"
+          className={`mt-3 rounded-md border p-3 ${
+            diagnosis.confidence === "confirmed"
+              ? "border-rose-200"
+              : "border-amber-200"
+          }`}
+        >
+          <p
+            className={`text-[11px] font-semibold uppercase tracking-wide ${
+              diagnosis.confidence === "confirmed"
+                ? "text-rose-700"
+                : "text-amber-700"
+            }`}
+          >
+            {diagnosis.confidence === "confirmed"
+              ? "Confirmed issue"
+              : diagnosis.confidence === "likely"
+                ? "Likely issue"
+                : "Possible issue"}
+          </p>
+          <h4 className="mt-1 text-sm font-semibold text-slate-800">
+            {diagnosis.title}
+          </h4>
+          <p className="mt-1 text-xs leading-5 text-slate-600">
+            {diagnosis.summary}
+          </p>
+          {firstRange && (
+            <p className="mt-2 text-xs font-medium text-slate-600">
+              Location: line {firstRange.start_line}
+              {firstRange.end_line !== firstRange.start_line
+                ? `–${firstRange.end_line}`
+                : ""}
+            </p>
+          )}
+          <p className="mt-2 text-xs leading-5 text-slate-600">
+            <span className="font-medium text-slate-700">Next step:</span>{" "}
+            {diagnosis.suggested_direction}
+          </p>
+          {firstRange && (
+            <ExpandableResultSection label="Show code">
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+                {firstRange.snippet}
+              </pre>
+            </ExpandableResultSection>
+          )}
+        </section>
+      )}
+
+      <ExpandableResultSection label="Technical details">
+        <dl className="grid gap-1 text-xs text-slate-600">
+          <div className="flex justify-between gap-3">
+            <dt>Memory access check</dt>
+            <dd>{statusLabel(result.memory_access_status)}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt>Undefined behaviour check</dt>
+            <dd>{statusLabel(result.undefined_behavior_status)}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt>Leak check</dt>
+            <dd>{statusLabel(result.leak_status)}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt>Provider</dt>
+            <dd>{result.execution_provider}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt>Tool</dt>
+            <dd>{result.memory_tool}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt>Exit code</dt>
+            <dd>{result.exit_code ?? "Not available"}</dd>
+          </div>
+          {isObjectScenarioResult(result) && (
+            <div className="flex justify-between gap-3">
+              <dt>Cleanup/destruction</dt>
+              <dd>{result.destruction_failed ? "Failed" : "Completed"}</dd>
+            </div>
+          )}
+        </dl>
+        {diagnosis && diagnosis.evidence.length > 0 && (
+          <div className="mt-3">
+            <p className="text-xs font-medium text-slate-700">Evidence</p>
+            <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600">
+              {diagnosis.evidence.map((evidence) => (
+                <li key={evidence}>{evidence}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {diagnosis && diagnosis.suspicious_ranges.length > 0 && (
+          <div className="mt-3">
+            <p className="text-xs font-medium text-slate-700">
+              Source locations
+            </p>
+            <ul className="mt-1 space-y-1 text-xs leading-5 text-slate-600">
+              {diagnosis.suspicious_ranges.map((range) => (
+                <li key={`${range.start_line}-${range.end_line}`}>
+                  Line {range.start_line}
+                  {range.end_line !== range.start_line
+                    ? `–${range.end_line}`
+                    : ""}
+                  : {range.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {result.leaked_bytes !== null &&
+          result.leaked_allocations !== null && (
+            <p className="mt-3 text-xs leading-5 text-slate-600">
+              {result.leak_kind === "possible"
+                ? "Possibly lost"
+                : "Definitely lost"}
+              : {result.leaked_bytes} bytes in {result.leaked_allocations}{" "}
+              allocation{result.leaked_allocations === 1 ? "" : "s"}
+            </p>
+          )}
+        {result.memory_diagnostics && (
+          <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+            {result.memory_diagnostics}
+          </pre>
+        )}
+        {result.stderr && (
+          <div className="mt-3">
+            <p className="text-xs font-medium text-slate-700">Runtime stderr</p>
+            <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+              {result.stderr}
+            </pre>
+          </div>
+        )}
+      </ExpandableResultSection>
+    </>
+  );
+}
+
+function ObjectScenarioSteps({ result }: { result: ObjectScenarioTestResult }) {
+  const renderStep = (step: ObjectScenarioTestResult["steps"][number]) => (
+    <div
+      key={`${result.name}-step-${step.index}`}
+      className="border-t border-slate-200 pt-2"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+            Step {step.index + 1}
+          </p>
+          <p className="mt-0.5 break-words font-mono text-xs text-slate-800">
+            {step.expression || step.method}
+            {step.result_object_name ? ` → ${step.result_object_name}` : ""}
+          </p>
+        </div>
+        <span
+          className={`shrink-0 text-[11px] font-medium ${
+            step.status === "not_executed"
+              ? "text-slate-500"
+              : step.passed
+                ? "text-emerald-700"
+                : "text-rose-700"
+          }`}
+        >
+          {step.status === "not_executed"
+            ? "NOT EXECUTED"
+            : step.passed
+              ? "PASS"
+              : "FAIL"}
+        </span>
+      </div>
+      {[step.return_result, step.stdout_result]
+        .filter(
+          (
+            channel,
+          ): channel is NonNullable<typeof channel> => channel !== null,
+        )
+        .map((channel, channelIndex) => (
+          <div key={channelIndex} className="mt-2">
+            <p className="text-[11px] font-medium text-slate-500">
+              {channel === step.return_result ? "Return value" : "Method output"}
+            </p>
+            <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
+              <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                Expected: {channel.expected || "(empty)"}
+              </pre>
+              <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
+                Actual: {channel.actual || "(empty)"}
+              </pre>
+            </div>
+          </div>
+        ))}
+    </div>
+  );
+  const passedSteps = result.steps.filter(
+    (step) => step.status === "completed" && step.passed,
+  );
+  const visibleSteps = result.steps.filter(
+    (step) => step.status !== "completed" || !step.passed,
+  );
+
+  return (
+    <>
+      {visibleSteps.map(renderStep)}
+      {passedSteps.length > 0 && (
+        <details className="border-t border-slate-200 pt-2">
+          <summary className="cursor-pointer text-xs font-medium text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900">
+            Show {passedSteps.length} passed step
+            {passedSteps.length === 1 ? "" : "s"}
+          </summary>
+          <div className="mt-2 space-y-2">{passedSteps.map(renderStep)}</div>
+        </details>
+      )}
+    </>
+  );
+}
+
 function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
   if (diagnostic.severity === "warning") return "Warning";
 
@@ -261,10 +656,12 @@ export default function EditorPage() {
     null,
   );
   const [testRunError, setTestRunError] = useState<string | null>(null);
+  const [testRunErrorCode, setTestRunErrorCode] = useState<string | null>(null);
   const [isRunningTests, setIsRunningTests] = useState(false);
   const [comparisonMode, setComparisonMode] = useState<
     "whitespace_tolerant" | "exact"
   >("whitespace_tolerant");
+  const [runMemoryChecks, setRunMemoryChecks] = useState(false);
   const [testMode, setTestMode] = useState<TestModeAnalysis | null>(null);
   const [testTarget, setTestTarget] = useState<TestTargetKind | null>(null);
   const [objectScenarios, setObjectScenarios] = useState<
@@ -635,6 +1032,7 @@ export default function EditorPage() {
     setActiveTab("tests");
     setIsRunningTests(true);
     setTestRunError(null);
+    setTestRunErrorCode(null);
     setTestRunResult(null);
 
     try {
@@ -653,6 +1051,7 @@ export default function EditorPage() {
               language: "cpp" as const,
               target_function: selectedFunction!.id,
               comparison_mode: comparisonMode,
+              run_memory_checks: runMemoryChecks,
               tests: testCases.map((test) => ({
                 name: test.name,
                 arguments: test.arguments,
@@ -684,6 +1083,7 @@ export default function EditorPage() {
                 code: currentCode,
                 language: "cpp" as const,
                 comparison_mode: comparisonMode,
+                run_memory_checks: runMemoryChecks,
                 tests: objectScenarios.map((scenario) => {
                   const classByObjectId = new Map(
                     scenario.objects.map((object) => [
@@ -785,6 +1185,7 @@ export default function EditorPage() {
               code: currentCode,
               language: "cpp" as const,
               comparison_mode: comparisonMode,
+              run_memory_checks: runMemoryChecks,
               tests: testCases.map(({ name, stdin, expected_stdout }) => ({
                 name,
                 stdin,
@@ -800,6 +1201,9 @@ export default function EditorPage() {
         error instanceof Error
           ? error.message
           : "The backend could not run the tests.",
+      );
+      setTestRunErrorCode(
+        error instanceof RunTestsRequestError ? error.code : null,
       );
     } finally {
       if (isMountedRef.current) {
@@ -1490,6 +1894,29 @@ export default function EditorPage() {
                     </div>
                   )}
 
+                  <label className="mt-3 flex items-start gap-2 rounded-md border border-slate-200 p-2.5">
+                    <input
+                      type="checkbox"
+                      checked={runMemoryChecks}
+                      disabled={isRunningTests}
+                      onChange={(event) => {
+                        setRunMemoryChecks(event.target.checked);
+                        setTestRunResult(null);
+                        setTestRunError(null);
+                      }}
+                      className="mt-0.5 h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-2 focus:ring-slate-300"
+                    />
+                    <span>
+                      <span className="block text-xs font-medium text-slate-700">
+                        Run memory checks
+                      </span>
+                      <span className="mt-0.5 block text-[11px] leading-4 text-slate-500">
+                        Runs C++ memory diagnostics in an isolated Linux
+                        environment. This may take longer.
+                      </span>
+                    </span>
+                  </label>
+
                   {testTarget === "function" &&
                     testMode &&
                     testMode.functions.length > 1 && (
@@ -1938,7 +2365,9 @@ export default function EditorPage() {
                       className="mt-4 border-l-2 border-rose-300 pl-3"
                     >
                       <p className="text-sm font-medium text-slate-800">
-                        Test runner unavailable
+                        {testRunErrorCode === "memory_compile_timeout"
+                          ? "Memory-check compilation timed out"
+                          : "Test runner unavailable"}
                       </p>
                       <p className="mt-1 text-xs leading-5 text-slate-600">
                         {testRunError}
@@ -1975,38 +2404,74 @@ export default function EditorPage() {
                       </p>
                     </div>
                   )}
+                  {testRunResult?.memory_status === "unavailable" &&
+                    testRunResult.tests.length === 0 && (
+                    <div
+                      role="status"
+                      className="mt-4 rounded-md border border-amber-200 p-3"
+                    >
+                      <p className="text-sm font-medium text-amber-700">
+                        CHECK INCOMPLETE — Scenario 1
+                      </p>
+                      <p className="mt-2 text-xs text-slate-600">
+                        Behaviour passed
+                      </p>
+                      <p className="text-xs text-slate-600">
+                        Memory diagnostics unavailable
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-slate-600">
+                        {testRunResult.memory_summary ??
+                          "The current compiler does not support the required sanitizer flags."}
+                      </p>
+                    </div>
+                  )}
                   {testRunResult && testRunResult.tests.length > 0 && (
                     <ul className="mt-4 space-y-3" aria-label="Test results">
-                      {testRunResult.tests.map((result, index) => (
+                      {testRunResult.tests.map((result, index) => {
+                        const presentation = getResultPresentation(result);
+                        return (
                         <li
                           key={`${result.name}-${index}`}
                           className={`rounded-md border p-3 ${
-                            result.passed
+                            presentation.tone === "success"
                               ? "border-emerald-100"
-                              : "border-rose-100"
+                              : presentation.tone === "warning"
+                                ? "border-amber-200"
+                                : "border-rose-100"
                           }`}
                         >
                           <div className="flex items-center justify-between gap-3">
                             <p className="text-sm font-medium text-slate-800">
                               <span
                                 className={
-                                  result.passed
+                                  presentation.tone === "success"
                                     ? "text-emerald-700"
-                                    : "text-rose-700"
+                                    : presentation.tone === "warning"
+                                      ? "text-amber-700"
+                                      : "text-rose-700"
                                 }
                               >
-                                {result.passed ? "PASS" : "FAIL"}
+                                {presentation.label}
                               </span>
                               {" — "}
                               {result.name}
                             </p>
-                            {!result.timed_out &&
+                            {!result.memory_check_enabled &&
+                              !result.timed_out &&
                               result.exit_code !== null && (
                                 <span className="text-xs tabular-nums text-slate-500">
                                   Exit {result.exit_code}
                                 </span>
                               )}
                           </div>
+                          {result.memory_check_enabled && (
+                            <div className="mt-2 text-xs leading-5 text-slate-600">
+                              <p>{presentation.behaviorText}</p>
+                              {presentation.memoryText && (
+                                <p>{presentation.memoryText}</p>
+                              )}
+                            </div>
+                          )}
                           {isObjectScenarioResult(result) && (
                             <div className="mt-3 space-y-2">
                               <div className="rounded bg-slate-50 p-2">
@@ -2032,84 +2497,14 @@ export default function EditorPage() {
                                   </p>
                                 ))}
                               </div>
-                              {result.steps.map((step) => (
-                                <div
-                                  key={`${result.name}-step-${step.index}`}
-                                  className="border-t border-slate-200 pt-2"
-                                >
-                                  <div className="flex items-center justify-between gap-2">
-                                    <div>
-                                      <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
-                                        Step {step.index + 1}
-                                      </p>
-                                      <p className="mt-0.5 break-words font-mono text-xs text-slate-800">
-                                        {step.expression || step.method}
-                                        {step.result_object_name
-                                          ? ` → ${step.result_object_name}`
-                                          : ""}
-                                      </p>
-                                    </div>
-                                    <span
-                                      className={`text-[11px] font-medium ${
-                                        step.status === "not_executed"
-                                          ? "text-slate-500"
-                                          : step.passed
-                                            ? "text-emerald-700"
-                                            : "text-rose-700"
-                                      }`}
-                                    >
-                                      {step.status === "not_executed"
-                                        ? "NOT EXECUTED"
-                                        : step.passed
-                                          ? "PASS"
-                                          : "FAIL"}
-                                    </span>
-                                  </div>
-                                  {step.status === "completed" &&
-                                    !step.return_result &&
-                                    !step.stdout_result && (
-                                      <p className="mt-1 text-xs text-slate-500">
-                                        Completed successfully
-                                      </p>
-                                    )}
-                                  {[step.return_result, step.stdout_result]
-                                    .filter(
-                                      (
-                                        channel,
-                                      ): channel is NonNullable<
-                                        typeof channel
-                                      > => channel !== null,
-                                    )
-                                    .map((channel, channelIndex) => (
-                                      <div
-                                        key={channelIndex}
-                                        className="mt-2"
-                                      >
-                                        <p className="text-[11px] font-medium text-slate-500">
-                                          {channel === step.return_result
-                                            ? "Return value"
-                                            : "Method output"}
-                                        </p>
-                                        <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
-                                          <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
-                                            Expected:{" "}
-                                            {channel.expected || "(empty)"}
-                                          </pre>
-                                          <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
-                                            Actual:{" "}
-                                            {channel.actual || "(empty)"}
-                                          </pre>
-                                        </div>
-                                      </div>
-                                    ))}
-                                </div>
-                              ))}
-                              {result.destruction_failed && (
+                              <ObjectScenarioSteps result={result} />
+                              {result.destruction_failed &&
+                                !result.memory_check_enabled && (
                                 <p className="border-t border-slate-200 pt-2 text-xs font-medium text-rose-700">
                                   Scenario steps completed, but object
                                   destruction failed.
                                 </p>
-                              )}
+                                )}
                             </div>
                           )}
                           {isFunctionCombinedResult(result) && (
@@ -2365,6 +2760,85 @@ export default function EditorPage() {
                               Output values match, but formatting differs.
                             </p>
                           ) : null}
+                          <MemoryResultDetails result={result} />
+                          {isObjectScenarioResult(result) &&
+                            result.big_five_diagnosis &&
+                            !result.memory_check_enabled && (
+                              <section
+                                aria-label="Big Five diagnosis"
+                                className={`mt-3 rounded-md border p-3 ${
+                                  result.big_five_diagnosis.confidence ===
+                                  "confirmed"
+                                    ? "border-rose-200 bg-rose-50/30"
+                                    : result.big_five_diagnosis.confidence ===
+                                        "likely"
+                                      ? "border-amber-200 bg-amber-50/30"
+                                      : "border-slate-200 bg-slate-50/50"
+                                }`}
+                              >
+                                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                  {result.big_five_diagnosis.confidence ===
+                                  "confirmed"
+                                    ? "Confirmed issue"
+                                    : result.big_five_diagnosis.confidence ===
+                                        "likely"
+                                      ? "Likely issue"
+                                      : "Possible issue"}
+                                </p>
+                                <h4 className="mt-1 text-sm font-semibold text-slate-800">
+                                  {result.big_five_diagnosis.title}
+                                </h4>
+                                <p className="mt-2 text-xs leading-5 text-slate-600">
+                                  {result.big_five_diagnosis.summary}
+                                </p>
+                                {result.big_five_diagnosis.suspicious_ranges.map(
+                                  (range) => (
+                                    <div
+                                      key={`${range.start_line}-${range.end_line}`}
+                                      className="mt-3"
+                                    >
+                                      <p className="text-xs font-medium text-slate-600">
+                                        Suspicious code — line{" "}
+                                        {range.start_line}
+                                        {range.end_line !== range.start_line
+                                          ? `–${range.end_line}`
+                                          : ""}
+                                      </p>
+                                      <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+                                        {range.snippet}
+                                      </pre>
+                                      <p className="mt-1 text-[11px] leading-4 text-slate-500">
+                                        {range.reason}
+                                      </p>
+                                    </div>
+                                  ),
+                                )}
+                                <p className="mt-3 text-xs leading-5 text-slate-600">
+                                  <span className="font-medium text-slate-700">
+                                    Suggested direction:
+                                  </span>{" "}
+                                  {
+                                    result.big_five_diagnosis
+                                      .suggested_direction
+                                  }
+                                </p>
+                                {result.big_five_diagnosis.evidence.length >
+                                  0 && (
+                                  <details className="mt-2">
+                                    <summary className="cursor-pointer text-xs font-medium text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900">
+                                      Why InkToCode thinks this
+                                    </summary>
+                                    <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600">
+                                      {result.big_five_diagnosis.evidence.map(
+                                        (evidence) => (
+                                          <li key={evidence}>{evidence}</li>
+                                        ),
+                                      )}
+                                    </ul>
+                                  </details>
+                                )}
+                              </section>
+                            )}
                           {!result.timed_out &&
                             !result.output_limited &&
                             !result.passed &&
@@ -2391,7 +2865,7 @@ export default function EditorPage() {
                               </div>
                             </div>
                           )}
-                          {result.stderr && (
+                          {result.stderr && !result.memory_check_enabled && (
                             <details className="mt-3">
                               <summary className="cursor-pointer text-xs font-medium text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900">
                                 Show runtime stderr
@@ -2402,7 +2876,8 @@ export default function EditorPage() {
                             </details>
                           )}
                         </li>
-                      ))}
+                        );
+                      })}
                     </ul>
                   )}
                 </div>

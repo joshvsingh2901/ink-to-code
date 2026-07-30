@@ -194,6 +194,76 @@ This local subprocess isolation is for development only. It is not a
 production-grade sandbox; container or equivalent isolation is required before
 running arbitrary code for real users.
 
+### Isolated Linux memory runner
+
+Memory diagnostics prefer the dedicated Linux runner when
+`CPP_EXECUTION_PROVIDER=auto` and Docker is available. Install Docker Desktop,
+then build the fixed local image from the repository root:
+
+```bash
+docker build -t inktocode-cpp-runner ./runner
+```
+
+Configure `backend/.env`:
+
+```dotenv
+CPP_EXECUTION_PROVIDER=auto
+CPP_RUNNER_IMAGE=inktocode-cpp-runner
+CPP_RUNNER_MEMORY=256m
+CPP_RUNNER_CPUS=1.0
+CPP_RUNNER_PIDS=32
+CPP_RUNNER_USER=runner
+CPP_DOCKER_COMPILE_TIMEOUT_SECONDS=30
+CPP_DOCKER_RUN_TIMEOUT_SECONDS=8
+CPP_DOCKER_VALGRIND_TIMEOUT_SECONDS=20
+```
+
+Docker sanitizer compilation, student-program execution, and Valgrind use
+separate backend-only time limits. The compile limit includes container and
+compiler startup. The shorter run limit applies only to student execution;
+these values are never accepted from frontend requests.
+
+Start the backend normally:
+
+```bash
+cd backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --port 8000
+```
+
+Check Docker and image readiness with:
+
+```bash
+docker version
+docker image inspect inktocode-cpp-runner
+```
+
+Run the provider tests, including capability-gated integration coverage:
+
+```bash
+cd backend
+source .venv/bin/activate
+pytest tests/test_execution_providers.py
+```
+
+After changing `runner/Dockerfile` or `runner/runner.py`, rebuild explicitly:
+
+```bash
+docker build --no-cache -t inktocode-cpp-runner ./runner
+```
+
+In `auto` mode, unavailable Docker falls back to the honest host capability
+result. In `docker` mode, an unavailable daemon or missing image produces an
+infrastructure-unavailable response and never falls back. Runner containers
+have no network, run as a non-root user, mount only one generated temporary
+directory, and use fixed CPU, memory, process, filesystem, and timeout limits.
+
+This local Docker runner is a development-stage isolation improvement, not a
+complete production arbitrary-code execution platform. Public deployment
+requires a dedicated security review, hardened orchestration, monitoring, and
+additional isolation controls. Never use privileged containers for submitted
+code.
+
 ### Object scenario testing
 
 Object scenario mode discovers usable inline public constructors and public

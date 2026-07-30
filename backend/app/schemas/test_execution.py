@@ -183,6 +183,7 @@ class ProgramRunTestsRequest(BaseModel):
     comparison_mode: Literal["whitespace_tolerant", "exact"] = (
         "whitespace_tolerant"
     )
+    run_memory_checks: bool = False
     tests: list[ProgramTestCase] = Field(min_length=1, max_length=10)
 
 
@@ -194,6 +195,7 @@ class FunctionRunTestsRequest(BaseModel):
     comparison_mode: Literal["whitespace_tolerant", "exact"] = (
         "whitespace_tolerant"
     )
+    run_memory_checks: bool = False
     tests: list[FunctionTestCase] = Field(min_length=1, max_length=10)
 
 
@@ -288,6 +290,7 @@ class ObjectScenarioRunTestsRequest(BaseModel):
     comparison_mode: Literal["whitespace_tolerant", "exact"] = (
         "whitespace_tolerant"
     )
+    run_memory_checks: bool = False
     tests: list[ObjectScenarioTestCase] = Field(min_length=1, max_length=10)
 
 
@@ -299,7 +302,47 @@ RunTestsRequest = Annotated[
 ]
 
 
-class ProgramTestResult(BaseModel):
+MemoryStatus = Literal[
+    "not_run",
+    "clean",
+    "partial",
+    "leak",
+    "use_after_free",
+    "double_free",
+    "invalid_free",
+    "buffer_overflow",
+    "undefined_behavior",
+    "runtime_error",
+    "unavailable",
+    "unknown_memory_error",
+]
+SanitizerCheckStatus = Literal[
+    "not_run", "clean", "failed", "unavailable", "possible"
+]
+
+
+class MemoryDiagnosticResult(BaseModel):
+    memory_check_enabled: bool = False
+    memory_status: MemoryStatus = "not_run"
+    memory_summary: str | None = None
+    memory_diagnostics: str | None = None
+    address_sanitizer_available: bool | None = None
+    undefined_behavior_sanitizer_available: bool | None = None
+    leak_sanitizer_available: bool | None = None
+    memory_access_status: SanitizerCheckStatus = "not_run"
+    undefined_behavior_status: SanitizerCheckStatus = "not_run"
+    leak_status: SanitizerCheckStatus = "not_run"
+    execution_provider: Literal["host", "docker"] = "host"
+    memory_tool: Literal[
+        "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
+    ] = "none"
+    container_runtime_available: bool | None = None
+    leaked_bytes: int | None = None
+    leaked_allocations: int | None = None
+    leak_kind: str | None = None
+
+
+class ProgramTestResult(MemoryDiagnosticResult):
     name: str
     passed: bool
     expected_stdout: str
@@ -316,7 +359,7 @@ class ProgramTestResult(BaseModel):
     ]
 
 
-class FunctionTestResult(BaseModel):
+class FunctionTestResult(MemoryDiagnosticResult):
     name: str
     passed: bool
     arguments: list[str]
@@ -330,7 +373,7 @@ class FunctionTestResult(BaseModel):
     match_type: Literal["exact", "whitespace_normalized", "mismatch"]
 
 
-class FunctionOutputTestResult(BaseModel):
+class FunctionOutputTestResult(MemoryDiagnosticResult):
     name: str
     passed: bool
     arguments: list[str]
@@ -348,7 +391,7 @@ class FunctionOutputTestResult(BaseModel):
     ]
 
 
-class FunctionMutationTestResult(BaseModel):
+class FunctionMutationTestResult(MemoryDiagnosticResult):
     name: str
     passed: bool
     initial_arguments: dict[str, str]
@@ -384,7 +427,7 @@ class FunctionMutationChannelResult(BaseModel):
     mismatch_detail: str | None = None
 
 
-class FunctionCombinedTestResult(BaseModel):
+class FunctionCombinedTestResult(MemoryDiagnosticResult):
     name: str
     passed: bool
     arguments: list[str]
@@ -423,7 +466,33 @@ class ObjectScenarioStepResult(BaseModel):
     stdout_result: FunctionChannelResult | None = None
 
 
-class ObjectScenarioTestResult(BaseModel):
+class SuspiciousSourceRange(BaseModel):
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    snippet: str
+    reason: str
+
+
+class BigFiveDiagnosis(BaseModel):
+    title: str
+    confidence: Literal["confirmed", "likely", "possible"]
+    summary: str
+    evidence: list[str] = Field(default_factory=list)
+    suspicious_ranges: list[SuspiciousSourceRange] = Field(
+        default_factory=list
+    )
+    suggested_direction: str
+    related_operation: Literal[
+        "copy_constructor",
+        "copy_assignment",
+        "self_assignment",
+        "move_constructor",
+        "move_assignment",
+        "destructor",
+    ] | None = None
+
+
+class ObjectScenarioTestResult(MemoryDiagnosticResult):
     name: str
     passed: bool
     class_name: str
@@ -440,6 +509,7 @@ class ObjectScenarioTestResult(BaseModel):
     timed_out: bool
     output_limited: bool
     match_type: Literal["exact", "mismatch"]
+    big_five_diagnosis: BigFiveDiagnosis | None = None
 
 
 class RunTestsResponse(BaseModel):
@@ -448,6 +518,18 @@ class RunTestsResponse(BaseModel):
     compile_error: str | None = None
     input_error: str | None = None
     unsupported_error: str | None = None
+    memory_check_enabled: bool = False
+    memory_status: MemoryStatus = "not_run"
+    memory_summary: str | None = None
+    memory_diagnostics: str | None = None
+    address_sanitizer_available: bool | None = None
+    undefined_behavior_sanitizer_available: bool | None = None
+    leak_sanitizer_available: bool | None = None
+    execution_provider: Literal["host", "docker"] = "host"
+    memory_tool: Literal[
+        "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
+    ] = "none"
+    container_runtime_available: bool | None = None
     function: FunctionResponse | None = None
     tests: list[
         FunctionTestResult

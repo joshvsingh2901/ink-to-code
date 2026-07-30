@@ -4,6 +4,11 @@ import type {
   ObjectClass,
   ObjectOperatorParameter,
 } from "@/lib/testExecution";
+import {
+  appendScenarioStep,
+  removeScenarioStep,
+  visibleScenarioStepNumber,
+} from "@/lib/objectScenarioState";
 
 export type EditableScenarioObject = {
   id: string;
@@ -347,10 +352,10 @@ export function ObjectScenarioTests({
                 onClick={() =>
                   updateScenario(scenario.id, (current) => ({
                     ...current,
-                    steps: [
-                      ...current.steps,
+                    steps: appendScenarioStep(
+                      current.steps,
                       newStep(current.objects[0]?.id ?? ""),
-                    ],
+                    ),
                   }))
                 }
                 className="rounded-md border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-700 focus-visible:outline-2 focus-visible:outline-slate-900 disabled:opacity-40"
@@ -429,7 +434,9 @@ export function ObjectScenarioTests({
                     className="rounded-md border border-slate-200 p-2.5"
                   >
                     <div className="flex items-center justify-between">
-                      <p className="text-xs font-semibold">Step {stepIndex + 1}</p>
+                      <p className="text-xs font-semibold">
+                        Step {visibleScenarioStepNumber(stepIndex)}
+                      </p>
                       <div className="flex gap-1">
                         <button
                           type="button"
@@ -470,16 +477,9 @@ export function ObjectScenarioTests({
                           onClick={() =>
                             updateScenario(scenario.id, (current) => ({
                               ...current,
-                              steps: current.steps.filter(
-                                (item) =>
-                                  item.id !== step.id &&
-                                  item.target_object_id !==
-                                    step.result_object_id &&
-                                  item.source_object_id !==
-                                    step.result_object_id &&
-                                  !item.operands.includes(
-                                    step.result_object_id,
-                                  ),
+                              steps: removeScenarioStep(
+                                current.steps,
+                                step.id,
                               ),
                             }))
                           }

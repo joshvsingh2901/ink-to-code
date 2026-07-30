@@ -177,12 +177,53 @@ type ResultBase = {
   exit_code: number | null;
   timed_out: boolean;
   output_limited: boolean;
+  memory_check_enabled: boolean;
+  memory_status: MemoryStatus;
+  memory_summary: string | null;
+  memory_diagnostics: string | null;
+  address_sanitizer_available: boolean | null;
+  undefined_behavior_sanitizer_available: boolean | null;
+  leak_sanitizer_available: boolean | null;
+  memory_access_status: SanitizerCheckStatus;
+  undefined_behavior_status: SanitizerCheckStatus;
+  leak_status: SanitizerCheckStatus;
+  execution_provider: "host" | "docker";
+  memory_tool:
+    | "none"
+    | "sanitizer"
+    | "valgrind"
+    | "sanitizer_and_valgrind";
+  container_runtime_available: boolean | null;
+  leaked_bytes: number | null;
+  leaked_allocations: number | null;
+  leak_kind: string | null;
   match_type:
     | "exact"
     | "whitespace_normalized"
     | "formatting_mismatch"
     | "mismatch";
 };
+
+export type MemoryStatus =
+  | "not_run"
+  | "clean"
+  | "partial"
+  | "leak"
+  | "use_after_free"
+  | "double_free"
+  | "invalid_free"
+  | "buffer_overflow"
+  | "undefined_behavior"
+  | "runtime_error"
+  | "unavailable"
+  | "unknown_memory_error";
+
+export type SanitizerCheckStatus =
+  | "not_run"
+  | "clean"
+  | "failed"
+  | "unavailable"
+  | "possible";
 
 export type ProgramTestResult = ResultBase & {
   expected_stdout: string;
@@ -261,6 +302,29 @@ export type ObjectScenarioTestResult = ResultBase & {
     return_result: FunctionChannelResult | null;
     stdout_result: FunctionChannelResult | null;
   }>;
+  big_five_diagnosis: BigFiveDiagnosis | null;
+};
+
+export type BigFiveDiagnosis = {
+  title: string;
+  confidence: "confirmed" | "likely" | "possible";
+  summary: string;
+  evidence: string[];
+  suspicious_ranges: Array<{
+    start_line: number;
+    end_line: number;
+    snippet: string;
+    reason: string;
+  }>;
+  suggested_direction: string;
+  related_operation:
+    | "copy_constructor"
+    | "copy_assignment"
+    | "self_assignment"
+    | "move_constructor"
+    | "move_assignment"
+    | "destructor"
+    | null;
 };
 
 export type RunTestsResult = {
@@ -269,6 +333,20 @@ export type RunTestsResult = {
   compile_error: string | null;
   input_error: string | null;
   unsupported_error: string | null;
+  memory_check_enabled: boolean;
+  memory_status: MemoryStatus;
+  memory_summary: string | null;
+  memory_diagnostics: string | null;
+  address_sanitizer_available: boolean | null;
+  undefined_behavior_sanitizer_available: boolean | null;
+  leak_sanitizer_available: boolean | null;
+  execution_provider: "host" | "docker";
+  memory_tool:
+    | "none"
+    | "sanitizer"
+    | "valgrind"
+    | "sanitizer_and_valgrind";
+  container_runtime_available: boolean | null;
   function: FunctionDescriptor | null;
   tests: Array<
     ProgramTestResult | FunctionTestResult | FunctionOutputTestResult
@@ -284,6 +362,7 @@ export type RunTestsRequest =
       code: string;
       language: "cpp";
       comparison_mode: "whitespace_tolerant" | "exact";
+      run_memory_checks?: boolean;
       tests: ProgramTestInput[];
     }
   | {
@@ -292,6 +371,7 @@ export type RunTestsRequest =
       language: "cpp";
       target_function: string;
       comparison_mode: "whitespace_tolerant" | "exact";
+      run_memory_checks?: boolean;
       tests: FunctionCombinedTestInput[];
     }
   | {
@@ -299,13 +379,17 @@ export type RunTestsRequest =
       code: string;
       language: "cpp";
       comparison_mode: "whitespace_tolerant" | "exact";
+      run_memory_checks?: boolean;
       tests: ObjectScenarioTestInput[];
     };
 
-type ApiError = { error?: { message?: string } };
+type ApiError = { error?: { code?: string; message?: string } };
 
 export class RunTestsRequestError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code: string | null = null,
+  ) {
     super(message);
     this.name = "RunTestsRequestError";
   }
@@ -475,7 +559,58 @@ function isResultBase(value: unknown): value is ResultBase {
     (result.exit_code === null || typeof result.exit_code === "number") &&
     typeof result.timed_out === "boolean" &&
     typeof result.output_limited === "boolean" &&
+    typeof result.memory_check_enabled === "boolean" &&
+    isMemoryStatus(result.memory_status) &&
+    (result.memory_summary === null ||
+      typeof result.memory_summary === "string") &&
+    (result.memory_diagnostics === null ||
+      typeof result.memory_diagnostics === "string") &&
+    (result.address_sanitizer_available === null ||
+      typeof result.address_sanitizer_available === "boolean") &&
+    (result.undefined_behavior_sanitizer_available === null ||
+      typeof result.undefined_behavior_sanitizer_available === "boolean") &&
+    (result.leak_sanitizer_available === null ||
+      typeof result.leak_sanitizer_available === "boolean") &&
+    isSanitizerCheckStatus(result.memory_access_status) &&
+    isSanitizerCheckStatus(result.undefined_behavior_status) &&
+    isSanitizerCheckStatus(result.leak_status) &&
+    ["host", "docker"].includes(result.execution_provider ?? "") &&
+    ["none", "sanitizer", "valgrind", "sanitizer_and_valgrind"].includes(
+      result.memory_tool ?? "",
+    ) &&
+    (result.container_runtime_available === null ||
+      typeof result.container_runtime_available === "boolean") &&
+    (result.leaked_bytes === null ||
+      typeof result.leaked_bytes === "number") &&
+    (result.leaked_allocations === null ||
+      typeof result.leaked_allocations === "number") &&
+    (result.leak_kind === null || typeof result.leak_kind === "string") &&
     isMatchType(result.match_type)
+  );
+}
+
+function isMemoryStatus(value: unknown): value is MemoryStatus {
+  return [
+    "not_run",
+    "clean",
+    "partial",
+    "leak",
+    "use_after_free",
+    "double_free",
+    "invalid_free",
+    "buffer_overflow",
+    "undefined_behavior",
+    "runtime_error",
+    "unavailable",
+    "unknown_memory_error",
+  ].includes(typeof value === "string" ? value : "");
+}
+
+function isSanitizerCheckStatus(
+  value: unknown,
+): value is SanitizerCheckStatus {
+  return ["not_run", "clean", "failed", "unavailable", "possible"].includes(
+    typeof value === "string" ? value : "",
   );
 }
 
@@ -549,6 +684,8 @@ function isTestResult(
       (item) => typeof item === "string",
     ) &&
     typeof objectResult.destruction_failed === "boolean" &&
+    (objectResult.big_five_diagnosis === null ||
+      isBigFiveDiagnosis(objectResult.big_five_diagnosis)) &&
     (objectResult.failed_step_index === null ||
       typeof objectResult.failed_step_index === "number") &&
     Array.isArray(objectResult.steps) &&
@@ -590,6 +727,40 @@ function isTestResult(
   );
 }
 
+function isBigFiveDiagnosis(value: unknown): value is BigFiveDiagnosis {
+  if (!value || typeof value !== "object") return false;
+  const diagnosis = value as Partial<BigFiveDiagnosis>;
+  return (
+    typeof diagnosis.title === "string" &&
+    ["confirmed", "likely", "possible"].includes(
+      diagnosis.confidence ?? "",
+    ) &&
+    typeof diagnosis.summary === "string" &&
+    Array.isArray(diagnosis.evidence) &&
+    diagnosis.evidence.every((item) => typeof item === "string") &&
+    Array.isArray(diagnosis.suspicious_ranges) &&
+    diagnosis.suspicious_ranges.every(
+      (range) =>
+        range !== null &&
+        typeof range === "object" &&
+        typeof range.start_line === "number" &&
+        typeof range.end_line === "number" &&
+        typeof range.snippet === "string" &&
+        typeof range.reason === "string",
+    ) &&
+    typeof diagnosis.suggested_direction === "string" &&
+    (diagnosis.related_operation === null ||
+      [
+        "copy_constructor",
+        "copy_assignment",
+        "self_assignment",
+        "move_constructor",
+        "move_assignment",
+        "destructor",
+      ].includes(diagnosis.related_operation ?? ""))
+  );
+}
+
 function isFunctionChannelResult(
   value: unknown,
 ): value is FunctionChannelResult {
@@ -627,6 +798,24 @@ function isRunTestsResult(value: unknown): value is RunTestsResult {
     (result.input_error === null || typeof result.input_error === "string") &&
     (result.unsupported_error === null ||
       typeof result.unsupported_error === "string") &&
+    typeof result.memory_check_enabled === "boolean" &&
+    isMemoryStatus(result.memory_status) &&
+    (result.memory_summary === null ||
+      typeof result.memory_summary === "string") &&
+    (result.memory_diagnostics === null ||
+      typeof result.memory_diagnostics === "string") &&
+    (result.address_sanitizer_available === null ||
+      typeof result.address_sanitizer_available === "boolean") &&
+    (result.undefined_behavior_sanitizer_available === null ||
+      typeof result.undefined_behavior_sanitizer_available === "boolean") &&
+    (result.leak_sanitizer_available === null ||
+      typeof result.leak_sanitizer_available === "boolean") &&
+    ["host", "docker"].includes(result.execution_provider ?? "") &&
+    ["none", "sanitizer", "valgrind", "sanitizer_and_valgrind"].includes(
+      result.memory_tool ?? "",
+    ) &&
+    (result.container_runtime_available === null ||
+      typeof result.container_runtime_available === "boolean") &&
     (result.function === null || isFunctionDescriptor(result.function)) &&
     Array.isArray(result.tests) &&
     result.tests.every(isTestResult)
@@ -668,6 +857,7 @@ async function postJson(path: string, payload: object, signal?: AbortSignal) {
     const apiError = body as ApiError | null;
     throw new RunTestsRequestError(
       apiError?.error?.message ?? "The test runner request failed.",
+      apiError?.error?.code ?? null,
     );
   }
   return body;

@@ -498,3 +498,59 @@ The expected request should contain the current source code in structured JSON, 
 - Moved-to objects may be observed normally; moved-from objects may only be checked through explicitly safe public operations.
 - Destruction must occur naturally through scope.
 - Automatic leak detection and sanitizer reporting remain a separate memory-diagnostics stage.
+
+## Memory diagnostics
+
+- Memory checks are optional and disabled by default.
+- Sanitizer compilation and execution occur only in the backend.
+- Normal and sanitizer execution paths must remain separate.
+- AddressSanitizer and UndefinedBehaviorSanitizer are used where supported.
+- A behavioural PASS with a sanitizer error is still a failed test.
+- Sanitizer-unavailable is distinct from clean and from user-code failure.
+- Temporary paths and internal backend details must be removed from returned diagnostics.
+- Sanitizer output must remain size-limited.
+- Do not silently fall back to an unsanitized run when checks were explicitly requested.
+
+## Big Five educational diagnoses
+
+- Big Five diagnoses supplement, but never replace, behavioural and sanitizer results.
+- Diagnoses use confirmed, likely, or possible confidence levels.
+- Confirmed claims require direct runtime or behavioural evidence.
+- Static ownership inference must remain conservative.
+- Raw pointers are not automatically treated as owning.
+- Recognize common safe RAII, swap, reset, and helper-based patterns.
+- Prefer no diagnosis over a misleading diagnosis.
+- Diagnoses must not change test pass/fail status.
+- Source highlights must use the user's original line numbers and minimal ranges.
+
+## Test-result presentation
+
+- Default result cards must prioritize behavioural outcome, memory outcome, the
+  diagnosed issue, its source location, and the next action.
+- Keep successful scenario steps collapsed by default; failed steps remain
+  visible.
+- Memory diagnostics use one compact summary in the default view. Sanitizer
+  capability, provider, tool, exit status, raw diagnostics, and stderr belong
+  in one collapsed technical-details section.
+- Big Five diagnoses show one concise educational summary. Evidence and
+  diagnostic internals remain secondary.
+- Source excerpts are hidden by default and must use the smallest available
+  suspicious source range.
+- A behavioural pass with a memory failure is presented as a memory issue, not
+  as an ordinary pass or ordinary behavioural failure.
+- Unavailable memory infrastructure is presented as an incomplete check, never
+  as a clean result.
+
+## Isolated C++ execution
+
+- Normal tests use the host execution provider unless configured otherwise.
+- Memory diagnostics prefer an isolated Linux Docker runner.
+- Docker-specific behaviour is isolated behind an execution-provider abstraction.
+- Submitted code must run as a non-root user with no network and strict CPU, memory, process, filesystem, and timeout limits.
+- Never mount the repository, secrets, home directory, or Docker socket.
+- Never use privileged containers.
+- Frontend requests cannot control Docker commands, images, compiler flags, mounts, environment variables, or resource limits.
+- LeakSanitizer and Valgrind capability must be proven with deliberate-leak probes.
+- Infrastructure failures are distinct from student-code failures.
+- All containers and temporary files must be removed after execution.
+- Diagnostics must redact host/container paths and remain size-limited.

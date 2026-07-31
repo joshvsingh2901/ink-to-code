@@ -12,6 +12,7 @@ from pathlib import Path
 
 from app.schemas.test_execution import (
     FunctionResponse,
+    ExceptionOutcomeResult,
     FunctionChannelResult,
     FunctionCombinedTestResult,
     FunctionMutationChannelResult,
@@ -49,6 +50,9 @@ from app.services.function_analysis import (
     ValueType,
     analyze_test_mode,
 )
+from app.services.memory_classifier import classify_memory_findings
+from app.services.memory_runtime_parser import parse_memory_runtime
+from app.services.memory_source_analysis import analyze_memory_source
 from app.services.object_analysis import (
     ObjectClass,
     ObjectConstructor,
@@ -89,6 +93,7 @@ class ProcessOutput:
     step_stdout: tuple[str, ...] = ()
     step_metadata: tuple[str | None, ...] = ()
     progress_index: int | None = None
+    constructor_metadata: str | None = None
     memory_status: str = "not_run"
     memory_summary: str | None = None
     memory_diagnostics: str | None = None
@@ -136,6 +141,8 @@ class PreparedObjectStep:
     source_object_id: str | None = None
     step_type: str = "method"
     result_object_class_id: str | None = None
+    constructor: ObjectConstructor | None = None
+    constructor_class: ObjectClass | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +152,7 @@ class PreparedScenarioObject:
     object_class: ObjectClass
     constructor: ObjectConstructor
     constructor_arguments: tuple[HarnessArgument, ...]
+    expected_outcome: str = "return_void"
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,21 @@ def _file_exceeds_limit(path: Path) -> bool:
         return path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
     except FileNotFoundError:
         return False
+
+
+def _completed_exception_result(path: Path) -> bool:
+    if not path.exists() or _file_exceeds_limit(path):
+        return False
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("process_completed") is True
+        and metadata.get("outcome")
+        in {"threw_standard", "threw_non_standard"}
+    )
 
 
 def _classify_output_match(expected: str, actual: str) -> str:
@@ -260,6 +283,9 @@ def _run_process(
     object_constructor_stdout_path = (
         working_directory / "object-constructor-stdout.txt"
     )
+    object_constructor_result_path = (
+        working_directory / "object-constructor-result.json"
+    )
     object_step_stdout_paths = tuple(
         working_directory / f"object-step-{index}-stdout.txt"
         for index in range(20)
@@ -272,6 +298,7 @@ def _run_process(
     function_stdout_path.unlink(missing_ok=True)
     object_progress_path.unlink(missing_ok=True)
     object_constructor_stdout_path.unlink(missing_ok=True)
+    object_constructor_result_path.unlink(missing_ok=True)
     for path in (*object_step_stdout_paths, *object_step_result_paths):
         path.unlink(missing_ok=True)
     if docker_provider is not None:
@@ -334,6 +361,7 @@ def _run_process(
                     _file_exceeds_limit(result_path)
                 )
                 or _file_exceeds_limit(object_constructor_stdout_path)
+                or _file_exceeds_limit(object_constructor_result_path)
                 or any(
                     _file_exceeds_limit(path)
                     for path in (
@@ -348,6 +376,17 @@ def _run_process(
             time.sleep(0.01)
 
         exit_code = process.wait()
+        if (
+            timed_out
+            and not run_memory_checks
+            and _completed_exception_result(result_path)
+        ):
+            # The action committed a complete exception outcome before later
+            # process teardown exceeded the host deadline. The process has
+            # still been killed and reaped, but teardown must not replace the
+            # completed action with a timeout.
+            timed_out = False
+            exit_code = 0
         stdout_file.flush()
         stderr_file.flush()
         stdout_file.seek(0)
@@ -443,6 +482,14 @@ def _run_process(
         step_stdout=step_stdout,
         step_metadata=step_metadata,
         progress_index=progress_index,
+        constructor_metadata=(
+            object_constructor_result_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if object_constructor_result_path.exists()
+            and not _file_exceeds_limit(object_constructor_result_path)
+            else None
+        ),
         memory_status=memory_status,
         memory_summary=memory_summary,
         memory_diagnostics=memory_diagnostics,
@@ -571,6 +618,7 @@ def _docker_process_output(
         step_stdout=result.step_stdout,
         step_metadata=result.step_metadata,
         progress_index=result.progress_index,
+        constructor_metadata=result.constructor_metadata,
         memory_status=sanitizer_status,
         memory_summary=summary,
         memory_diagnostics=(
@@ -646,77 +694,70 @@ def _classify_memory_diagnostics(
             "Memory diagnostics are unavailable with the current compiler.",
             _clean_memory_diagnostics(stderr, working_directory),
         )
-    classifications = (
-        (
-            "double_free",
-            "Double free detected.",
-            ("attempting double-free", "double free"),
-        ),
-        (
-            "invalid_free",
-            "Invalid free detected.",
-            (
-                "attempting free on address which was not malloc()-ed",
-                "bad-free",
-                "invalid free",
+    findings = parse_memory_runtime(stderr)
+    if findings:
+        category = findings[0].category
+        status, summary = {
+            "double_free": ("double_free", "Double free detected."),
+            "invalid_free": ("invalid_free", "Invalid free detected."),
+            "use_after_free": (
+                "use_after_free",
+                "Heap use-after-free detected.",
             ),
-        ),
-        (
-            "use_after_free",
-            "Heap use-after-free detected.",
-            (
-                "heap-use-after-free",
-                "stack-use-after-return",
-                "stack-use-after-scope",
+            "lifetime_error": (
+                "use_after_free",
+                "Invalid lifetime access detected.",
             ),
-        ),
-        (
-            "buffer_overflow",
-            "Buffer overflow detected.",
-            (
-                "heap-buffer-overflow",
-                "stack-buffer-overflow",
-                "global-buffer-overflow",
+            "heap_buffer_overflow": (
+                "buffer_overflow",
+                "Buffer overflow detected.",
             ),
-        ),
-        (
-            "leak",
-            "Memory leak detected.",
-            ("detected memory leaks", "leaksanitizer"),
-        ),
-        (
-            "undefined_behavior",
-            "Undefined behaviour detected.",
-            (
-                "runtime error:",
-                "signed integer overflow",
-                "null pointer",
-                "misaligned address",
-                "division by zero",
-                "shift exponent",
-                "shift-base",
-                "out of bounds",
-                "out-of-bounds",
+            "stack_buffer_overflow": (
+                "buffer_overflow",
+                "Buffer overflow detected.",
             ),
-        ),
-        (
-            "runtime_error",
-            "Runtime memory error detected.",
-            (
-                "addresssanitizer: deadlysignal",
-                "addresssanitizer:deadlysignal",
-                "addresssanitizer: segv",
-                "undefinedbehaviorsanitizer: deadlysignal",
+            "global_buffer_overflow": (
+                "buffer_overflow",
+                "Buffer overflow detected.",
             ),
-        ),
-    )
-    for status, summary, patterns in classifications:
-        if any(pattern in lowered for pattern in patterns):
-            return (
-                status,
-                summary,
-                _clean_memory_diagnostics(stderr, working_directory),
-            )
+            "out_of_bounds_read": (
+                "buffer_overflow",
+                "Out-of-bounds read detected.",
+            ),
+            "out_of_bounds_write": (
+                "buffer_overflow",
+                "Out-of-bounds write detected.",
+            ),
+            "memory_leak": ("leak", "Memory leak detected."),
+            "undefined_behaviour": (
+                "undefined_behavior",
+                "Undefined behaviour detected.",
+            ),
+            "null_pointer_access": (
+                "undefined_behavior",
+                "Null pointer access detected.",
+            ),
+            "invalid_pointer_arithmetic": (
+                "undefined_behavior",
+                "Invalid pointer arithmetic detected.",
+            ),
+            "unknown_memory_failure": (
+                "runtime_error",
+                "Runtime memory error detected.",
+            ),
+            "mismatched_allocation_deallocation": (
+                "invalid_free",
+                "Mismatched memory cleanup detected.",
+            ),
+        }.get(
+            category,
+            ("runtime_error", "Runtime memory error detected."),
+        )
+        return (
+            status,
+            summary,
+            _clean_memory_diagnostics(stderr, working_directory),
+        )
     if exit_code == 0:
         return "clean", "No memory issues detected.", None
     return (
@@ -781,7 +822,31 @@ def _sanitizer_environment(
 def _memory_result_fields(
     output: ProcessOutput,
     enabled: bool,
+    source: str = "",
+    *,
+    exception_active: bool = False,
+    operation_context: str = "unknown",
+    related_operation: str | None = None,
 ) -> dict[str, object]:
+    findings = (
+        parse_memory_runtime(
+            output.memory_diagnostics or output.stderr,
+            provider=output.execution_provider,
+        )
+        if enabled
+        else []
+    )
+    diagnoses = classify_memory_findings(
+        findings + (
+            analyze_memory_source(source)
+            if enabled and output.memory_status in {"partial", "unavailable"}
+            else []
+        ),
+        source,
+        exception_active=exception_active,
+        operation_context=operation_context,
+        related_operation=related_operation,
+    )
     return {
         "memory_check_enabled": enabled,
         "memory_status": output.memory_status,
@@ -805,6 +870,34 @@ def _memory_result_fields(
         "leaked_bytes": output.leaked_bytes,
         "leaked_allocations": output.leaked_allocations,
         "leak_kind": output.leak_kind,
+        "memory_diagnoses": [
+            {
+                "category": diagnosis.category,
+                "title": diagnosis.title,
+                "confidence": diagnosis.confidence,
+                "summary": diagnosis.summary,
+                "likely_cause": diagnosis.likely_cause,
+                "source_range": (
+                    {
+                        "start_line": diagnosis.location.start_line,
+                        "end_line": diagnosis.location.end_line,
+                        "excerpt": diagnosis.location.excerpt,
+                        "label": diagnosis.location.label,
+                        "confidence": diagnosis.location.confidence,
+                    }
+                    if diagnosis.location
+                    else None
+                ),
+                "suggested_direction": diagnosis.suggested_direction,
+                "related_operation": diagnosis.related_operation,
+                "confirmed_by": list(diagnosis.confirmed_by),
+                "technical_details": list(diagnosis.technical_details),
+                "supporting_findings": list(
+                    diagnosis.supporting_findings
+                ),
+            }
+            for diagnosis in diagnoses
+        ],
     }
 
 
@@ -1545,6 +1638,102 @@ def _string_serializer_source() -> str:
     )
 
 
+_EXCEPTION_CATCH_TYPES = (
+    "std::invalid_argument",
+    "std::domain_error",
+    "std::length_error",
+    "std::out_of_range",
+    "std::logic_error",
+    "std::overflow_error",
+    "std::underflow_error",
+    "std::range_error",
+    "std::runtime_error",
+    "std::bad_alloc",
+    "std::bad_cast",
+    "std::bad_typeid",
+    "std::bad_function_call",
+)
+
+
+def _exception_support_source() -> str:
+    return """
+static void inktocode_write_json_string(
+    std::ostream& output, const std::string& value)
+{
+    output << '"';
+    for (unsigned char character : value)
+    {
+        switch (character)
+        {
+            case '\\\\': output << "\\\\\\\\"; break;
+            case '"': output << "\\\\\\""; break;
+            case '\\n': output << "\\\\n"; break;
+            case '\\r': output << "\\\\r"; break;
+            case '\\t': output << "\\\\t"; break;
+            default:
+                if (character < 0x20) output << '?';
+                else output << static_cast<char>(character);
+        }
+    }
+    output << '"';
+}
+
+static void inktocode_write_exception(
+    const char* path,
+    const char* type,
+    const char* message,
+    bool standard)
+{
+    std::string temporary_path = std::string(path) + ".tmp";
+    std::ofstream output(
+        temporary_path, std::ios::binary | std::ios::trunc);
+    output << "{\\"outcome\\":\\""
+           << (standard ? "threw_standard" : "threw_non_standard")
+           << "\\",\\"exception_type\\":";
+    inktocode_write_json_string(output, type);
+    output << ",\\"exception_message\\":";
+    inktocode_write_json_string(output, message ? message : "");
+    output << ",\\"process_completed\\":true}";
+    output.flush();
+    output.close();
+    std::rename(temporary_path.c_str(), path);
+}
+""".strip()
+
+
+def _exception_catches(
+    metadata_path: str,
+    *,
+    before_write: str = "",
+) -> str:
+    catches = [
+        (
+            f"catch (const {exception_type}& inktocode_exception) {{ "
+            f"{before_write} "
+            f'inktocode_write_exception("{metadata_path}", '
+            f'"{exception_type}", inktocode_exception.what(), true); '
+            "return 0; }"
+        )
+        for exception_type in _EXCEPTION_CATCH_TYPES
+    ]
+    catches.append(
+        "catch (const std::exception& inktocode_exception) { "
+        f"{before_write} "
+        "const char* inktocode_type = "
+        "typeid(inktocode_exception) == typeid(std::exception) "
+        '? "std::exception" : "other std::exception"; '
+        f'inktocode_write_exception("{metadata_path}", inktocode_type, '
+        "inktocode_exception.what(), true); return 0; }"
+    )
+    catches.append(
+        "catch (...) { "
+        f"{before_write} "
+        f'inktocode_write_exception("{metadata_path}", '
+        '"non-standard", "", false); return 0; }'
+    )
+    return " ".join(catches)
+
+
 def _build_function_harness(
     code: str,
     function: FunctionSignature,
@@ -1690,6 +1879,7 @@ def _build_function_harness(
                 "std::ios::binary | std::ios::trunc);",
                 "std::streambuf* inktocode_original_output = "
                 "std::cout.rdbuf(inktocode_user_output.rdbuf());",
+                "try {",
                 call_statement,
                 "std::cout.rdbuf(inktocode_original_output);",
                 "inktocode_user_output.close();",
@@ -1697,15 +1887,23 @@ def _build_function_harness(
                 "std::ios::binary | std::ios::trunc);",
                 "std::streambuf* inktocode_original_metadata = "
                 "std::cout.rdbuf(inktocode_metadata.rdbuf());",
-                'std::cout << "{\\"return\\":";',
+                'std::cout << "{\\"outcome\\":\\"returned\\",\\"return\\":";',
                 serialized_return,
                 'std::cout << ",\\"mutations\\":{";',
                 " ".join(serialized_mutations),
-                'std::cout << "}}";',
+                'std::cout << "},\\"process_completed\\":true}";',
                 "std::cout.rdbuf(inktocode_original_metadata);",
                 "inktocode_metadata.close();",
                 'std::rename("function-result.json.tmp", '
                 '"function-result.json");',
+                "}",
+                _exception_catches(
+                    "function-result.json",
+                    before_write=(
+                        "std::cout.rdbuf(inktocode_original_output); "
+                        "inktocode_user_output.close();"
+                    ),
+                ),
             ]
         )
         cases.append(
@@ -1729,12 +1927,17 @@ def _build_function_harness(
     return (
         "#include <cstdio>\n"
         "#include <fstream>\n"
+        "#include <functional>\n"
         "#include <iomanip>\n"
         "#include <iostream>\n\n"
+        "#include <new>\n"
+        "#include <stdexcept>\n"
         "#include <string>\n"
+        "#include <typeinfo>\n"
         "#include <vector>\n\n"
         f"{code}\n\n"
         f"{_string_serializer_source()}\n\n"
+        f"{_exception_support_source()}\n\n"
         f"{generated_main}\n"
     )
 
@@ -1791,6 +1994,15 @@ def _build_object_harness(
         )
         statements = [
             constructor_declarations,
+            *[
+                (
+                    f"std::optional<{scenario_object.object_class.name}> "
+                    f"inktocode_object_{object_index};"
+                )
+                for object_index, scenario_object in enumerate(
+                    scenario.objects
+                )
+            ],
             _progress_statement(-1),
             (
                 'std::ofstream inktocode_constructor_output('
@@ -1799,15 +2011,16 @@ def _build_object_harness(
             ),
             "std::streambuf* inktocode_constructor_original = "
             "std::cout.rdbuf(inktocode_constructor_output.rdbuf());",
+            "try {",
             *[
                 (
-                    f"{scenario_object.object_class.name} "
-                    f"inktocode_object_{object_index}{{"
+                    f"{_progress_statement(-100 - object_index)} "
+                    f"inktocode_object_{object_index}.emplace("
                     + ", ".join(
                         argument.expression
                         for argument in scenario_object.constructor_arguments
                     )
-                    + "};"
+                    + ");"
                 )
                 for object_index, scenario_object in enumerate(
                     scenario.objects
@@ -1815,12 +2028,28 @@ def _build_object_harness(
             ],
             "std::cout.rdbuf(inktocode_constructor_original);",
             "inktocode_constructor_output.close();",
+            (
+                'std::ofstream inktocode_constructor_metadata('
+                '"object-constructor-result.json", '
+                "std::ios::binary | std::ios::trunc); "
+                'inktocode_constructor_metadata << '
+                '"{\\"outcome\\":\\"returned\\"}";'
+            ),
+            "}",
+            _exception_catches(
+                "object-constructor-result.json",
+                before_write=(
+                    "std::cout.rdbuf(inktocode_constructor_original); "
+                    "inktocode_constructor_output.close();"
+                ),
+            ),
         ]
         object_variables = {
-            scenario_object.object_id: f"inktocode_object_{index}"
+            scenario_object.object_id: f"(*inktocode_object_{index})"
             for index, scenario_object in enumerate(scenario.objects)
         }
         for step_index, step in enumerate(scenario.steps):
+            persistent_declaration = ""
             declarations = " ".join(
                 declaration
                 for argument in step.arguments
@@ -1829,8 +2058,24 @@ def _build_object_harness(
             expressions = ", ".join(
                 argument.expression for argument in step.arguments
             )
-            target = object_variables[step.target_object_id]
-            if step.special_member is not None:
+            target = object_variables.get(step.target_object_id, "")
+            if step.constructor is not None and step.constructor_class is not None:
+                result_variable = f"inktocode_result_{step_index}"
+                persistent_declaration = (
+                    f"std::optional<{step.constructor_class.name}> "
+                    f"{result_variable};"
+                )
+                call_statement = (
+                    f"{result_variable}.emplace({expressions});"
+                )
+                if step.result_object_id:
+                    object_variables[step.result_object_id] = (
+                        f"(*{result_variable})"
+                    )
+                return_type = None
+                object_result_type = step.constructor_class.name
+                suppress_return = True
+            elif step.special_member is not None:
                 source = (
                     object_variables[step.source_object_id]
                     if step.source_object_id
@@ -1838,14 +2083,20 @@ def _build_object_harness(
                 )
                 result_variable = f"inktocode_result_{step_index}"
                 if step.step_type == "copy_construct":
+                    persistent_declaration = (
+                        f"std::optional<{step.result_object_class_id}> "
+                        f"{result_variable};"
+                    )
                     call_statement = (
-                        f"{step.result_object_class_id} {result_variable}"
-                        f"{{{source}}};"
+                        f"{result_variable}.emplace({source});"
                     )
                 elif step.step_type == "move_construct":
+                    persistent_declaration = (
+                        f"std::optional<{step.result_object_class_id}> "
+                        f"{result_variable};"
+                    )
                     call_statement = (
-                        f"{step.result_object_class_id} {result_variable}"
-                        f"{{std::move({source})}};"
+                        f"{result_variable}.emplace(std::move({source}));"
                     )
                 elif step.step_type == "copy_assign":
                     call_statement = f"{target} = {source};"
@@ -1854,7 +2105,9 @@ def _build_object_harness(
                 else:
                     call_statement = f"{target} = {target};"
                 if step.result_object_id:
-                    object_variables[step.result_object_id] = result_variable
+                    object_variables[step.result_object_id] = (
+                        f"(*{result_variable})"
+                    )
                 return_type = None
                 object_result_type = step.result_object_class_id
                 suppress_return = True
@@ -1894,15 +2147,20 @@ def _build_object_harness(
                     "stream_reference",
                 }
             result_name = f"inktocode_step_{step_index}_result"
-            if step.special_member is not None:
+            if step.special_member is not None or step.constructor is not None:
                 pass
             elif object_result_type:
                 result_variable = f"inktocode_result_{step_index}"
+                persistent_declaration = (
+                    f"std::optional<{object_result_type}> {result_variable};"
+                )
                 call_statement = (
-                    f"{object_result_type} {result_variable} = {call};"
+                    f"{result_variable}.emplace({call});"
                 )
                 if step.result_object_id:
-                    object_variables[step.result_object_id] = result_variable
+                    object_variables[step.result_object_id] = (
+                        f"(*{result_variable})"
+                    )
             else:
                 call_statement = (
                     f"{call};"
@@ -1917,6 +2175,7 @@ def _build_object_harness(
             statements.extend(
                 [
                     declarations,
+                    persistent_declaration,
                     _progress_statement(step_index),
                     (
                         f'std::ofstream inktocode_step_output_{step_index}('
@@ -1928,6 +2187,7 @@ def _build_object_harness(
                         "= std::cout.rdbuf("
                         f"inktocode_step_output_{step_index}.rdbuf());"
                     ),
+                    "try {",
                     call_statement,
                     (
                         "std::cout.rdbuf("
@@ -1944,7 +2204,7 @@ def _build_object_harness(
                         f"{step_index} = std::cout.rdbuf("
                         f"inktocode_step_metadata_{step_index}.rdbuf());"
                     ),
-                    'std::cout << "{\\"return\\":";',
+                    'std::cout << "{\\"outcome\\":\\"returned\\",\\"return\\":";',
                     serialized_return,
                     'std::cout << "}";',
                     (
@@ -1955,6 +2215,15 @@ def _build_object_harness(
                     (
                         f'std::rename("object-step-{step_index}-result.json.tmp", '
                         f'"object-step-{step_index}-result.json");'
+                    ),
+                    "}",
+                    _exception_catches(
+                        f"object-step-{step_index}-result.json",
+                        before_write=(
+                            "std::cout.rdbuf("
+                            f"inktocode_step_original_{step_index}); "
+                            f"inktocode_step_output_{step_index}.close();"
+                        ),
                     ),
                 ]
             )
@@ -1980,13 +2249,19 @@ def _build_object_harness(
     return (
         "#include <cstdio>\n"
         "#include <fstream>\n"
+        "#include <functional>\n"
         "#include <iomanip>\n"
         "#include <iostream>\n"
+        "#include <new>\n"
+        "#include <optional>\n"
+        "#include <stdexcept>\n"
         "#include <string>\n"
+        "#include <typeinfo>\n"
         "#include <utility>\n"
         "#include <vector>\n\n"
         f"{code}\n\n"
         f"{_string_serializer_source()}\n\n"
+        f"{_exception_support_source()}\n\n"
         f"{generated_main}\n"
     )
 
@@ -2034,7 +2309,9 @@ def _program_results(
                 timed_out=output.timed_out,
                 output_limited=output.output_limited,
                 match_type=match_type,
-                **_memory_result_fields(output, request.run_memory_checks),
+                **_memory_result_fields(
+                    output, request.run_memory_checks, request.code
+                ),
             )
         )
     return results
@@ -2111,6 +2388,79 @@ def _typed_mismatch_detail(
     return None
 
 
+def _exception_outcome_result(
+    *,
+    expected_outcome: str,
+    expected_exception_type: str | None,
+    message_rule: str,
+    expected_message: str | None,
+    metadata: dict[str, object] | None,
+    timed_out: bool,
+    exit_code: int | None,
+    execution_continued: bool,
+) -> ExceptionOutcomeResult:
+    raw_outcome = metadata.get("outcome") if metadata else None
+    actual_outcome = (
+        raw_outcome
+        if raw_outcome
+        in {"returned", "threw_standard", "threw_non_standard"}
+        else "timed_out"
+        if timed_out
+        else "crashed"
+        if exit_code not in {0, None}
+        else "crashed"
+    )
+    actual_type = (
+        metadata.get("exception_type")
+        if metadata
+        and isinstance(metadata.get("exception_type"), str)
+        else None
+    )
+    actual_message = (
+        metadata.get("exception_message")
+        if metadata
+        and isinstance(metadata.get("exception_message"), str)
+        else None
+    )
+    type_matched: bool | None = None
+    message_matched: bool | None = None
+    if expected_outcome == "throws":
+        type_matched = (
+            actual_outcome == "threw_standard"
+            and (
+                expected_exception_type == "any_std_exception"
+                or actual_type == expected_exception_type
+            )
+        )
+        message_matched = (
+            True
+            if message_rule == "ignore"
+            else actual_message == expected_message
+            if message_rule == "exact"
+            else (
+                expected_message in actual_message
+                if expected_message is not None and actual_message is not None
+                else False
+            )
+        )
+        expectation_passed = bool(type_matched and message_matched)
+    else:
+        expectation_passed = actual_outcome == "returned"
+    return ExceptionOutcomeResult(
+        expected_outcome=expected_outcome,
+        actual_outcome=actual_outcome,
+        expected_exception_type=expected_exception_type,
+        actual_exception_type=actual_type,
+        expected_message_rule=message_rule,
+        expected_message=expected_message,
+        actual_message=actual_message,
+        type_matched=type_matched,
+        message_matched=message_matched,
+        expectation_passed=expectation_passed,
+        execution_continued=execution_continued,
+    )
+
+
 def _function_results(
     executable: Path,
     working_directory: Path,
@@ -2161,6 +2511,47 @@ def _function_results(
             stderr = (
                 f"{stderr}\n" if stderr else ""
             ) + "Function result metadata was incomplete."
+        exception_result = _exception_outcome_result(
+            expected_outcome=test.expected_outcome or (
+                "return_value"
+                if function.return_value_type.kind != "void"
+                else "return_void"
+            ),
+            expected_exception_type=test.expected_exception_type,
+            message_rule=test.exception_message_rule,
+            expected_message=test.expected_exception_message,
+            metadata=metadata,
+            timed_out=output.timed_out,
+            exit_code=output.exit_code,
+            execution_continued=False,
+        )
+        if test.expected_outcome == "throws":
+            passed = (
+                exception_result.expectation_passed
+                and not output.output_limited
+                and _memory_is_clean(output, request.run_memory_checks)
+            )
+            results.append(
+                FunctionCombinedTestResult(
+                    name=test.name,
+                    passed=passed,
+                    arguments=test.arguments,
+                    return_result=None,
+                    stdout_result=None,
+                    mutation_results=[],
+                    stderr=stderr,
+                    exit_code=output.exit_code,
+                    timed_out=output.timed_out,
+                    output_limited=output.output_limited,
+                    match_type="exact" if passed else "mismatch",
+                    exception_result=exception_result,
+                    **_memory_result_fields(
+                        output, request.run_memory_checks, request.code,
+                        exception_active=True,
+                    ),
+                )
+            )
+            continue
 
         supplied_expected_values = _expected_mutations(test) or {}
         expected_values = {
@@ -2272,6 +2663,7 @@ def _function_results(
             and not output.output_limited
             and output.exit_code == 0
             and metadata is not None
+            and exception_result.expectation_passed
             and _memory_is_clean(output, request.run_memory_checks)
         )
         active_channels = sum(
@@ -2303,8 +2695,9 @@ def _function_results(
                     timed_out=output.timed_out,
                     output_limited=output.output_limited,
                     match_type="exact" if passed else "mismatch",
+                    exception_result=exception_result,
                     **_memory_result_fields(
-                        output, request.run_memory_checks
+                        output, request.run_memory_checks, request.code
                     ),
                 )
             )
@@ -2343,8 +2736,9 @@ def _function_results(
                     timed_out=output.timed_out,
                     output_limited=output.output_limited,
                     match_type=match_type,
+                    exception_result=exception_result,
                     **_memory_result_fields(
-                        output, request.run_memory_checks
+                        output, request.run_memory_checks, request.code
                     ),
                 )
             )
@@ -2374,8 +2768,9 @@ def _function_results(
                     timed_out=output.timed_out,
                     output_limited=output.output_limited,
                     match_type=match_type,
+                    exception_result=exception_result,
                     **_memory_result_fields(
-                        output, request.run_memory_checks
+                        output, request.run_memory_checks, request.code
                     ),
                 )
             )
@@ -2410,7 +2805,10 @@ def _function_results(
                 timed_out=output.timed_out,
                 output_limited=output.output_limited,
                 match_type=match_type,
-                **_memory_result_fields(output, request.run_memory_checks),
+                exception_result=exception_result,
+                **_memory_result_fields(
+                    output, request.run_memory_checks, request.code
+                ),
             )
         )
     return results
@@ -2438,6 +2836,54 @@ def _object_results(
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
             docker_provider=docker_provider,
+        )
+        constructor_metadata: dict[str, object] | None = None
+        if output.constructor_metadata is not None:
+            try:
+                decoded_constructor = json.loads(
+                    output.constructor_metadata
+                )
+            except json.JSONDecodeError:
+                decoded_constructor = None
+            if isinstance(decoded_constructor, dict):
+                constructor_metadata = decoded_constructor
+        failed_constructor_index = (
+            -output.progress_index - 100
+            if output.progress_index is not None
+            and output.progress_index <= -100
+            else None
+        )
+        requested_objects = test.objects or []
+        constructor_expectation = (
+            requested_objects[failed_constructor_index]
+            if failed_constructor_index is not None
+            and failed_constructor_index < len(requested_objects)
+            else next(
+                (
+                    item
+                    for item in requested_objects
+                    if item.expected_outcome == "throws"
+                ),
+                requested_objects[0] if requested_objects else None,
+            )
+        )
+        constructor_exception_result = (
+            _exception_outcome_result(
+                expected_outcome=constructor_expectation.expected_outcome,
+                expected_exception_type=(
+                    constructor_expectation.expected_exception_type
+                ),
+                message_rule=constructor_expectation.exception_message_rule,
+                expected_message=(
+                    constructor_expectation.expected_exception_message
+                ),
+                metadata=constructor_metadata,
+                timed_out=output.timed_out,
+                exit_code=output.exit_code,
+                execution_continued=False,
+            )
+            if constructor_expectation is not None
+            else None
         )
         constructor_completed = (
             output.progress_index is not None
@@ -2470,6 +2916,26 @@ def _object_results(
                     if failed_step_index == step_index
                     else "not_executed"
                 )
+                failed_exception_result = (
+                    _exception_outcome_result(
+                        expected_outcome=(
+                            step_request.expected_outcome or "return_void"
+                        ),
+                        expected_exception_type=(
+                            step_request.expected_exception_type
+                        ),
+                        message_rule=step_request.exception_message_rule,
+                        expected_message=(
+                            step_request.expected_exception_message
+                        ),
+                        metadata=None,
+                        timed_out=output.timed_out,
+                        exit_code=output.exit_code,
+                        execution_continued=False,
+                    )
+                    if status == "failed"
+                    else None
+                )
                 step_results.append(
                     ObjectScenarioStepResult(
                         index=step_index,
@@ -2490,14 +2956,32 @@ def _object_results(
                             else prepared_step.operator.display
                             if prepared_step.operator
                             else prepared_step.special_member.display
+                            if prepared_step.special_member
+                            else prepared_step.constructor.display
+                            if prepared_step.constructor
+                            else "Create object"
                         ),
                         expression=prepared_step.expression,
                         result_object_name=prepared_step.result_name,
                         status=status,
                         passed=False,
+                        exception_result=failed_exception_result,
                     )
                 )
                 continue
+
+            exception_result = _exception_outcome_result(
+                expected_outcome=step_request.expected_outcome or "return_void",
+                expected_exception_type=step_request.expected_exception_type,
+                message_rule=step_request.exception_message_rule,
+                expected_message=step_request.expected_exception_message,
+                metadata=metadata,
+                timed_out=output.timed_out,
+                exit_code=output.exit_code,
+                execution_continued=(
+                    metadata.get("outcome") == "returned"
+                ),
+            )
 
             return_result: FunctionChannelResult | None = None
             result_type = (
@@ -2508,7 +2992,11 @@ def _object_results(
                 and prepared_step.operator.return_kind == "value"
                 else None
             )
-            if result_type is not None and result_type.kind != "void":
+            if (
+                result_type is not None
+                and result_type.kind != "void"
+                and step_request.expected_outcome != "throws"
+            ):
                 expected_return = step_request.expected_return or ""
                 actual_return = _metadata_value(
                     result_type,
@@ -2557,7 +3045,10 @@ def _object_results(
                 for channel in (return_result, stdout_result)
                 if channel is not None
             ]
-            passed = all(channel.passed for channel in channels)
+            passed = (
+                exception_result.expectation_passed
+                and all(channel.passed for channel in channels)
+            )
             step_results.append(
                 ObjectScenarioStepResult(
                     index=step_index,
@@ -2576,6 +3067,10 @@ def _object_results(
                         else prepared_step.operator.display
                         if prepared_step.operator
                         else prepared_step.special_member.display
+                        if prepared_step.special_member
+                        else prepared_step.constructor.display
+                        if prepared_step.constructor
+                        else "Create object"
                     ),
                     expression=prepared_step.expression,
                     result_object_name=prepared_step.result_name,
@@ -2583,19 +3078,49 @@ def _object_results(
                     passed=passed,
                     return_result=return_result,
                     stdout_result=stdout_result,
+                    exception_result=exception_result,
                 )
             )
 
+        expected_constructor_throw = any(
+            item.expected_outcome == "throws" for item in requested_objects
+        )
+        constructor_behavior_passed = (
+            constructor_exception_result.expectation_passed
+            if constructor_exception_result is not None
+            else constructor_completed
+        )
+        expected_stop_after_constructor = (
+            expected_constructor_throw
+            and constructor_exception_result is not None
+            and constructor_exception_result.expectation_passed
+        )
+        expected_stop_after_step = any(
+            step.exception_result is not None
+            and step.exception_result.expected_outcome == "throws"
+            and step.exception_result.expectation_passed
+            for step in step_results
+        )
         runtime_ok = (
             not output.timed_out
             and not output.output_limited
             and output.exit_code == 0
-            and constructor_completed
-            and output.progress_index == len(prepared.steps)
+            and constructor_behavior_passed
+            and (
+                output.progress_index == len(prepared.steps)
+                or expected_stop_after_constructor
+                or expected_stop_after_step
+            )
             and _memory_is_clean(output, request.run_memory_checks)
         )
         passed = runtime_ok and all(
-            step.passed for step in step_results
+            step.passed
+            for step in step_results
+            if step.status != "not_executed"
+        ) and not any(
+            step.status == "not_executed"
+            for step in step_results
+            if not expected_stop_after_step
         )
         object_names = {
             item.object_id: item.name for item in prepared.objects
@@ -2617,24 +3142,42 @@ def _object_results(
         scenario_result = ObjectScenarioTestResult(
                 name=test.name,
                 passed=passed,
-                class_name=prepared.objects[0].object_class.name,
-                constructor=prepared.objects[0].constructor.display,
+                class_name=(
+                    prepared.objects[0].object_class.name
+                    if prepared.objects
+                    else next(
+                        (
+                            step.constructor_class.name
+                            for step in prepared.steps
+                            if step.constructor_class is not None
+                        ),
+                        "Object scenario",
+                    )
+                ),
+                constructor=(
+                    prepared.objects[0].constructor.display
+                    if prepared.objects
+                    else "No setup constructor"
+                ),
                 constructor_arguments=(
                     test.constructor_arguments
                     if test.constructor_arguments is not None
                     else test.objects[0].arguments
+                    if test.objects
+                    else []
                 ),
                 constructor_completed=constructor_completed,
                 constructed_objects=[
                     (
                         f"{item.name} = {item.constructor.display}"
                         f"({', '.join(requested.arguments)})"
-                    )
-                    for item, requested in zip(
-                        prepared.objects,
-                        test.objects
-                        or [
-                            type(
+                        )
+                        for item, requested in zip(
+                            prepared.objects,
+                            test.objects
+                            if test.objects is not None
+                            else [
+                                type(
                                 "LegacyObject",
                                 (),
                                 {"arguments": test.constructor_arguments or []},
@@ -2642,6 +3185,8 @@ def _object_results(
                         ],
                         strict=True,
                     )
+                    if failed_constructor_index is None
+                    or prepared.objects.index(item) < failed_constructor_index
                 ],
                 moved_from_objects=[
                     object_names[object_id]
@@ -2656,7 +3201,54 @@ def _object_results(
                 timed_out=output.timed_out,
                 output_limited=output.output_limited,
                 match_type="exact" if passed else "mismatch",
-                **_memory_result_fields(output, request.run_memory_checks),
+                constructor_exception_result=constructor_exception_result,
+                **_memory_result_fields(
+                    output,
+                    request.run_memory_checks,
+                    request.code,
+                    exception_active=any(
+                        (
+                            item.expected_outcome == "throws"
+                            for item in (
+                                list(test.objects or []) + list(test.steps)
+                            )
+                        )
+                    ),
+                    operation_context=next(
+                        (
+                            step.step_type
+                            for step in reversed(test.steps)
+                            if step.step_type
+                            in {
+                                "copy_construct",
+                                "copy_assign",
+                                "move_construct",
+                                "move_assign",
+                            }
+                        ),
+                        "scenario_cleanup",
+                    ).replace("copy_assign", "copy_assignment").replace(
+                        "move_assign", "move_assignment"
+                    ).replace(
+                        "copy_construct", "copy_constructor"
+                    ).replace(
+                        "move_construct", "move_constructor"
+                    ),
+                    related_operation=next(
+                        (
+                            step.step_type
+                            for step in reversed(test.steps)
+                            if step.step_type
+                            in {
+                                "copy_construct",
+                                "copy_assign",
+                                "move_construct",
+                                "move_assign",
+                            }
+                        ),
+                        None,
+                    ),
+                ),
             )
         diagnosis = diagnose_big_five(request.code, test, scenario_result)
         results.append(
@@ -2695,6 +3287,10 @@ def _prepare_object_scenarios(
                         "class_id": test.class_id,
                         "constructor_id": test.constructor_id,
                         "arguments": test.constructor_arguments,
+                        "expected_outcome": "return_void",
+                        "expected_exception_type": None,
+                        "exception_message_rule": "ignore",
+                        "expected_exception_message": None,
                     },
                 )()
             ]
@@ -2758,17 +3354,114 @@ def _prepare_object_scenarios(
                     object_class=object_class,
                     constructor=constructor,
                     constructor_arguments=arguments,
+                    expected_outcome=item.expected_outcome,
                 )
             )
-            available_objects[item.object_id] = (object_class.id, item.name)
+            if item.expected_outcome != "throws":
+                available_objects[item.object_id] = (
+                    object_class.id,
+                    item.name,
+                )
         prepared_steps: list[PreparedObjectStep] = []
         moved_from: set[str] = set()
         for step_index, step in enumerate(test.steps):
-            target_id = step.target_object_id or requested_objects[0].object_id
+            if step.step_type == "create_object":
+                object_class = next(
+                    (
+                        candidate
+                        for candidate in analysis.classes
+                        if candidate.id == step.class_id
+                    ),
+                    None,
+                )
+                if object_class is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected an "
+                        "unsupported class."
+                    )
+                constructor = next(
+                    (
+                        candidate
+                        for candidate in object_class.constructors
+                        if candidate.id == step.constructor_id
+                    ),
+                    None,
+                )
+                if constructor is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected a stale "
+                        "or wrong-class constructor."
+                    )
+                if (
+                    step.result_object_id in available_objects
+                    or step.result_name in used_names
+                ):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} object name and "
+                        "identifier must be unique."
+                    )
+                if len(step.arguments) != len(constructor.parameters):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} constructor "
+                        f"requires {len(constructor.parameters)} argument(s)."
+                    )
+                arguments = tuple(
+                    _prepare_argument(
+                        parameter.value_type,
+                        argument,
+                        (
+                            f"{test.name} step {step_index + 1} constructor "
+                            f"argument {parameter.name}"
+                        ),
+                        test_index=scenario_index,
+                        parameter_index=(
+                            (len(requested_objects) + step_index) * 20
+                            + parameter_index
+                        ),
+                    )
+                    for parameter_index, (parameter, argument) in enumerate(
+                        zip(
+                            constructor.parameters,
+                            step.arguments,
+                            strict=True,
+                        )
+                    )
+                )
+                if step.expected_outcome != "throws":
+                    available_objects[step.result_object_id or ""] = (
+                        object_class.id,
+                        step.result_name or "",
+                    )
+                    used_names.add(step.result_name or "")
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=None,
+                        arguments=arguments,
+                        target_object_id=step.result_object_id or "",
+                        result_object_id=step.result_object_id,
+                        result_name=step.result_name,
+                        expression=(
+                            f"Create {step.result_name} with "
+                            f"{constructor.display}"
+                        ),
+                        step_type="create_object",
+                        result_object_class_id=object_class.id,
+                        constructor=constructor,
+                        constructor_class=object_class,
+                    )
+                )
+                continue
+            target_id = step.target_object_id or (
+                requested_objects[0].object_id
+                if requested_objects
+                else ""
+            )
             target = available_objects.get(target_id)
             if target is None:
                 raise ValueError(
-                    f"{test.name} step {step_index + 1} references a stale object."
+                    f"{test.name} step {step_index + 1} references an "
+                    "unavailable object. Objects expected to fail "
+                    "construction cannot be used later."
                 )
             target_class = next(
                 item for item in analysis.classes if item.id == target[0]
@@ -2820,7 +3513,7 @@ def _prepare_object_scenarios(
                     "copy_construct",
                     "move_construct",
                 }
-                if creates_object:
+                if creates_object and step.expected_outcome != "throws":
                     if not step.result_object_id or not step.result_name:
                         raise ValueError(
                             "Copy/move construction requires a named result object."
@@ -2844,11 +3537,15 @@ def _prepare_object_scenarios(
                 readable = {
                     "copy_construct": (
                         f"Copy constructed {step.result_name} from {source[1]}"
+                        if step.result_name
+                        else f"Copy construction from {source[1]}"
                     ),
                     "copy_assign": f"{target[1]} = {source[1]}",
                     "self_assign": f"{target[1]} = {target[1]}",
                     "move_construct": (
                         f"Move constructed {step.result_name} from {source[1]}"
+                        if step.result_name
+                        else f"Move construction from {source[1]}"
                     ),
                     "move_assign": (
                         f"{target[1]} = move({source[1]})"
@@ -2895,12 +3592,15 @@ def _prepare_object_scenarios(
                         f"{len(method.parameters)} argument(s)."
                     )
                 is_void = method.return_value_type.kind == "void"
-                if is_void == (step.expected_return is not None):
+                if (
+                    step.expected_outcome != "throws"
+                    and is_void == (step.expected_return is not None)
+                ):
                     raise ValueError(
                         f"{test.name} step {step_index + 1} has an invalid "
                         "expected return."
                     )
-                if not is_void:
+                if not is_void and step.expected_outcome != "throws":
                     _safe_value_literal(
                         method.return_value_type,
                         step.expected_return or "",
@@ -3003,7 +3703,10 @@ def _prepare_object_scenarios(
                 ]
                 if not participating:
                     raise ValueError("Standalone operator has no object operand.")
-            if operator.return_kind == "value":
+            if (
+                operator.return_kind == "value"
+                and step.expected_outcome != "throws"
+            ):
                 if step.expected_return is None or operator.return_value_type is None:
                     raise ValueError(
                         f"{test.name} step {step_index + 1} requires an expected value."
@@ -3013,7 +3716,10 @@ def _prepare_object_scenarios(
                     step.expected_return,
                     f"{test.name} step {step_index + 1} expected return",
                 )
-            elif operator.return_kind == "object_value":
+            elif (
+                operator.return_kind == "object_value"
+                and step.expected_outcome != "throws"
+            ):
                 if step.expected_return is not None:
                     raise ValueError(
                         "Object-valued operator results must use observers."
@@ -3228,6 +3934,8 @@ def run_test_request(
                     in {"mutable_reference", "scalar_pointer"}
                 ]
                 if (
+                    test.expected_outcome != "throws"
+                    and
                     required_mutable_parameters
                     and not mutation_parameter_names
                 ):
@@ -3236,6 +3944,8 @@ def run_test_request(
                         "every mutable parameter."
                     )
                 if (
+                    test.expected_outcome != "throws"
+                    and
                     not mutation_parameter_names
                     and is_void
                     and test.expected_stdout is None
@@ -3245,6 +3955,8 @@ def run_test_request(
                         "the selected void function."
                     )
                 if (
+                    test.expected_outcome != "throws"
+                    and
                     not is_void
                     and test.expected_return is None
                 ):
@@ -3252,10 +3964,15 @@ def run_test_request(
                         f"{test.name} must provide an expected return value "
                         "for the selected non-void function."
                     )
-                if is_void and test.expected_return is not None:
+                if is_void and test.expected_outcome == "return_value":
                     raise ValueError(
-                        f"{test.name} cannot provide an expected return "
-                        "for a void function."
+                        f"{test.name} cannot expect a return value from a "
+                        "void function."
+                    )
+                if not is_void and test.expected_outcome == "return_void":
+                    raise ValueError(
+                        f"{test.name} cannot expect void completion from a "
+                        "non-void function."
                     )
                 prepared_arguments = [
                     _prepare_argument(
@@ -3339,7 +4056,7 @@ def run_test_request(
                             f"cannot exceed the {element_count or 0} "
                             f"provided element(s) for {parameter.name}."
                         )
-                if not is_void:
+                if not is_void and test.expected_outcome != "throws":
                     _safe_value_literal(
                         function.return_value_type,
                         test.expected_return or "",

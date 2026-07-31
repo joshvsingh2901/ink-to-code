@@ -102,6 +102,7 @@ def sidecar_payload():
     return {
         "function_stdout": text("function-stdout.txt") or "",
         "result_metadata": text("function-result.json"),
+        "constructor_metadata": text("object-constructor-result.json"),
         "step_stdout": step_stdout,
         "step_metadata": step_metadata,
         "progress_index": progress_index,

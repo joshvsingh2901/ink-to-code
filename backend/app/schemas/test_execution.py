@@ -124,6 +124,26 @@ class FunctionMutationExpectation(BaseModel):
     parameter_id: str = Field(min_length=1, max_length=100)
     expected_final_value: str = Field(max_length=1_000)
 
+ExpectedOutcomeKind = Literal["return_value", "return_void", "throws"]
+ExceptionMessageRule = Literal["ignore", "exact", "contains"]
+ExceptionType = Literal[
+    "any_std_exception",
+    "std::exception",
+    "std::runtime_error",
+    "std::logic_error",
+    "std::invalid_argument",
+    "std::domain_error",
+    "std::length_error",
+    "std::out_of_range",
+    "std::overflow_error",
+    "std::underflow_error",
+    "std::range_error",
+    "std::bad_alloc",
+    "std::bad_cast",
+    "std::bad_typeid",
+    "std::bad_function_call",
+]
+
 
 class FunctionTestCase(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -140,14 +160,59 @@ class FunctionTestCase(BaseModel):
         min_length=1,
         max_length=20,
     )
+    expected_outcome: ExpectedOutcomeKind | None = None
+    expected_exception_type: ExceptionType | None = None
+    exception_message_rule: ExceptionMessageRule = "ignore"
+    expected_exception_message: str | None = Field(
+        default=None, max_length=1_000
+    )
 
     @model_validator(mode="after")
     def validate_expected_value(self) -> "FunctionTestCase":
+        if self.expected_outcome is None:
+            self.expected_outcome = (
+                "return_value"
+                if self.expected_return is not None
+                else "return_void"
+            )
+        if self.expected_outcome == "throws":
+            if not self.expected_exception_type:
+                raise ValueError("Exception tests require an exception type.")
+            if self.expected_return is not None:
+                raise ValueError(
+                    "Expected return and expected exception cannot be combined."
+                )
+            if (
+                self.exception_message_rule in {"exact", "contains"}
+                and not self.expected_exception_message
+            ):
+                raise ValueError(
+                    "Exact and contains message matching require a message."
+                )
+            if self.exception_message_rule == "ignore":
+                self.expected_exception_message = None
+        else:
+            if self.expected_exception_type is not None:
+                raise ValueError(
+                    "Exception fields require a throws outcome."
+                )
+            self.exception_message_rule = "ignore"
+            self.expected_exception_message = None
+            if (
+                self.expected_outcome == "return_value"
+                and self.expected_return is None
+            ):
+                raise ValueError("Return-value tests require an expected return.")
+            if (
+                self.expected_outcome == "return_void"
+                and self.expected_return is not None
+            ):
+                raise ValueError("Void outcomes cannot include an expected return.")
         mutation_supplied = (
             self.expected_final_arguments is not None
             or self.expected_mutations is not None
         )
-        if not any(
+        if self.expected_outcome != "throws" and not any(
             (
                 self.expected_return is not None,
                 self.expected_stdout is not None,
@@ -201,6 +266,7 @@ class FunctionRunTestsRequest(BaseModel):
 
 class ObjectScenarioStep(BaseModel):
     step_type: Literal[
+        "create_object",
         "method",
         "observer",
         "operator",
@@ -211,6 +277,8 @@ class ObjectScenarioStep(BaseModel):
         "move_assign",
     ] = "method"
     method_id: str | None = Field(default=None, max_length=500)
+    class_id: str | None = Field(default=None, max_length=200)
+    constructor_id: str | None = Field(default=None, max_length=500)
     operator_id: str | None = Field(default=None, max_length=700)
     target_object_id: str | None = Field(default=None, max_length=100)
     arguments: list[str] = Field(default_factory=list, max_length=20)
@@ -222,9 +290,57 @@ class ObjectScenarioStep(BaseModel):
     expected_return: str | None = Field(default=None, max_length=1_000)
     check_stdout: bool = False
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
+    expected_outcome: ExpectedOutcomeKind | None = None
+    expected_exception_type: ExceptionType | None = None
+    exception_message_rule: ExceptionMessageRule = "ignore"
+    expected_exception_message: str | None = Field(
+        default=None, max_length=1_000
+    )
 
     @model_validator(mode="after")
     def validate_stdout(self) -> "ObjectScenarioStep":
+        if self.expected_outcome is None:
+            self.expected_outcome = (
+                "return_value"
+                if self.expected_return is not None
+                else "return_void"
+            )
+        if self.expected_outcome == "throws":
+            if not self.expected_exception_type:
+                raise ValueError("Exception steps require an exception type.")
+            if self.expected_return is not None:
+                raise ValueError(
+                    "Expected return and expected exception cannot be combined."
+                )
+            if (
+                self.exception_message_rule in {"exact", "contains"}
+                and not self.expected_exception_message
+            ):
+                raise ValueError(
+                    "Exact and contains message matching require a message."
+                )
+            if self.exception_message_rule == "ignore":
+                self.expected_exception_message = None
+        else:
+            if self.expected_exception_type is not None:
+                raise ValueError("Exception fields require a throws outcome.")
+            self.exception_message_rule = "ignore"
+            self.expected_exception_message = None
+        if self.step_type == "create_object":
+            if not self.result_object_id or not self.result_name:
+                raise ValueError(
+                    "Create-object steps require an object name."
+                )
+            if not self.class_id:
+                raise ValueError("Create-object steps require a class.")
+            if not self.constructor_id:
+                raise ValueError(
+                    "Create-object steps require a constructor."
+                )
+            if self.expected_outcome == "return_value":
+                raise ValueError(
+                    "Constructors cannot have an expected return value."
+                )
         if self.step_type in {"method", "observer"} and not self.method_id:
             raise ValueError("Method steps require a method identifier.")
         if self.step_type == "operator" and not self.operator_id:
@@ -256,19 +372,47 @@ class ObjectScenarioObject(BaseModel):
     class_id: str = Field(min_length=1, max_length=200)
     constructor_id: str = Field(min_length=1, max_length=500)
     arguments: list[str] = Field(max_length=20)
+    expected_outcome: Literal["return_void", "throws"] = "return_void"
+    expected_exception_type: ExceptionType | None = None
+    exception_message_rule: ExceptionMessageRule = "ignore"
+    expected_exception_message: str | None = Field(
+        default=None, max_length=1_000
+    )
+
+    @model_validator(mode="after")
+    def validate_constructor_outcome(self) -> "ObjectScenarioObject":
+        if self.expected_outcome == "throws":
+            if not self.expected_exception_type:
+                raise ValueError(
+                    "Constructor exception tests require an exception type."
+                )
+            if (
+                self.exception_message_rule in {"exact", "contains"}
+                and not self.expected_exception_message
+            ):
+                raise ValueError(
+                    "Exact and contains message matching require a message."
+                )
+            if self.exception_message_rule == "ignore":
+                self.expected_exception_message = None
+        elif self.expected_exception_type is not None:
+            raise ValueError(
+                "Constructor exception fields require a throws outcome."
+            )
+        return self
 
 
 class ObjectScenarioTestCase(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     objects: list[ObjectScenarioObject] | None = Field(
-        default=None, min_length=1, max_length=5
+        default=None, max_length=5
     )
     class_id: str | None = Field(default=None, max_length=200)
     constructor_id: str | None = Field(default=None, max_length=500)
     constructor_arguments: list[str] | None = Field(
         default=None, max_length=20
     )
-    steps: list[ObjectScenarioStep] = Field(min_length=1, max_length=20)
+    steps: list[ObjectScenarioStep] = Field(max_length=20)
 
     @model_validator(mode="after")
     def validate_object_shape(self) -> "ObjectScenarioTestCase":
@@ -280,6 +424,10 @@ class ObjectScenarioTestCase(BaseModel):
             raise ValueError("Provide scenario objects.")
         if self.objects is not None and self.class_id is not None:
             raise ValueError("Use either objects or the legacy object fields.")
+        if self.objects == [] and not self.steps:
+            raise ValueError(
+                "Provide a setup object or an executable scenario step."
+            )
         return self
 
 
@@ -321,6 +469,59 @@ SanitizerCheckStatus = Literal[
 ]
 
 
+MemoryDiagnosisCategory = Literal[
+    "memory_leak",
+    "use_after_free",
+    "double_free",
+    "invalid_free",
+    "out_of_bounds_read",
+    "out_of_bounds_write",
+    "stack_buffer_overflow",
+    "heap_buffer_overflow",
+    "global_buffer_overflow",
+    "null_pointer_access",
+    "uninitialized_read",
+    "uninitialized_value",
+    "mismatched_allocation_deallocation",
+    "overlapping_memory_operation",
+    "invalid_pointer_arithmetic",
+    "dangling_reference",
+    "lifetime_error",
+    "resource_overwrite",
+    "ownership_aliasing",
+    "destructor_failure",
+    "cleanup_failure",
+    "undefined_behaviour",
+    "memory_limit_exceeded",
+    "allocator_failure",
+    "leak_check_unavailable",
+    "memory_check_incomplete",
+    "unknown_memory_failure",
+]
+
+
+class MemorySourceRange(BaseModel):
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    excerpt: str = Field(max_length=500)
+    label: str = Field(max_length=100)
+    confidence: Literal["confirmed", "likely", "possible"]
+
+
+class MemoryDiagnosisResponse(BaseModel):
+    category: MemoryDiagnosisCategory
+    title: str = Field(max_length=120)
+    confidence: Literal["confirmed", "likely", "possible"]
+    summary: str = Field(max_length=500)
+    likely_cause: str | None = Field(default=None, max_length=500)
+    source_range: MemorySourceRange | None = None
+    suggested_direction: str = Field(max_length=500)
+    related_operation: str | None = Field(default=None, max_length=100)
+    confirmed_by: list[str] = Field(default_factory=list, max_length=10)
+    technical_details: list[str] = Field(default_factory=list, max_length=20)
+    supporting_findings: list[str] = Field(default_factory=list, max_length=10)
+
+
 class MemoryDiagnosticResult(BaseModel):
     memory_check_enabled: bool = False
     memory_status: MemoryStatus = "not_run"
@@ -340,6 +541,9 @@ class MemoryDiagnosticResult(BaseModel):
     leaked_bytes: int | None = None
     leaked_allocations: int | None = None
     leak_kind: str | None = None
+    memory_diagnoses: list[MemoryDiagnosisResponse] = Field(
+        default_factory=list, max_length=3
+    )
 
 
 class ProgramTestResult(MemoryDiagnosticResult):
@@ -371,6 +575,7 @@ class FunctionTestResult(MemoryDiagnosticResult):
     timed_out: bool
     output_limited: bool
     match_type: Literal["exact", "whitespace_normalized", "mismatch"]
+    exception_result: "ExceptionOutcomeResult | None" = None
 
 
 class FunctionOutputTestResult(MemoryDiagnosticResult):
@@ -389,6 +594,7 @@ class FunctionOutputTestResult(MemoryDiagnosticResult):
         "formatting_mismatch",
         "mismatch",
     ]
+    exception_result: "ExceptionOutcomeResult | None" = None
 
 
 class FunctionMutationTestResult(MemoryDiagnosticResult):
@@ -403,6 +609,7 @@ class FunctionMutationTestResult(MemoryDiagnosticResult):
     timed_out: bool
     output_limited: bool
     match_type: Literal["exact", "mismatch"]
+    exception_result: "ExceptionOutcomeResult | None" = None
 
 
 class FunctionChannelResult(BaseModel):
@@ -416,6 +623,26 @@ class FunctionChannelResult(BaseModel):
         "formatting_mismatch",
         "mismatch",
     ]
+
+
+class ExceptionOutcomeResult(BaseModel):
+    expected_outcome: ExpectedOutcomeKind
+    actual_outcome: Literal[
+        "returned",
+        "threw_standard",
+        "threw_non_standard",
+        "crashed",
+        "timed_out",
+    ]
+    expected_exception_type: ExceptionType | None = None
+    actual_exception_type: str | None = None
+    expected_message_rule: ExceptionMessageRule = "ignore"
+    expected_message: str | None = None
+    actual_message: str | None = None
+    type_matched: bool | None = None
+    message_matched: bool | None = None
+    expectation_passed: bool
+    execution_continued: bool
 
 
 class FunctionMutationChannelResult(BaseModel):
@@ -441,11 +668,13 @@ class FunctionCombinedTestResult(MemoryDiagnosticResult):
     timed_out: bool
     output_limited: bool
     match_type: Literal["exact", "mismatch"]
+    exception_result: ExceptionOutcomeResult | None = None
 
 
 class ObjectScenarioStepResult(BaseModel):
     index: int
     step_type: Literal[
+        "create_object",
         "method",
         "observer",
         "operator",
@@ -464,6 +693,7 @@ class ObjectScenarioStepResult(BaseModel):
     passed: bool
     return_result: FunctionChannelResult | None = None
     stdout_result: FunctionChannelResult | None = None
+    exception_result: ExceptionOutcomeResult | None = None
 
 
 class SuspiciousSourceRange(BaseModel):
@@ -510,6 +740,7 @@ class ObjectScenarioTestResult(MemoryDiagnosticResult):
     output_limited: bool
     match_type: Literal["exact", "mismatch"]
     big_five_diagnosis: BigFiveDiagnosis | None = None
+    constructor_exception_result: ExceptionOutcomeResult | None = None
 
 
 class RunTestsResponse(BaseModel):

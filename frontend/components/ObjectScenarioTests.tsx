@@ -5,12 +5,18 @@ import type {
   ObjectOperatorParameter,
 } from "@/lib/testExecution";
 import {
+  ExceptionExpectationFields,
+  type EditableExceptionExpectation,
+} from "@/components/ExceptionExpectationFields";
+import {
   appendScenarioStep,
+  emptyScenarioCollections,
+  removeScenarioObject,
   removeScenarioStep,
   visibleScenarioStepNumber,
 } from "@/lib/objectScenarioState";
 
-export type EditableScenarioObject = {
+export type EditableScenarioObject = EditableExceptionExpectation & {
   id: string;
   name: string;
   class_id: string;
@@ -18,9 +24,10 @@ export type EditableScenarioObject = {
   arguments: string[];
 };
 
-export type EditableObjectStep = {
+export type EditableObjectStep = EditableExceptionExpectation & {
   id: string;
   step_type:
+    | "create_object"
     | "method"
     | "observer"
     | "operator"
@@ -31,6 +38,8 @@ export type EditableObjectStep = {
     | "move_assign";
   target_object_id: string;
   method_id: string;
+  class_id: string;
+  constructor_id: string;
   operator_id: string;
   arguments: string[];
   operands: string[];
@@ -67,6 +76,10 @@ function newObject(classes: ObjectClass[], index: number): EditableScenarioObjec
     class_id: objectClass?.id ?? "",
     constructor_id: constructor?.id ?? "",
     arguments: constructor?.parameters.map(() => "") ?? [],
+    expected_outcome: "return_void",
+    expected_exception_type: "",
+    exception_message_rule: "ignore",
+    expected_exception_message: "",
   };
 }
 
@@ -76,6 +89,8 @@ function newStep(targetId: string): EditableObjectStep {
     step_type: "method",
     target_object_id: targetId,
     method_id: "",
+    class_id: "",
+    constructor_id: "",
     operator_id: "",
     arguments: [],
     operands: [],
@@ -86,6 +101,10 @@ function newStep(targetId: string): EditableObjectStep {
     expected_return: "",
     check_stdout: false,
     expected_stdout: "",
+    expected_outcome: "return_void",
+    expected_exception_type: "",
+    exception_message_rule: "ignore",
+    expected_exception_message: "",
   };
 }
 
@@ -202,6 +221,11 @@ export function ObjectScenarioTests({
               </button>
             </div>
             <div className="mt-2 space-y-2">
+              {scenario.objects.length === 0 && (
+                <p className="text-[11px] text-slate-500">
+                  No setup objects added.
+                </p>
+              )}
               {scenario.objects.map((object, objectIndex) => {
                 const objectClass = classes.find(
                   (item) => item.id === object.class_id,
@@ -242,28 +266,21 @@ export function ObjectScenarioTests({
                         }
                         className="min-w-0 flex-1 rounded-md border border-slate-300 px-2 py-1.5 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-slate-200"
                       />
-                      {scenario.objects.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateScenario(scenario.id, (current) => ({
-                              ...current,
-                              objects: current.objects.filter(
-                                (item) => item.id !== object.id,
-                              ),
-                              steps: current.steps.filter(
-                                (step) =>
-                                  step.target_object_id !== object.id &&
-                                  step.source_object_id !== object.id &&
-                                  !step.operands.includes(object.id),
-                              ),
-                            }))
-                          }
-                          className="text-[11px] text-slate-500 hover:text-rose-700"
-                        >
-                          Remove
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateScenario(scenario.id, (current) => ({
+                            ...current,
+                            objects: removeScenarioObject(
+                              current.objects,
+                              object.id,
+                            ),
+                          }))
+                        }
+                        className="text-[11px] text-slate-500 hover:text-rose-700"
+                      >
+                        Remove
+                      </button>
                     </div>
                     <div className="mt-2 grid gap-2">
                       <select
@@ -348,7 +365,7 @@ export function ObjectScenarioTests({
               </p>
               <button
                 type="button"
-                disabled={!scenario.objects.length || scenario.steps.length >= 20}
+                disabled={scenario.steps.length >= 20}
                 onClick={() =>
                   updateScenario(scenario.id, (current) => ({
                     ...current,
@@ -365,7 +382,9 @@ export function ObjectScenarioTests({
             </div>
             <div className="mt-2 space-y-2">
               {scenario.steps.map((step, stepIndex) => {
-                const priorObjects = [...scenario.objects];
+                const priorObjects = scenario.objects.filter(
+                  (item) => item.expected_outcome !== "throws",
+                );
                 const movedFrom = new Set<string>();
                 for (const priorStep of scenario.steps.slice(0, stepIndex)) {
                   const source = priorObjects.find(
@@ -373,7 +392,8 @@ export function ObjectScenarioTests({
                   );
                   if (
                     priorStep.result_object_id &&
-                    priorStep.result_name
+                    priorStep.result_name &&
+                    priorStep.expected_outcome !== "throws"
                   ) {
                     const operatorClass = classes
                       .flatMap((item) => item.operators)
@@ -382,9 +402,16 @@ export function ObjectScenarioTests({
                     priorObjects.push({
                       id: priorStep.result_object_id,
                       name: priorStep.result_name,
-                      class_id: operatorClass ?? source?.class_id ?? "",
+                      class_id:
+                        priorStep.step_type === "create_object"
+                          ? priorStep.class_id
+                          : operatorClass ?? source?.class_id ?? "",
                       constructor_id: "",
                       arguments: [],
+                      expected_outcome: "return_void",
+                      expected_exception_type: "",
+                      exception_message_rule: "ignore",
+                      expected_exception_message: "",
                     });
                   }
                   if (
@@ -411,6 +438,12 @@ export function ObjectScenarioTests({
                   .find((item) => item.id === step.operator_id);
                 const method = targetClass?.methods.find(
                   (item) => item.id === step.method_id,
+                );
+                const createClass = classes.find(
+                  (item) => item.id === step.class_id,
+                );
+                const createConstructor = createClass?.constructors.find(
+                  (item) => item.id === step.constructor_id,
                 );
                 const operatorParameters =
                   operator?.parameters.filter(
@@ -494,6 +527,7 @@ export function ObjectScenarioTests({
                       value={step.step_type}
                       onChange={(event) => {
                         const nextType = event.target.value as
+                            | "create_object"
                             | "method"
                             | "observer"
                             | "operator"
@@ -542,12 +576,26 @@ export function ObjectScenarioTests({
                                 current.check_stdout
                                   ? current.expected_stdout
                                   : "",
+                              expected_outcome:
+                                selectedMethod?.return_type_metadata.kind ===
+                                "void"
+                                  ? "return_void"
+                                  : current.expected_outcome === "throws"
+                                    ? "throws"
+                                    : "return_value",
                             };
                           }
                           return {
                             ...newStep(current.target_object_id),
                             id: current.id,
                             step_type: nextType,
+                            ...(nextType === "create_object"
+                              ? {
+                                  target_object_id: "",
+                                  result_object_id: `object-${crypto.randomUUID()}`,
+                                  expected_outcome: "return_void" as const,
+                                }
+                              : {}),
                             source_object_id: [
                               "copy_construct",
                               "move_construct",
@@ -560,6 +608,7 @@ export function ObjectScenarioTests({
                       }}
                       className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
                     >
+                      <option value="create_object">Create object</option>
                       <option value="method">Method call</option>
                       <option value="observer">Observer method call</option>
                       <option value="operator">Operator call</option>
@@ -587,7 +636,7 @@ export function ObjectScenarioTests({
                         <option value="move_assign">Move assign</option>
                       )}
                     </select>
-                    <select
+                    {step.step_type !== "create_object" && <select
                       aria-label={`Step ${stepIndex + 1} target object`}
                       value={step.target_object_id}
                       onChange={(event) =>
@@ -622,8 +671,107 @@ export function ObjectScenarioTests({
                           {movedFrom.has(item.id) ? " — moved from" : ""}
                         </option>
                       ))}
-                    </select>
-                    {["method", "observer"].includes(step.step_type) ? (
+                    </select>}
+                    {step.step_type === "create_object" ? (
+                      <div className="mt-2 space-y-2">
+                        <ValueField
+                          id={`${step.id}-created-name`}
+                          label="Object name"
+                          type={createClass?.name ?? "Object"}
+                          value={step.result_name}
+                          placeholder="e.g. badNumber"
+                          onChange={(value) =>
+                            replaceStep((current) => ({
+                              ...current,
+                              result_name: value,
+                              result_object_id:
+                                current.result_object_id ||
+                                `object-${crypto.randomUUID()}`,
+                            }))
+                          }
+                        />
+                        <label className="block text-xs text-slate-700">
+                          Class
+                          <select
+                            value={step.class_id}
+                            onChange={(event) => {
+                              const nextClass = classes.find(
+                                (item) => item.id === event.target.value,
+                              );
+                              const nextConstructor =
+                                nextClass?.constructors.length === 1
+                                  ? nextClass.constructors[0]
+                                  : undefined;
+                              replaceStep((current) => ({
+                                ...current,
+                                class_id: nextClass?.id ?? "",
+                                constructor_id: nextConstructor?.id ?? "",
+                                arguments:
+                                  nextConstructor?.parameters.map(() => "") ??
+                                  [],
+                              }));
+                            }}
+                            className="mt-1 w-full min-w-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                          >
+                            <option value="">Choose a class</option>
+                            {classes.map((item) => (
+                              <option key={item.id} value={item.id}>
+                                {item.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        {createClass && (
+                          <label className="block text-xs text-slate-700">
+                            Constructor
+                            <select
+                              value={step.constructor_id}
+                              onChange={(event) => {
+                                const next = createClass.constructors.find(
+                                  (item) => item.id === event.target.value,
+                                );
+                                replaceStep((current) => ({
+                                  ...current,
+                                  constructor_id: next?.id ?? "",
+                                  arguments:
+                                    next?.parameters.map(() => "") ?? [],
+                                }));
+                              }}
+                              className="mt-1 w-full min-w-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                            >
+                              <option value="">Choose a constructor</option>
+                              {createClass.constructors.map((item) => (
+                                <option key={item.id} value={item.id}>
+                                  {item.display}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                        {createConstructor?.parameters.map(
+                          (parameter, argumentIndex) => (
+                            <ValueField
+                              key={`${step.id}-constructor-${argumentIndex}`}
+                              id={`${step.id}-constructor-${argumentIndex}`}
+                              label={parameter.name}
+                              type={parameter.type_metadata.display_type}
+                              value={step.arguments[argumentIndex] ?? ""}
+                              onChange={(value) =>
+                                replaceStep((current) => ({
+                                  ...current,
+                                  arguments: current.arguments.map(
+                                    (argument, currentIndex) =>
+                                      currentIndex === argumentIndex
+                                        ? value
+                                        : argument,
+                                  ),
+                                }))
+                              }
+                            />
+                          ),
+                        )}
+                      </div>
+                    ) : ["method", "observer"].includes(step.step_type) ? (
                       <>
                         <select
                           aria-label={`Step ${stepIndex + 1} method`}
@@ -642,6 +790,12 @@ export function ObjectScenarioTests({
                                   : next?.id === current.method_id
                                     ? current.expected_return
                                     : "",
+                              expected_outcome:
+                                next?.return_type_metadata.kind === "void"
+                                  ? "return_void"
+                                  : current.expected_outcome === "throws"
+                                    ? "throws"
+                                    : "return_value",
                             }));
                           }}
                           className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
@@ -770,9 +924,44 @@ export function ObjectScenarioTests({
                         onChange={replaceStep}
                       />
                     )}
+                    {(method ||
+                      operator ||
+                      specialMember ||
+                      createConstructor) && (
+                      <ExceptionExpectationFields
+                        id={step.id}
+                        value={step}
+                        supportsReturnValue={
+                          (method?.return_type_metadata.kind !== "void" &&
+                            method !== undefined) ||
+                          operator?.return_kind === "value"
+                        }
+                        onChange={(expectation) =>
+                          replaceStep((current) => ({
+                            ...current,
+                            ...expectation,
+                            expected_return:
+                              expectation.expected_outcome === "return_value"
+                                ? current.expected_return
+                                : "",
+                            result_object_id:
+                              expectation.expected_outcome === "throws" &&
+                              current.step_type !== "create_object"
+                                ? ""
+                                : current.result_object_id,
+                            result_name:
+                              expectation.expected_outcome === "throws" &&
+                              current.step_type !== "create_object"
+                                ? ""
+                                : current.result_name,
+                          }))
+                        }
+                      />
+                    )}
                     {((method &&
                       method.return_type_metadata.kind !== "void") ||
-                      operator?.return_kind === "value") && (
+                      operator?.return_kind === "value") &&
+                      step.expected_outcome === "return_value" && (
                       <ValueField
                         id={`${step.id}-expected-return`}
                         label="Expected value"
@@ -790,6 +979,7 @@ export function ObjectScenarioTests({
                         }
                       />
                     )}
+                    {step.step_type !== "create_object" && (
                     <label className="mt-2 flex items-center gap-2 text-xs text-slate-600">
                       <input
                         type="checkbox"
@@ -807,6 +997,7 @@ export function ObjectScenarioTests({
                       />
                       Check method output
                     </label>
+                    )}
                     {step.check_stdout && (
                       <textarea
                         aria-label="Expected output"
@@ -837,8 +1028,7 @@ export function ObjectScenarioTests({
             {
               id: `scenario-${crypto.randomUUID()}`,
               name: `Scenario ${scenarios.length + 1}`,
-              objects: [newObject(classes, 0)],
-              steps: [],
+              ...emptyScenarioCollections(),
             },
           ])
         }

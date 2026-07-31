@@ -47,6 +47,7 @@ class DockerExecutionResult:
     step_stdout: tuple[str, ...] = ()
     step_metadata: tuple[str | None, ...] = ()
     progress_index: int | None = None
+    constructor_metadata: str | None = None
     memory_tool: MemoryTool = "none"
     valgrind_diagnostics: str | None = None
     leaked_bytes: int | None = None
@@ -300,6 +301,9 @@ class DockerExecutionProvider:
                 payload.get("progress_index")
                 if isinstance(payload.get("progress_index"), int)
                 else None
+            ),
+            constructor_metadata=_optional_string(
+                payload.get("constructor_metadata")
             ),
             memory_tool=(
                 payload.get("memory_tool")

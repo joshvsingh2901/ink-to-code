@@ -3,9 +3,113 @@ import test from "node:test";
 
 import {
   appendScenarioStep,
+  createInitialObjectScenario,
+  emptyScenarioCollections,
+  isObjectScenarioReady,
+  removeScenarioObject,
   removeScenarioStep,
   visibleScenarioStepNumber,
 } from "../lib/objectScenarioState.ts";
+
+const constructorStep = {
+  id: "constructor-step",
+  step_type: "create_object",
+  target_object_id: "",
+  method_id: "",
+  operator_id: "",
+  special_member_id: "",
+  result_name: "badNumber",
+  result_object_id: "bad-number",
+  class_id: "number-class",
+  constructor_id: "number-int",
+};
+
+test("new scenario collections start without setup objects", () => {
+  assert.deepEqual(emptyScenarioCollections(), { objects: [], steps: [] });
+  assert.deepEqual(createInitialObjectScenario(), {
+    id: "scenario-1",
+    name: "Scenario 1",
+    objects: [],
+    steps: [],
+  });
+});
+
+test("constructor-only scenario is ready without setup objects", () => {
+  assert.equal(
+    isObjectScenarioReady({ objects: [], steps: [constructorStep] }),
+    true,
+  );
+});
+
+test("constructor-only payload keeps an empty setup-object array", () => {
+  const scenario = { objects: [], steps: [constructorStep] };
+  const payload = {
+    objects: scenario.objects.map((object) => object),
+    steps: scenario.steps,
+  };
+  assert.deepEqual(payload.objects, []);
+  assert.equal(payload.steps[0].id, "constructor-step");
+});
+
+test("setup objects can be added and the final object can be removed", () => {
+  const setup = { id: "setup-one", name: "setup" };
+  const added = [...emptyScenarioCollections().objects, setup];
+  const removed = removeScenarioObject(added, setup.id);
+  assert.equal(added.length, 1);
+  assert.deepEqual(removed, []);
+});
+
+test("removing setup objects preserves scenario steps and surviving IDs", () => {
+  const first = { id: "setup-one", name: "one" };
+  const second = { id: "setup-two", name: "two" };
+  const scenario = {
+    objects: [first, second],
+    steps: [constructorStep],
+  };
+  const next = {
+    ...scenario,
+    objects: removeScenarioObject(scenario.objects, first.id),
+  };
+  assert.strictEqual(next.steps, scenario.steps);
+  assert.strictEqual(next.objects[0], second);
+});
+
+test("removing scenario steps preserves setup objects", () => {
+  const setup = { id: "setup-one", name: "setup" };
+  const scenario = {
+    objects: [setup],
+    steps: [constructorStep],
+  };
+  const next = {
+    ...scenario,
+    steps: removeScenarioStep(scenario.steps, constructorStep.id),
+  };
+  assert.strictEqual(next.objects, scenario.objects);
+  assert.deepEqual(next.steps, []);
+});
+
+test("existing valid setup-object scenarios remain ready", () => {
+  assert.equal(
+    isObjectScenarioReady({
+      objects: [
+        {
+          name: "setup",
+          class_id: "number-class",
+          constructor_id: "number-int",
+        },
+      ],
+      steps: [
+        {
+          ...constructorStep,
+          step_type: "method",
+          target_object_id: "setup-one",
+          method_id: "get-method",
+        },
+      ],
+    }),
+    true,
+  );
+});
 
 type Step = {
   id: string;
@@ -104,6 +208,7 @@ test("deleting the last remaining step leaves an empty optional step list", () =
 
 test("removal preserves every supported configured step kind", () => {
   const original = [
+    "create_object",
     "method",
     "observer",
     "copy_construct",
@@ -116,11 +221,12 @@ test("removal preserves every supported configured step kind", () => {
     value: `value-${index}`,
     step_type,
   }));
-  const result = removeScenarioStep(original, "kind-3");
+  const result = removeScenarioStep(original, "kind-4");
 
   assert.deepEqual(
     result.map((step) => step.step_type),
     [
+      "create_object",
       "method",
       "observer",
       "copy_construct",

@@ -554,3 +554,32 @@ The expected request should contain the current source code in structured JSON, 
 - Infrastructure failures are distinct from student-code failures.
 - All containers and temporary files must be removed after execution.
 - Diagnostics must redact host/container paths and remain size-limited.
+
+## Exception-test behaviour
+
+- Exception expectations are structured and validated.
+- Never inject raw client exception-type strings into generated C++.
+- Named exception types use exact matching.
+- “Any std::exception” matches any standard exception.
+- Non-standard exceptions are reported separately.
+- Expected exceptions are normal test outcomes, not crashes.
+- Memory diagnostics remain independent from exception matching.
+- Failed constructors do not create usable scenario objects.
+- Result cards stay concise and technical details remain collapsed.
+
+## Memory-diagnostics architecture
+
+- Runtime tools are the source of truth for confirmed memory failures.
+- Source analysis only identifies likely locations and possible causes.
+- Memory categories and operation contexts are modeled separately.
+- Diagnostics use confirmed, likely, or possible confidence wording.
+- Do not add one-off explanations for individual test programs.
+- Tool-specific output must be normalized before classification.
+- Prefer one primary diagnosis over repeated symptoms.
+- Student-facing results show issue, location, cause, and direction.
+- Raw sanitizer and Valgrind evidence remains under Technical details.
+- Never expose temporary paths, raw addresses, or generated harness internals.
+- Infrastructure failures must not be reported as student-code failures.
+- Memory and exception outcomes remain independent.
+- Keep source excerpts minimal and escaped.
+- Do not attempt to replace a full C++ static analyzer.

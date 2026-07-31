@@ -7,7 +7,12 @@ import {
   ObjectScenarioTests,
   type EditableObjectScenario,
 } from "@/components/ObjectScenarioTests";
+import {
+  ExceptionExpectationFields,
+  type EditableExceptionExpectation,
+} from "@/components/ExceptionExpectationFields";
 import { useUploads } from "@/components/UploadProvider";
+import { exceptionExpectationPayload } from "@/lib/exceptionTestState";
 import {
   compileCpp,
   type CompileDiagnostic,
@@ -19,6 +24,7 @@ import {
   RunTestsRequestError,
   type FunctionCombinedTestResult,
   type FunctionDescriptor,
+  type ExceptionOutcomeResult,
   type FunctionMutationTestResult,
   type ObjectScenarioTestResult,
   type FunctionOutputTestResult,
@@ -27,6 +33,12 @@ import {
   type RunTestsResult,
   type TestModeAnalysis,
 } from "@/lib/testExecution";
+import { presentMemoryDiagnoses } from "@/lib/memoryDiagnostics";
+import {
+  createInitialObjectScenario,
+  isObjectScenarioReady,
+} from "@/lib/objectScenarioState";
+import { getObjectScenarioSummary } from "@/lib/objectScenarioSummary";
 
 type SidebarTab = "compiler" | "tests";
 type PrimaryDiagnostic = CompileDiagnostic & {
@@ -46,7 +58,7 @@ type IssueCategory =
   | "Operator issue"
   | "Warning"
   | "Other issue";
-type EditableTestCase = {
+type EditableTestCase = EditableExceptionExpectation & {
   id: string;
   name: string;
   stdin: string;
@@ -85,21 +97,13 @@ const INITIAL_TEST_CASE: EditableTestCase = {
   expected_return: "",
   expected_final_arguments: {},
   check_stdout: false,
+  expected_outcome: "return_value",
+  expected_exception_type: "",
+  exception_message_rule: "ignore",
+  expected_exception_message: "",
 };
-const INITIAL_OBJECT_SCENARIO: EditableObjectScenario = {
-  id: "scenario-1",
-  name: "Scenario 1",
-  objects: [
-    {
-      id: "object-1",
-      name: "object",
-      class_id: "",
-      constructor_id: "",
-      arguments: [],
-    },
-  ],
-  steps: [],
-};
+const INITIAL_OBJECT_SCENARIO: EditableObjectScenario =
+  createInitialObjectScenario();
 
 function mutableParameters(functionDescriptor: FunctionDescriptor) {
   return functionDescriptor.parameters.filter(
@@ -190,17 +194,26 @@ function isObjectScenarioResult(
 function didBehaviorPass(result: TestResult) {
   if (result.timed_out || result.output_limited) return false;
   if (isObjectScenarioResult(result)) {
+    const constructorPassed =
+      result.constructor_exception_result?.expectation_passed ??
+      result.constructor_completed;
     return (
-      result.constructor_completed &&
-      result.steps.every((step) => step.status === "completed" && step.passed)
+      constructorPassed &&
+      result.steps.every(
+        (step) => step.status === "not_executed" || step.passed,
+      )
     );
   }
   if (isFunctionCombinedResult(result)) {
     return (
+      (result.exception_result?.expectation_passed ?? true) &&
       (result.return_result?.passed ?? true) &&
       (result.stdout_result?.passed ?? true) &&
       result.mutation_results.every((mutation) => mutation.passed)
     );
+  }
+  if (result.exception_result && !result.exception_result.expectation_passed) {
+    return false;
   }
   if (isFunctionMutationResult(result)) {
     return Object.keys(result.mismatch_details).length === 0;
@@ -307,8 +320,17 @@ function ExpandableResultSection({
 function MemoryResultDetails({ result }: { result: TestResult }) {
   if (!result.memory_check_enabled) return null;
 
+  const memoryDiagnoses = result.memory_diagnoses ?? [];
+  const {
+    primary: primaryMemoryDiagnosis,
+    secondary: secondaryMemoryDiagnoses,
+    confidenceLabel,
+    likelyAccess,
+  } = presentMemoryDiagnoses(memoryDiagnoses);
   const diagnosis = isObjectScenarioResult(result)
-    ? result.big_five_diagnosis
+    ? primaryMemoryDiagnosis
+      ? null
+      : result.big_five_diagnosis
     : null;
   const memoryLine =
     result.memory_status === "clean"
@@ -350,6 +372,68 @@ function MemoryResultDetails({ result }: { result: TestResult }) {
           <span className="text-slate-500">{memoryLine[1]}</span>
         </p>
       </div>
+
+      {primaryMemoryDiagnosis && (
+        <section
+          aria-label="Primary memory diagnosis"
+          className={`mt-3 rounded-md border p-3 ${
+            primaryMemoryDiagnosis.confidence === "confirmed"
+              ? "border-rose-200"
+              : "border-amber-200"
+          }`}
+        >
+          <p
+            className={`text-[11px] font-semibold uppercase tracking-wide ${
+              primaryMemoryDiagnosis.confidence === "confirmed"
+                ? "text-rose-700"
+                : "text-amber-700"
+            }`}
+          >
+            {confidenceLabel}
+          </p>
+          <h4 className="mt-1 text-sm font-semibold text-slate-800">
+            {primaryMemoryDiagnosis.title}
+          </h4>
+          <p className="mt-1 text-xs leading-5 text-slate-600">
+            {primaryMemoryDiagnosis.summary}
+          </p>
+          {primaryMemoryDiagnosis.source_range && (
+            <div className="mt-2 text-xs text-slate-600">
+              <p className="font-medium">Likely access:</p>
+              <code className="mt-1 block max-w-full overflow-x-auto whitespace-pre-wrap break-words font-mono text-slate-800">
+                {likelyAccess}
+              </code>
+            </div>
+          )}
+          <p className="mt-2 text-xs leading-5 text-slate-600">
+            <span className="font-medium text-slate-700">
+              Suggested direction:
+            </span>{" "}
+            {primaryMemoryDiagnosis.suggested_direction}
+          </p>
+          {primaryMemoryDiagnosis.source_range && (
+            <ExpandableResultSection label="Show code">
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+                {primaryMemoryDiagnosis.source_range.excerpt}
+              </pre>
+            </ExpandableResultSection>
+          )}
+          {secondaryMemoryDiagnoses.length > 0 && (
+            <ul className="mt-3 space-y-2 border-t border-slate-200 pt-3">
+              {secondaryMemoryDiagnoses.map((item) => (
+                <li key={`${item.category}-${item.title}`}>
+                  <p className="text-xs font-medium text-slate-700">
+                    {item.title}
+                  </p>
+                  <p className="text-xs leading-5 text-slate-500">
+                    {item.summary}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       {diagnosis && (
         <section
@@ -444,6 +528,21 @@ function MemoryResultDetails({ result }: { result: TestResult }) {
             </ul>
           </div>
         )}
+        {memoryDiagnoses.flatMap((item) => item.technical_details).length >
+          0 && (
+          <div className="mt-3">
+            <p className="text-xs font-medium text-slate-700">
+              Classification evidence
+            </p>
+            <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-slate-600">
+              {memoryDiagnoses
+                .flatMap((item) => item.technical_details)
+                .map((detail) => (
+                  <li key={detail}>{detail}</li>
+                ))}
+            </ul>
+          </div>
+        )}
         {diagnosis && diagnosis.suspicious_ranges.length > 0 && (
           <div className="mt-3">
             <p className="text-xs font-medium text-slate-700">
@@ -473,17 +572,18 @@ function MemoryResultDetails({ result }: { result: TestResult }) {
             </p>
           )}
         {result.memory_diagnostics && (
-          <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
-            {result.memory_diagnostics}
-          </pre>
+          <ExpandableResultSection label="Raw memory output">
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+              {result.memory_diagnostics}
+            </pre>
+          </ExpandableResultSection>
         )}
         {result.stderr && (
-          <div className="mt-3">
-            <p className="text-xs font-medium text-slate-700">Runtime stderr</p>
-            <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
+          <ExpandableResultSection label="Runtime stderr">
+            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-xs leading-5 text-slate-100">
               {result.stderr}
             </pre>
-          </div>
+          </ExpandableResultSection>
         )}
       </ExpandableResultSection>
     </>
@@ -522,6 +622,9 @@ function ObjectScenarioSteps({ result }: { result: ObjectScenarioTestResult }) {
               : "FAIL"}
         </span>
       </div>
+      {step.exception_result && (
+        <ExceptionOutcomeSummary result={step.exception_result} />
+      )}
       {[step.return_result, step.stdout_result]
         .filter(
           (
@@ -565,6 +668,90 @@ function ObjectScenarioSteps({ result }: { result: ObjectScenarioTestResult }) {
         </details>
       )}
     </>
+  );
+}
+
+function ExceptionOutcomeSummary({
+  result,
+}: {
+  result: ExceptionOutcomeResult;
+}) {
+  const unexpectedStandard =
+    result.expected_outcome !== "throws" &&
+    result.actual_outcome === "threw_standard";
+  const wrongType =
+    result.expected_outcome === "throws" &&
+    result.actual_outcome === "threw_standard" &&
+    result.type_matched === false;
+  const wrongMessage =
+    result.expected_outcome === "throws" &&
+    result.type_matched === true &&
+    result.message_matched === false;
+  const expectedButReturned =
+    result.expected_outcome === "throws" &&
+    result.actual_outcome === "returned";
+
+  if (
+    result.expected_outcome !== "throws" &&
+    result.actual_outcome === "returned"
+  ) {
+    return null;
+  }
+
+  return (
+    <div className="mt-2 border-l-2 border-slate-200 pl-2 text-xs leading-5 text-slate-600">
+      <p className="font-medium text-slate-800">
+        {result.expectation_passed
+          ? "Expected exception matched"
+          : wrongType
+            ? "Wrong exception type"
+            : wrongMessage
+              ? "Exception message did not match"
+              : expectedButReturned
+                ? "Expected an exception, but the function returned normally."
+                : result.actual_outcome === "threw_non_standard"
+                  ? "Non-standard exception thrown"
+                  : unexpectedStandard
+                    ? "Unexpected exception"
+                    : result.actual_outcome === "timed_out"
+                      ? "Program timed out before producing the expected result."
+                      : "Program crashed before producing the expected result."}
+      </p>
+      {result.expected_outcome === "throws" && (
+        <p>
+          Expected:{" "}
+          <span className="font-mono">
+            {result.expected_exception_type === "any_std_exception"
+              ? "Any std::exception"
+              : result.expected_exception_type}
+          </span>
+        </p>
+      )}
+      {result.actual_exception_type && (
+        <p>
+          Actual:{" "}
+          <span className="font-mono">{result.actual_exception_type}</span>
+        </p>
+      )}
+      {result.actual_outcome === "threw_non_standard" && (
+        <p>The code threw a value that is not derived from std::exception.</p>
+      )}
+      {result.expected_outcome === "throws" &&
+        result.expected_message_rule !== "ignore" && (
+          <p>
+            Expected message:{" "}
+            <span className="font-mono">{result.expected_message}</span>
+          </p>
+        )}
+      {result.actual_message && (
+        <p>
+          Actual message:{" "}
+          <span className="font-mono">{result.actual_message}</span>
+        </p>
+      )}
+      {result.expectation_passed &&
+        result.expected_message_rule !== "ignore" && <p>Message matched</p>}
+    </div>
   );
 }
 
@@ -773,6 +960,24 @@ export default function EditorPage() {
                   nextId === previousId
                     ? test.check_stdout
                     : defaultOutputCheck(nextFunction),
+                expected_outcome:
+                  nextId === previousId
+                    ? test.expected_outcome
+                    : nextFunction?.return_type_metadata.kind === "void"
+                      ? "return_void"
+                      : "return_value",
+                expected_exception_type:
+                  nextId === previousId
+                    ? test.expected_exception_type
+                    : "",
+                exception_message_rule:
+                  nextId === previousId
+                    ? test.exception_message_rule
+                    : "ignore",
+                expected_exception_message:
+                  nextId === previousId
+                    ? test.expected_exception_message
+                    : "",
               })),
             );
           } else {
@@ -1029,6 +1234,29 @@ export default function EditorPage() {
       setActiveTab("tests");
       return;
     }
+    const invalidExceptionExpectation = (
+      expectation: EditableExceptionExpectation,
+    ) =>
+      expectation.expected_outcome === "throws" &&
+      (!expectation.expected_exception_type ||
+        (expectation.exception_message_rule !== "ignore" &&
+          !expectation.expected_exception_message));
+    if (
+      (testTarget === "function" &&
+        testCases.some(invalidExceptionExpectation)) ||
+      (testTarget === "object" &&
+        objectScenarios.some(
+          (scenario) =>
+            scenario.objects.some(invalidExceptionExpectation) ||
+            scenario.steps.some(invalidExceptionExpectation),
+        ))
+    ) {
+      setActiveTab("tests");
+      setTestRunError(
+        "Choose an exception type and provide a message for exact or contains matching.",
+      );
+      return;
+    }
     setActiveTab("tests");
     setIsRunningTests(true);
     setTestRunError(null);
@@ -1055,14 +1283,19 @@ export default function EditorPage() {
               tests: testCases.map((test) => ({
                 name: test.name,
                 arguments: test.arguments,
-                check_stdout: test.check_stdout,
-                ...(selectedFunction!.return_type_metadata.kind !== "void"
+                ...exceptionExpectationPayload(test),
+                check_stdout:
+                  test.expected_outcome === "throws"
+                    ? false
+                    : test.check_stdout,
+                ...(test.expected_outcome === "return_value"
                   ? { expected_return: test.expected_return }
                   : {}),
-                ...(test.check_stdout
+                ...(test.expected_outcome !== "throws" && test.check_stdout
                   ? { expected_stdout: test.expected_stdout }
                   : {}),
-                ...(mutableParameters?.length
+                ...(test.expected_outcome !== "throws" &&
+                mutableParameters?.length
                   ? {
                       expected_mutations: mutableParameters.map(
                         (parameter) => ({
@@ -1099,6 +1332,7 @@ export default function EditorPage() {
                       class_id: object.class_id,
                       constructor_id: object.constructor_id,
                       arguments: object.arguments,
+                      ...exceptionExpectationPayload(object),
                     })),
                     steps: scenario.steps.map((step) => {
                       const operator = testMode.classes
@@ -1116,7 +1350,32 @@ export default function EditorPage() {
                       const isMethodStep = ["method", "observer"].includes(
                         step.step_type,
                       );
-                      if (step.result_object_id) {
+                      const expectation =
+                        exceptionExpectationPayload(step);
+                      if (step.step_type === "create_object") {
+                        if (
+                          step.expected_outcome !== "throws" &&
+                          step.result_object_id
+                        ) {
+                          classByObjectId.set(
+                            step.result_object_id,
+                            step.class_id,
+                          );
+                        }
+                        return {
+                          ...expectation,
+                          step_type: step.step_type,
+                          class_id: step.class_id,
+                          constructor_id: step.constructor_id,
+                          arguments: step.arguments,
+                          result_object_id: step.result_object_id,
+                          result_name: step.result_name,
+                        };
+                      }
+                      if (
+                        step.expected_outcome !== "throws" &&
+                        step.result_object_id
+                      ) {
                         const resultClassId =
                           step.step_type === "operator"
                             ? operator?.return_object_class_id
@@ -1130,12 +1389,14 @@ export default function EditorPage() {
                       }
                       if (isMethodStep) {
                         return {
+                          ...expectation,
                           step_type: step.step_type,
                           target_object_id: step.target_object_id,
                           method_id: step.method_id,
                           arguments: step.arguments,
                           check_stdout: step.check_stdout,
-                          ...(method?.return_type_metadata.kind !== "void"
+                          ...(step.expected_outcome === "return_value" &&
+                          method?.return_type_metadata.kind !== "void"
                             ? { expected_return: step.expected_return }
                             : {}),
                           ...(step.check_stdout
@@ -1145,6 +1406,7 @@ export default function EditorPage() {
                       }
                       if (step.step_type === "operator") {
                         return {
+                          ...expectation,
                           step_type: step.step_type,
                           target_object_id: step.target_object_id,
                               operator_id: step.operator_id,
@@ -1156,7 +1418,8 @@ export default function EditorPage() {
                                     result_name: step.result_name,
                                   }
                                 : {}),
-                          ...(operator?.return_kind === "value"
+                          ...(step.expected_outcome === "return_value" &&
+                          operator?.return_kind === "value"
                             ? { expected_return: step.expected_return }
                             : {}),
                           ...(step.check_stdout
@@ -1165,6 +1428,7 @@ export default function EditorPage() {
                         };
                       }
                       return {
+                        ...expectation,
                         step_type: step.step_type,
                         target_object_id: step.target_object_id,
                         special_member_id: step.special_member_id,
@@ -1265,6 +1529,13 @@ export default function EditorPage() {
         expected_return: "",
         expected_final_arguments: {},
         check_stdout: defaultOutputCheck(selectedFunction),
+        expected_outcome:
+          selectedFunction?.return_type_metadata.kind === "void"
+            ? "return_void"
+            : "return_value",
+        expected_exception_type: "",
+        exception_message_rule: "ignore",
+        expected_exception_message: "",
       },
     ]);
     setTestRunResult(null);
@@ -1291,6 +1562,13 @@ export default function EditorPage() {
         expected_stdout: "",
         expected_final_arguments: {},
         check_stdout: defaultOutputCheck(nextFunction),
+        expected_outcome:
+          nextFunction?.return_type_metadata.kind === "void"
+            ? "return_void"
+            : "return_value",
+        expected_exception_type: "",
+        exception_message_rule: "ignore",
+        expected_exception_message: "",
       })),
     );
     setTestRunResult(null);
@@ -1402,21 +1680,7 @@ export default function EditorPage() {
   const objectScenariosReady =
     objectScenarios.length > 0 &&
     objectScenarios.every(
-      (scenario) =>
-        scenario.objects.length > 0 &&
-        scenario.objects.every(
-          (object) => object.class_id && object.constructor_id && object.name,
-        ) &&
-        scenario.steps.length > 0 &&
-        scenario.steps.every(
-          (step) =>
-            step.target_object_id &&
-            (["method", "observer"].includes(step.step_type)
-              ? step.method_id
-              : step.step_type === "operator"
-                ? step.operator_id
-                : step.special_member_id),
-        ),
+      (scenario) => isObjectScenarioReady(scenario),
     );
   const isCleanCompileSuccess =
     compileResult?.success === true &&
@@ -2111,8 +2375,51 @@ export default function EditorPage() {
                                 </p>
                               )}
                             </div>
+                            <ExceptionExpectationFields
+                              id={test.id}
+                              value={test}
+                              supportsReturnValue={
+                                selectedFunction.return_type_metadata.kind !==
+                                "void"
+                              }
+                              onChange={(expectation) => {
+                                setTestCases((current) =>
+                                  current.map((item) =>
+                                    item.id === test.id
+                                      ? {
+                                          ...item,
+                                          ...expectation,
+                                          expected_return:
+                                            expectation.expected_outcome ===
+                                            "return_value"
+                                              ? item.expected_return
+                                              : "",
+                                          check_stdout:
+                                            expectation.expected_outcome ===
+                                            "throws"
+                                              ? false
+                                              : item.check_stdout,
+                                          expected_stdout:
+                                            expectation.expected_outcome ===
+                                            "throws"
+                                              ? ""
+                                              : item.expected_stdout,
+                                          expected_final_arguments:
+                                            expectation.expected_outcome ===
+                                            "throws"
+                                              ? {}
+                                              : item.expected_final_arguments,
+                                        }
+                                      : item,
+                                  ),
+                                );
+                                setTestRunResult(null);
+                                setTestRunError(null);
+                              }}
+                            />
                             {selectedFunction.return_type_metadata.kind !==
-                              "void" && (
+                              "void" &&
+                              test.expected_outcome === "return_value" && (
                               <>
                                 <label
                                   htmlFor={`${test.id}-expected-return`}
@@ -2176,6 +2483,7 @@ export default function EditorPage() {
                                 )}
                               </>
                             )}
+                            {test.expected_outcome !== "throws" && (
                             <label className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-600">
                               <input
                                 type="checkbox"
@@ -2190,7 +2498,9 @@ export default function EditorPage() {
                               />
                               Check function output
                             </label>
-                            {test.check_stdout && (
+                            )}
+                            {test.expected_outcome !== "throws" &&
+                              test.check_stdout && (
                               <>
                                 <label
                                   htmlFor={`${test.id}-expected-output`}
@@ -2214,7 +2524,8 @@ export default function EditorPage() {
                                 />
                               </>
                             )}
-                            {mutableParameters &&
+                            {test.expected_outcome !== "throws" &&
+                              mutableParameters &&
                               mutableParameters.length > 0 && (
                               <>
                                 <p className="mt-3 text-xs font-medium text-slate-600">
@@ -2429,6 +2740,9 @@ export default function EditorPage() {
                     <ul className="mt-4 space-y-3" aria-label="Test results">
                       {testRunResult.tests.map((result, index) => {
                         const presentation = getResultPresentation(result);
+                        const scenarioSummary = isObjectScenarioResult(result)
+                          ? getObjectScenarioSummary(result)
+                          : null;
                         return (
                         <li
                           key={`${result.name}-${index}`}
@@ -2472,26 +2786,31 @@ export default function EditorPage() {
                               )}
                             </div>
                           )}
+                          {result.exception_result && (
+                            <ExceptionOutcomeSummary
+                              result={result.exception_result}
+                            />
+                          )}
                           {isObjectScenarioResult(result) && (
                             <div className="mt-3 space-y-2">
-                              <div className="rounded bg-slate-50 p-2">
-                                <p className="text-xs font-medium text-slate-600">
-                                  {result.constructor_completed
-                                    ? "Constructed"
-                                    : "Construction failed"}
+                              <div className="min-w-0 rounded bg-slate-50 p-2 text-xs leading-5">
+                                <p className="font-medium text-slate-800">
+                                  {scenarioSummary?.title}
                                 </p>
-                                {result.constructed_objects.map((item) => (
-                                  <p
-                                    key={item}
-                                    className="mt-1 break-words font-mono text-xs text-slate-800"
-                                  >
-                                    {item}
+                                {scenarioSummary?.detail && (
+                                  <p className="break-words font-mono text-slate-700">
+                                    {scenarioSummary.detail}
                                   </p>
-                                ))}
+                                )}
+                                {scenarioSummary?.supporting && (
+                                  <p className="text-slate-600">
+                                    {scenarioSummary.supporting}
+                                  </p>
+                                )}
                                 {result.moved_from_objects.map((item) => (
                                   <p
                                     key={`moved-${item}`}
-                                    className="mt-1 text-xs text-slate-500"
+                                    className="text-slate-500"
                                   >
                                     {item} — moved from
                                   </p>

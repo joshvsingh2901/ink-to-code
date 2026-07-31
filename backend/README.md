@@ -200,6 +200,20 @@ Memory diagnostics prefer the dedicated Linux runner when
 `CPP_EXECUTION_PROVIDER=auto` and Docker is available. Install Docker Desktop,
 then build the fixed local image from the repository root:
 
+Runtime output is normalized into bounded, tool-independent findings before it
+is classified. The API retains the existing memory status fields and adds up
+to three `memory_diagnoses` per test result. Each diagnosis contains a stable
+category, confidence, concise explanation, optional minimal source range,
+suggested direction, and collapsed technical evidence. AddressSanitizer,
+UndefinedBehaviorSanitizer, LeakSanitizer, and Valgrind remain the authority
+for confirmed failures; conservative source analysis can only add a possible
+cause when runtime checking is incomplete.
+
+The frontend shows one primary diagnosis and at most two compact secondary
+summaries. Raw runtime output, provider/tool data, and classification evidence
+remain under Technical details. Temporary paths and generated harness frames
+are not used as the main student source location.
+
 ```bash
 docker build -t inktocode-cpp-runner ./runner
 ```
@@ -265,6 +279,29 @@ additional isolation controls. Never use privileged containers for submitted
 code.
 
 ### Object scenario testing
+
+Exception expectations are available for function tests, constructors, object
+methods, operators, and supported copy/move steps. Each expectation is a
+structured choice between a return value, normal void completion, or a thrown
+exception. The backend maps validated exception enums to a fixed C++ allowlist;
+raw client type text is never inserted into generated harness source.
+
+Named exception types use exact matching. `any_std_exception` accepts any value
+catchable as `const std::exception&`; integers, string literals, and other
+non-standard values are reported separately. Messages may be ignored, matched
+exactly, or matched as case-sensitive substrings. Exact and substring rules
+require a non-empty expected message.
+
+Harnesses write exception outcomes to structured sidecar metadata instead of
+parsing student output or stderr. Expected exceptions remain independent from
+memory diagnostics, and a matching exception cannot hide a sanitizer or
+Valgrind failure. Objects whose constructors are expected to throw are not
+available to later scenario steps.
+
+Constructor exceptions use the ordered `create_object` scenario step. Setup
+objects remain pre-step fixtures that are expected to construct normally.
+Successful create steps register their object for later steps; expected or
+failed construction does not create a usable object.
 
 Object scenario mode discovers usable inline public constructors and public
 instance methods on classes and structs. Each scenario selects one or more

@@ -106,6 +106,32 @@ export type ProgramTestInput = {
   expected_stdout: string;
 };
 
+export type ExpectedOutcomeKind = "return_value" | "return_void" | "throws";
+export type ExceptionMessageRule = "ignore" | "exact" | "contains";
+export type SupportedExceptionType =
+  | "any_std_exception"
+  | "std::exception"
+  | "std::runtime_error"
+  | "std::logic_error"
+  | "std::invalid_argument"
+  | "std::domain_error"
+  | "std::length_error"
+  | "std::out_of_range"
+  | "std::overflow_error"
+  | "std::underflow_error"
+  | "std::range_error"
+  | "std::bad_alloc"
+  | "std::bad_cast"
+  | "std::bad_typeid"
+  | "std::bad_function_call";
+
+export type ExceptionExpectationInput = {
+  expected_outcome: ExpectedOutcomeKind;
+  expected_exception_type?: SupportedExceptionType;
+  exception_message_rule?: ExceptionMessageRule;
+  expected_exception_message?: string;
+};
+
 export type FunctionTestInput = {
   name: string;
   arguments: string[];
@@ -127,7 +153,7 @@ export type FunctionMutationTestInput = {
   }>;
 };
 
-export type FunctionCombinedTestInput = {
+export type FunctionCombinedTestInput = ExceptionExpectationInput & {
   name: string;
   arguments: string[];
   expected_return?: string;
@@ -144,9 +170,10 @@ export type ObjectScenarioTestInput = {
     class_id: string;
     constructor_id: string;
     arguments: string[];
-  }>;
+  } & ExceptionExpectationInput>;
   steps: Array<{
     step_type:
+      | "create_object"
       | "method"
       | "observer"
       | "operator"
@@ -156,8 +183,10 @@ export type ObjectScenarioTestInput = {
       | "move_construct"
       | "move_assign";
     method_id?: string;
+    class_id?: string;
+    constructor_id?: string;
     operator_id?: string;
-    target_object_id: string;
+    target_object_id?: string;
     arguments?: string[];
     operands?: string[];
     result_object_id?: string;
@@ -167,7 +196,26 @@ export type ObjectScenarioTestInput = {
     expected_return?: string;
     check_stdout?: boolean;
     expected_stdout?: string;
-  }>;
+  } & ExceptionExpectationInput>;
+};
+
+export type ExceptionOutcomeResult = {
+  expected_outcome: ExpectedOutcomeKind;
+  actual_outcome:
+    | "returned"
+    | "threw_standard"
+    | "threw_non_standard"
+    | "crashed"
+    | "timed_out";
+  expected_exception_type: SupportedExceptionType | null;
+  actual_exception_type: string | null;
+  expected_message_rule: ExceptionMessageRule;
+  expected_message: string | null;
+  actual_message: string | null;
+  type_matched: boolean | null;
+  message_matched: boolean | null;
+  expectation_passed: boolean;
+  execution_continued: boolean;
 };
 
 type ResultBase = {
@@ -197,11 +245,33 @@ type ResultBase = {
   leaked_bytes: number | null;
   leaked_allocations: number | null;
   leak_kind: string | null;
+  memory_diagnoses?: MemoryDiagnosis[];
   match_type:
     | "exact"
     | "whitespace_normalized"
     | "formatting_mismatch"
     | "mismatch";
+  exception_result?: ExceptionOutcomeResult | null;
+};
+
+export type MemoryDiagnosis = {
+  category: string;
+  title: string;
+  confidence: "confirmed" | "likely" | "possible";
+  summary: string;
+  likely_cause: string | null;
+  source_range: {
+    start_line: number;
+    end_line: number;
+    excerpt: string;
+    label: string;
+    confidence: "confirmed" | "likely" | "possible";
+  } | null;
+  suggested_direction: string;
+  related_operation: string | null;
+  confirmed_by: string[];
+  technical_details: string[];
+  supporting_findings: string[];
 };
 
 export type MemoryStatus =
@@ -285,6 +355,7 @@ export type ObjectScenarioTestResult = ResultBase & {
     index: number;
     method_id: string | null;
     step_type:
+      | "create_object"
       | "method"
       | "observer"
       | "operator"
@@ -301,8 +372,10 @@ export type ObjectScenarioTestResult = ResultBase & {
     passed: boolean;
     return_result: FunctionChannelResult | null;
     stdout_result: FunctionChannelResult | null;
+    exception_result: ExceptionOutcomeResult | null;
   }>;
   big_five_diagnosis: BigFiveDiagnosis | null;
+  constructor_exception_result: ExceptionOutcomeResult | null;
 };
 
 export type BigFiveDiagnosis = {
@@ -585,7 +658,51 @@ function isResultBase(value: unknown): value is ResultBase {
     (result.leaked_allocations === null ||
       typeof result.leaked_allocations === "number") &&
     (result.leak_kind === null || typeof result.leak_kind === "string") &&
-    isMatchType(result.match_type)
+    (result.memory_diagnoses === undefined ||
+      (Array.isArray(result.memory_diagnoses) &&
+        result.memory_diagnoses.every(isMemoryDiagnosis))) &&
+    isMatchType(result.match_type) &&
+    (result.exception_result === undefined ||
+      result.exception_result === null ||
+      isExceptionOutcomeResult(result.exception_result))
+  );
+}
+
+function isMemoryDiagnosis(value: unknown): value is MemoryDiagnosis {
+  if (!value || typeof value !== "object") return false;
+  const diagnosis = value as Partial<MemoryDiagnosis>;
+  const sourceRange = diagnosis.source_range;
+  return (
+    typeof diagnosis.category === "string" &&
+    typeof diagnosis.title === "string" &&
+    ["confirmed", "likely", "possible"].includes(
+      diagnosis.confidence ?? "",
+    ) &&
+    typeof diagnosis.summary === "string" &&
+    (diagnosis.likely_cause === null ||
+      typeof diagnosis.likely_cause === "string") &&
+    (sourceRange === null ||
+      (typeof sourceRange === "object" &&
+        typeof sourceRange.start_line === "number" &&
+        typeof sourceRange.end_line === "number" &&
+        typeof sourceRange.excerpt === "string" &&
+        typeof sourceRange.label === "string" &&
+        ["confirmed", "likely", "possible"].includes(
+          sourceRange.confidence,
+        ))) &&
+    typeof diagnosis.suggested_direction === "string" &&
+    (diagnosis.related_operation === null ||
+      typeof diagnosis.related_operation === "string") &&
+    Array.isArray(diagnosis.confirmed_by) &&
+    diagnosis.confirmed_by.every((item) => typeof item === "string") &&
+    Array.isArray(diagnosis.technical_details) &&
+    diagnosis.technical_details.every(
+      (item) => typeof item === "string",
+    ) &&
+    Array.isArray(diagnosis.supporting_findings) &&
+    diagnosis.supporting_findings.every(
+      (item) => typeof item === "string",
+    )
   );
 }
 
@@ -684,6 +801,8 @@ function isTestResult(
       (item) => typeof item === "string",
     ) &&
     typeof objectResult.destruction_failed === "boolean" &&
+    (objectResult.constructor_exception_result === null ||
+      isExceptionOutcomeResult(objectResult.constructor_exception_result)) &&
     (objectResult.big_five_diagnosis === null ||
       isBigFiveDiagnosis(objectResult.big_five_diagnosis)) &&
     (objectResult.failed_step_index === null ||
@@ -695,6 +814,7 @@ function isTestResult(
         typeof step === "object" &&
         typeof step.index === "number" &&
         [
+          "create_object",
           "method",
           "observer",
           "operator",
@@ -715,7 +835,9 @@ function isTestResult(
         (step.return_result === null ||
           isFunctionChannelResult(step.return_result)) &&
         (step.stdout_result === null ||
-          isFunctionChannelResult(step.stdout_result)),
+          isFunctionChannelResult(step.stdout_result)) &&
+        (step.exception_result === null ||
+          isExceptionOutcomeResult(step.exception_result)),
     );
   return (
     programResult ||
@@ -724,6 +846,42 @@ function isTestResult(
     mutationResult ||
     combinedResult ||
     scenarioResult
+  );
+}
+
+function isExceptionOutcomeResult(
+  value: unknown,
+): value is ExceptionOutcomeResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<ExceptionOutcomeResult>;
+  return (
+    ["return_value", "return_void", "throws"].includes(
+      result.expected_outcome ?? "",
+    ) &&
+    [
+      "returned",
+      "threw_standard",
+      "threw_non_standard",
+      "crashed",
+      "timed_out",
+    ].includes(result.actual_outcome ?? "") &&
+    (result.expected_exception_type === null ||
+      typeof result.expected_exception_type === "string") &&
+    (result.actual_exception_type === null ||
+      typeof result.actual_exception_type === "string") &&
+    ["ignore", "exact", "contains"].includes(
+      result.expected_message_rule ?? "",
+    ) &&
+    (result.expected_message === null ||
+      typeof result.expected_message === "string") &&
+    (result.actual_message === null ||
+      typeof result.actual_message === "string") &&
+    (result.type_matched === null ||
+      typeof result.type_matched === "boolean") &&
+    (result.message_matched === null ||
+      typeof result.message_matched === "boolean") &&
+    typeof result.expectation_passed === "boolean" &&
+    typeof result.execution_continued === "boolean"
   );
 }
 

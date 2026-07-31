@@ -372,7 +372,6 @@ function MemoryResultDetails({ result }: { result: TestResult }) {
           <span className="text-slate-500">{memoryLine[1]}</span>
         </p>
       </div>
-
       {primaryMemoryDiagnosis && (
         <section
           aria-label="Primary memory diagnosis"
@@ -622,6 +621,59 @@ function ObjectScenarioSteps({ result }: { result: ObjectScenarioTestResult }) {
               : "FAIL"}
         </span>
       </div>
+      {step.dispatch_kind && step.static_type && step.runtime_type && (
+        <div className="mt-2 text-xs leading-5 text-slate-600">
+          <p className="font-medium text-slate-700">
+            {step.dispatch_kind === "virtual"
+              ? "Virtual dispatch matched"
+              : "Base implementation selected"}
+          </p>
+          <p>Static type: {step.static_type}</p>
+          <p>Runtime type: {step.runtime_type}</p>
+          {step.dispatch_kind === "non_virtual" && (
+            <p>
+              The method is not virtual, so the static type determined the
+              call.
+            </p>
+          )}
+        </div>
+      )}
+      {step.slicing_occurred && step.static_type && (
+        <div className="mt-2 text-xs leading-5 text-slate-600">
+          <p className="font-medium text-slate-700">
+            Object slicing confirmed
+          </p>
+          <p>The copied object now has type {step.static_type}.</p>
+        </div>
+      )}
+      {step.cast_result && (
+        <div className="mt-2 text-xs leading-5 text-slate-600">
+          <p className="font-medium text-slate-700">
+            {step.cast_result === "succeeded"
+              ? "Cast succeeded"
+              : step.cast_result === "null"
+                ? "Cast returned null"
+                : "Cast threw std::bad_cast"}
+          </p>
+          {step.static_type && step.runtime_type && (
+            <p>
+              Static type: {step.static_type}; runtime type:{" "}
+              {step.runtime_type}
+            </p>
+          )}
+        </div>
+      )}
+      {step.step_type === "delete_base_pointer" &&
+        step.virtual_destructor === false && (
+          <div className="mt-2 text-xs leading-5 text-amber-800">
+            <p className="font-medium">Likely issue</p>
+            <p>Non-virtual base destructor</p>
+            <p>
+              Deleting a derived object through this base pointer may skip
+              derived cleanup.
+            </p>
+          </div>
+        )}
       {step.exception_result && (
         <ExceptionOutcomeSummary result={step.exception_result} />
       )}
@@ -1347,9 +1399,11 @@ export default function EditorPage() {
                       const method = targetClass?.methods.find(
                         (item) => item.id === step.method_id,
                       );
-                      const isMethodStep = ["method", "observer"].includes(
-                        step.step_type,
-                      );
+                      const isMethodStep = [
+                        "method",
+                        "observer",
+                        "polymorphic_method",
+                      ].includes(step.step_type);
                       const expectation =
                         exceptionExpectationPayload(step);
                       if (step.step_type === "create_object") {
@@ -1370,6 +1424,65 @@ export default function EditorPage() {
                           arguments: step.arguments,
                           result_object_id: step.result_object_id,
                           result_name: step.result_name,
+                        };
+                      }
+                      if (
+                        [
+                          "create_base_reference",
+                          "create_base_pointer",
+                          "slice_object",
+                        ].includes(step.step_type)
+                      ) {
+                        classByObjectId.set(
+                          step.result_object_id,
+                          step.base_class_id,
+                        );
+                        return {
+                          ...expectation,
+                          step_type: step.step_type,
+                          source_object_id: step.source_object_id,
+                          base_class_id: step.base_class_id,
+                          result_object_id: step.result_object_id,
+                          result_name: step.result_name,
+                        };
+                      }
+                      if (
+                        step.step_type === "create_owned_base_pointer"
+                      ) {
+                        if (step.expected_outcome !== "throws") {
+                          classByObjectId.set(
+                            step.result_object_id,
+                            step.base_class_id,
+                          );
+                        }
+                        return {
+                          ...expectation,
+                          step_type: step.step_type,
+                          base_class_id: step.base_class_id,
+                          derived_class_id: step.derived_class_id,
+                          constructor_id: step.constructor_id,
+                          arguments: step.arguments,
+                          result_object_id: step.result_object_id,
+                          result_name: step.result_name,
+                        };
+                      }
+                      if (step.step_type === "dynamic_cast") {
+                        return {
+                          ...expectation,
+                          step_type: step.step_type,
+                          source_object_id: step.source_object_id,
+                          cast_target_class_id:
+                            step.cast_target_class_id,
+                          cast_mode: step.cast_mode,
+                          expected_cast_result:
+                            step.expected_cast_result,
+                        };
+                      }
+                      if (step.step_type === "delete_base_pointer") {
+                        return {
+                          ...expectation,
+                          step_type: step.step_type,
+                          target_object_id: step.target_object_id,
                         };
                       }
                       if (

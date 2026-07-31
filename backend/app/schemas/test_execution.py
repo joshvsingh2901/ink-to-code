@@ -48,6 +48,12 @@ class ObjectMethodResponse(BaseModel):
     return_type: str
     return_type_metadata: FunctionTypeResponse
     is_const: bool
+    is_virtual: bool = False
+    is_pure_virtual: bool = False
+    is_override: bool = False
+    is_final: bool = False
+    overrides_method_id: str | None = None
+    override_mismatch_reason: str | None = None
 
 
 class ObjectOperatorParameterResponse(BaseModel):
@@ -97,6 +103,13 @@ class ObjectClassResponse(BaseModel):
     special_members: list[ObjectSpecialMemberResponse] = Field(
         default_factory=list
     )
+    base_class_id: str | None = None
+    inheritance_access: str | None = None
+    inheritance_supported: bool = True
+    is_abstract: bool = False
+    has_virtual_destructor: bool = False
+    derived_class_ids: list[str] = Field(default_factory=list)
+    inheritance_depth: int = Field(default=0, ge=0)
 
 
 class SourceModeRequest(BaseModel):
@@ -267,6 +280,13 @@ class FunctionRunTestsRequest(BaseModel):
 class ObjectScenarioStep(BaseModel):
     step_type: Literal[
         "create_object",
+        "create_base_reference",
+        "create_base_pointer",
+        "create_owned_base_pointer",
+        "polymorphic_method",
+        "delete_base_pointer",
+        "slice_object",
+        "dynamic_cast",
         "method",
         "observer",
         "operator",
@@ -287,6 +307,13 @@ class ObjectScenarioStep(BaseModel):
     result_name: str | None = Field(default=None, max_length=100)
     special_member_id: str | None = Field(default=None, max_length=700)
     source_object_id: str | None = Field(default=None, max_length=100)
+    base_class_id: str | None = Field(default=None, max_length=200)
+    derived_class_id: str | None = Field(default=None, max_length=200)
+    cast_target_class_id: str | None = Field(default=None, max_length=200)
+    cast_mode: Literal["pointer", "reference"] | None = None
+    expected_cast_result: Literal[
+        "succeeds", "returns_null", "throws_bad_cast"
+    ] | None = None
     expected_return: str | None = Field(default=None, max_length=1_000)
     check_stdout: bool = False
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
@@ -340,6 +367,50 @@ class ObjectScenarioStep(BaseModel):
             if self.expected_outcome == "return_value":
                 raise ValueError(
                     "Constructors cannot have an expected return value."
+                )
+        if self.step_type in {
+            "create_base_reference",
+            "create_base_pointer",
+            "slice_object",
+        }:
+            if not self.source_object_id:
+                raise ValueError(
+                    "Base views and slices require a source object."
+                )
+            if not self.base_class_id:
+                raise ValueError("Select a validated base class.")
+            if not self.result_object_id or not self.result_name:
+                raise ValueError("Provide a unique result name.")
+        if self.step_type == "create_owned_base_pointer":
+            if not all(
+                (
+                    self.base_class_id,
+                    self.derived_class_id,
+                    self.constructor_id,
+                    self.result_object_id,
+                    self.result_name,
+                )
+            ):
+                raise ValueError(
+                    "Owned base pointers require a base, derived class, "
+                    "constructor, and unique pointer name."
+                )
+        if self.step_type == "polymorphic_method" and not self.method_id:
+            raise ValueError("Polymorphic calls require a method.")
+        if self.step_type == "delete_base_pointer" and not self.target_object_id:
+            raise ValueError("Base-pointer deletion requires an owned pointer.")
+        if self.step_type == "dynamic_cast":
+            if not all(
+                (
+                    self.source_object_id,
+                    self.cast_target_class_id,
+                    self.cast_mode,
+                    self.expected_cast_result,
+                )
+            ):
+                raise ValueError(
+                    "Dynamic casts require a source, target, mode, and "
+                    "expected cast result."
                 )
         if self.step_type in {"method", "observer"} and not self.method_id:
             raise ValueError("Method steps require a method identifier.")
@@ -675,6 +746,13 @@ class ObjectScenarioStepResult(BaseModel):
     index: int
     step_type: Literal[
         "create_object",
+        "create_base_reference",
+        "create_base_pointer",
+        "create_owned_base_pointer",
+        "polymorphic_method",
+        "delete_base_pointer",
+        "slice_object",
+        "dynamic_cast",
         "method",
         "observer",
         "operator",
@@ -694,6 +772,16 @@ class ObjectScenarioStepResult(BaseModel):
     return_result: FunctionChannelResult | None = None
     stdout_result: FunctionChannelResult | None = None
     exception_result: ExceptionOutcomeResult | None = None
+    static_type: str | None = None
+    runtime_type: str | None = None
+    ownership_mode: Literal[
+        "value", "reference", "non_owning_pointer", "owned_pointer"
+    ] | None = None
+    dispatch_kind: Literal["virtual", "non_virtual"] | None = None
+    selected_implementation: str | None = None
+    slicing_occurred: bool = False
+    cast_result: Literal["succeeded", "null", "threw_bad_cast"] | None = None
+    virtual_destructor: bool | None = None
 
 
 class SuspiciousSourceRange(BaseModel):

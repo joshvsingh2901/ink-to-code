@@ -476,7 +476,9 @@ The expected request should contain the current source code in structured JSON, 
 - Private fields must never be accessed or exposed by the generated harness.
 - Constructors and methods must be identified by full signatures, not names alone.
 - The original Monaco source must remain unchanged.
-- Automatic Big Five generation, inheritance, memory diagnostics, and arbitrary multi-object interactions remain separate future stages.
+- Automatic Big Five generation and arbitrary multi-object interactions remain separate future stages.
+- Supported single-public-inheritance scenarios follow the inheritance and
+  polymorphism rules below.
 
 ## Operator-overload scenario testing
 
@@ -583,3 +585,17 @@ The expected request should contain the current source code in structured JSON, 
 - Memory and exception outcomes remain independent.
 - Keep source excerpts minimal and escaped.
 - Do not attempt to replace a full C++ static analyzer.
+
+## Inheritance and polymorphism testing
+
+- Support single public inheritance first.
+- Static type and runtime type must be tracked separately.
+- Virtual dispatch, non-virtual dispatch, and slicing are distinct outcomes.
+- Do not construct abstract classes directly.
+- Base pointers and references must come from validated parsed relationships.
+- Deleting through a base pointer requires ownership tracking.
+- A non-virtual base destructor is a structural warning unless runtime evidence confirms memory failure.
+- Runtime tools remain the source of truth for confirmed cleanup failures.
+- Do not inject raw frontend class or method names into generated C++.
+- Keep polymorphism results concise and show technical lifecycle details only when expanded.
+- Do not add multiple inheritance or virtual inheritance without a separate design stage.

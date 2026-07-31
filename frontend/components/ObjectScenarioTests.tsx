@@ -28,6 +28,13 @@ export type EditableObjectStep = EditableExceptionExpectation & {
   id: string;
   step_type:
     | "create_object"
+    | "create_base_reference"
+    | "create_base_pointer"
+    | "create_owned_base_pointer"
+    | "polymorphic_method"
+    | "delete_base_pointer"
+    | "slice_object"
+    | "dynamic_cast"
     | "method"
     | "observer"
     | "operator"
@@ -47,6 +54,11 @@ export type EditableObjectStep = EditableExceptionExpectation & {
   result_name: string;
   special_member_id: string;
   source_object_id: string;
+  base_class_id: string;
+  derived_class_id: string;
+  cast_target_class_id: string;
+  cast_mode: "pointer" | "reference";
+  expected_cast_result: "succeeds" | "returns_null" | "throws_bad_cast";
   expected_return: string;
   check_stdout: boolean;
   expected_stdout: string;
@@ -67,7 +79,8 @@ type Props = {
 };
 
 function newObject(classes: ObjectClass[], index: number): EditableScenarioObject {
-  const objectClass = classes.length === 1 ? classes[0] : null;
+  const constructible = classes.filter((item) => !item.is_abstract);
+  const objectClass = constructible.length === 1 ? constructible[0] : null;
   const constructor =
     objectClass?.constructors.length === 1 ? objectClass.constructors[0] : null;
   return {
@@ -98,6 +111,11 @@ function newStep(targetId: string): EditableObjectStep {
     result_name: "",
     special_member_id: "",
     source_object_id: "",
+    base_class_id: "",
+    derived_class_id: "",
+    cast_target_class_id: "",
+    cast_mode: "pointer",
+    expected_cast_result: "succeeds",
     expected_return: "",
     check_stdout: false,
     expected_stdout: "",
@@ -305,10 +323,20 @@ export function ObjectScenarioTests({
                         className="w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-slate-200"
                       >
                         <option value="">Choose a class</option>
-                        {classes.map((item) => (
-                          <option key={item.id} value={item.id}>
-                            {item.name}
-                          </option>
+                          {classes.map((item) => (
+                            <option
+                              key={item.id}
+                              value={item.id}
+                              disabled={item.is_abstract}
+                            >
+                              {item.name}
+                              {item.base_class_id
+                                ? ` — derives from ${item.base_class_id}`
+                                : ""}
+                              {item.is_abstract
+                                ? " — Abstract base class"
+                                : ""}
+                            </option>
                         ))}
                       </select>
                       {objectClass && (
@@ -386,6 +414,8 @@ export function ObjectScenarioTests({
                   (item) => item.expected_outcome !== "throws",
                 );
                 const movedFrom = new Set<string>();
+                const ownedPointerIds = new Set<string>();
+                const deletedPointerIds = new Set<string>();
                 for (const priorStep of scenario.steps.slice(0, stepIndex)) {
                   const source = priorObjects.find(
                     (item) => item.id === priorStep.source_object_id,
@@ -405,6 +435,13 @@ export function ObjectScenarioTests({
                       class_id:
                         priorStep.step_type === "create_object"
                           ? priorStep.class_id
+                          : [
+                                "create_base_reference",
+                                "create_base_pointer",
+                                "create_owned_base_pointer",
+                                "slice_object",
+                              ].includes(priorStep.step_type)
+                            ? priorStep.base_class_id
                           : operatorClass ?? source?.class_id ?? "",
                       constructor_id: "",
                       arguments: [],
@@ -413,6 +450,15 @@ export function ObjectScenarioTests({
                       exception_message_rule: "ignore",
                       expected_exception_message: "",
                     });
+                    if (
+                      priorStep.step_type ===
+                      "create_owned_base_pointer"
+                    ) {
+                      ownedPointerIds.add(priorStep.result_object_id);
+                    }
+                  }
+                  if (priorStep.step_type === "delete_base_pointer") {
+                    deletedPointerIds.add(priorStep.target_object_id);
                   }
                   if (
                     priorStep.step_type === "move_construct" ||
@@ -427,7 +473,10 @@ export function ObjectScenarioTests({
                     movedFrom.delete(priorStep.target_object_id);
                   }
                 }
-                const target = priorObjects.find(
+                const livePriorObjects = priorObjects.filter(
+                  (item) => !deletedPointerIds.has(item.id),
+                );
+                const target = livePriorObjects.find(
                   (item) => item.id === step.target_object_id,
                 );
                 const targetClass = classes.find(
@@ -528,6 +577,13 @@ export function ObjectScenarioTests({
                       onChange={(event) => {
                         const nextType = event.target.value as
                             | "create_object"
+                            | "create_base_reference"
+                            | "create_base_pointer"
+                            | "create_owned_base_pointer"
+                            | "polymorphic_method"
+                            | "delete_base_pointer"
+                            | "slice_object"
+                            | "dynamic_cast"
                             | "method"
                             | "observer"
                             | "operator"
@@ -589,7 +645,13 @@ export function ObjectScenarioTests({
                             ...newStep(current.target_object_id),
                             id: current.id,
                             step_type: nextType,
-                            ...(nextType === "create_object"
+                            ...([
+                              "create_object",
+                              "create_base_reference",
+                              "create_base_pointer",
+                              "create_owned_base_pointer",
+                              "slice_object",
+                            ].includes(nextType)
                               ? {
                                   target_object_id: "",
                                   result_object_id: `object-${crypto.randomUUID()}`,
@@ -609,6 +671,23 @@ export function ObjectScenarioTests({
                       className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
                     >
                       <option value="create_object">Create object</option>
+                      <option value="create_base_reference">
+                        Create base reference view
+                      </option>
+                      <option value="create_base_pointer">
+                        Create base pointer view
+                      </option>
+                      <option value="create_owned_base_pointer">
+                        Create owned base pointer
+                      </option>
+                      <option value="polymorphic_method">
+                        Polymorphic method call
+                      </option>
+                      <option value="delete_base_pointer">
+                        Delete through base pointer
+                      </option>
+                      <option value="slice_object">Slice object</option>
+                      <option value="dynamic_cast">Dynamic cast</option>
                       <option value="method">Method call</option>
                       <option value="observer">Observer method call</option>
                       <option value="operator">Operator call</option>
@@ -636,7 +715,14 @@ export function ObjectScenarioTests({
                         <option value="move_assign">Move assign</option>
                       )}
                     </select>
-                    {step.step_type !== "create_object" && <select
+                    {![
+                      "create_object",
+                      "create_base_reference",
+                      "create_base_pointer",
+                      "create_owned_base_pointer",
+                      "slice_object",
+                      "dynamic_cast",
+                    ].includes(step.step_type) && <select
                       aria-label={`Step ${stepIndex + 1} target object`}
                       value={step.target_object_id}
                       onChange={(event) =>
@@ -656,7 +742,13 @@ export function ObjectScenarioTests({
                       className="mt-2 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
                     >
                       <option value="">Choose an object</option>
-                      {priorObjects.map((item) => (
+                      {livePriorObjects
+                        .filter(
+                          (item) =>
+                            step.step_type !== "delete_base_pointer" ||
+                            ownedPointerIds.has(item.id),
+                        )
+                        .map((item) => (
                         <option
                           key={item.id}
                           value={item.id}
@@ -715,8 +807,18 @@ export function ObjectScenarioTests({
                           >
                             <option value="">Choose a class</option>
                             {classes.map((item) => (
-                              <option key={item.id} value={item.id}>
+                              <option
+                                key={item.id}
+                                value={item.id}
+                                disabled={item.is_abstract}
+                              >
                                 {item.name}
+                                {item.base_class_id
+                                  ? ` — derives from ${item.base_class_id}`
+                                  : ""}
+                                {item.is_abstract
+                                  ? " — Abstract base class"
+                                  : ""}
                               </option>
                             ))}
                           </select>
@@ -771,7 +873,20 @@ export function ObjectScenarioTests({
                           ),
                         )}
                       </div>
-                    ) : ["method", "observer"].includes(step.step_type) ? (
+                    ) : [
+                        "create_base_reference",
+                        "create_base_pointer",
+                        "create_owned_base_pointer",
+                        "slice_object",
+                        "dynamic_cast",
+                      ].includes(step.step_type) ? (
+                      <PolymorphismStepFields
+                        step={step}
+                        classes={classes}
+                        objects={livePriorObjects}
+                        onChange={replaceStep}
+                      />
+                    ) : ["method", "observer", "polymorphic_method"].includes(step.step_type) ? (
                       <>
                         <select
                           aria-label={`Step ${stepIndex + 1} method`}
@@ -810,6 +925,12 @@ export function ObjectScenarioTests({
                             .map((item) => (
                             <option key={item.id} value={item.id}>
                               {item.display}
+                              {item.is_virtual
+                                ? " — virtual"
+                                : " — non-virtual"}
+                              {item.override_mismatch_reason
+                                ? ` — likely override mismatch: ${item.override_mismatch_reason}`
+                                : ""}
                             </option>
                             ))}
                         </select>
@@ -885,7 +1006,7 @@ export function ObjectScenarioTests({
                             id={`${step.id}-operand-${index}`}
                             parameter={parameter}
                             value={step.operands[index] ?? ""}
-                            objects={priorObjects}
+                            objects={livePriorObjects}
                             onChange={(value) =>
                               replaceStep((current) => ({
                                 ...current,
@@ -919,7 +1040,7 @@ export function ObjectScenarioTests({
                         step={step}
                         member={specialMember}
                         targetClass={targetClass}
-                        objects={priorObjects}
+                        objects={livePriorObjects}
                         movedFrom={movedFrom}
                         onChange={replaceStep}
                       />
@@ -927,7 +1048,12 @@ export function ObjectScenarioTests({
                     {(method ||
                       operator ||
                       specialMember ||
-                      createConstructor) && (
+                      createConstructor ||
+                      [
+                        "create_owned_base_pointer",
+                        "dynamic_cast",
+                        "delete_base_pointer",
+                      ].includes(step.step_type)) && (
                       <ExceptionExpectationFields
                         id={step.id}
                         value={step}
@@ -1036,6 +1162,295 @@ export function ObjectScenarioTests({
       >
         Add scenario
       </button>
+    </div>
+  );
+}
+
+function PolymorphismStepFields({
+  step,
+  classes,
+  objects,
+  onChange,
+}: {
+  step: EditableObjectStep;
+  classes: ObjectClass[];
+  objects: EditableScenarioObject[];
+  onChange: (
+    change: (step: EditableObjectStep) => EditableObjectStep,
+  ) => void;
+}) {
+  const source = objects.find(
+    (item) => item.id === step.source_object_id,
+  );
+  const derived = classes.find(
+    (item) =>
+      item.id ===
+      (step.step_type === "create_owned_base_pointer"
+        ? step.derived_class_id
+        : source?.class_id),
+  );
+  const castTargetIds = new Set(
+    [
+      derived?.id,
+      derived?.base_class_id,
+      ...(derived?.derived_class_ids ?? []),
+    ].filter((item): item is string => Boolean(item)),
+  );
+  const validBases = derived?.base_class_id
+    ? classes.filter(
+        (item) =>
+          item.id === derived.base_class_id &&
+          derived.inheritance_supported &&
+          derived.inheritance_access === "public",
+      )
+    : [];
+  const constructor = derived?.constructors.find(
+    (item) => item.id === step.constructor_id,
+  );
+  const needsSource = step.step_type !== "create_owned_base_pointer";
+  const createsName = step.step_type !== "dynamic_cast";
+
+  return (
+    <div className="mt-2 space-y-2">
+      {createsName && (
+        <ValueField
+          id={`${step.id}-polymorphic-name`}
+          label={
+            step.step_type === "create_owned_base_pointer"
+              ? "Pointer name"
+              : step.step_type === "slice_object"
+                ? "Sliced object name"
+                : "View name"
+          }
+          type={step.base_class_id || "Object"}
+          value={step.result_name}
+          placeholder="e.g. animal"
+          onChange={(value) =>
+            onChange((current) => ({
+              ...current,
+              result_name: value,
+              result_object_id:
+                current.result_object_id ||
+                `object-${crypto.randomUUID()}`,
+            }))
+          }
+        />
+      )}
+      {needsSource && (
+        <label className="block text-xs text-slate-700">
+          Existing object or view
+          <select
+            aria-label="Polymorphism source object"
+            value={step.source_object_id}
+            onChange={(event) => {
+              const next = objects.find(
+                (item) => item.id === event.target.value,
+              );
+              const nextClass = classes.find(
+                (item) => item.id === next?.class_id,
+              );
+              onChange((current) => ({
+                ...current,
+                source_object_id: next?.id ?? "",
+                base_class_id: nextClass?.base_class_id ?? "",
+                cast_target_class_id: "",
+              }));
+            }}
+            className="mt-1 w-full min-w-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+          >
+            <option value="">Choose an object</option>
+            {objects.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {step.step_type === "create_owned_base_pointer" && (
+        <label className="block text-xs text-slate-700">
+          Concrete derived class
+          <select
+            value={step.derived_class_id}
+            onChange={(event) => {
+              const next = classes.find(
+                (item) => item.id === event.target.value,
+              );
+              onChange((current) => ({
+                ...current,
+                derived_class_id: next?.id ?? "",
+                base_class_id: next?.base_class_id ?? "",
+                constructor_id: "",
+                arguments: [],
+              }));
+            }}
+            className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+          >
+            <option value="">Choose a derived class</option>
+            {classes
+              .filter(
+                (item) =>
+                  item.base_class_id &&
+                  item.inheritance_supported &&
+                  !item.is_abstract,
+              )
+              .map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+          </select>
+        </label>
+      )}
+      {step.step_type !== "dynamic_cast" && (
+        <label className="block text-xs text-slate-700">
+          Base class
+          <select
+            value={step.base_class_id}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                base_class_id: event.target.value,
+              }))
+            }
+            className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+          >
+            <option value="">Choose a base class</option>
+            {validBases.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {step.step_type === "create_owned_base_pointer" && derived && (
+        <>
+          <label className="block text-xs text-slate-700">
+            Constructor
+            <select
+              value={step.constructor_id}
+              onChange={(event) => {
+                const next = derived.constructors.find(
+                  (item) => item.id === event.target.value,
+                );
+                onChange((current) => ({
+                  ...current,
+                  constructor_id: next?.id ?? "",
+                  arguments: next?.parameters.map(() => "") ?? [],
+                }));
+              }}
+              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+            >
+              <option value="">Choose a constructor</option>
+              {derived.constructors.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.display}
+                </option>
+              ))}
+            </select>
+          </label>
+          {constructor?.parameters.map((parameter, index) => (
+            <ValueField
+              key={`${step.id}-poly-argument-${index}`}
+              id={`${step.id}-poly-argument-${index}`}
+              label={parameter.name}
+              type={parameter.type_metadata.display_type}
+              value={step.arguments[index] ?? ""}
+              onChange={(value) =>
+                onChange((current) => ({
+                  ...current,
+                  arguments: current.arguments.map((item, itemIndex) =>
+                    itemIndex === index ? value : item,
+                  ),
+                }))
+              }
+            />
+          ))}
+        </>
+      )}
+      {step.step_type === "dynamic_cast" && (
+        <>
+          <label className="block text-xs text-slate-700">
+            Target class
+            <select
+              value={step.cast_target_class_id}
+              onChange={(event) =>
+                onChange((current) => ({
+                  ...current,
+                  cast_target_class_id: event.target.value,
+                }))
+              }
+              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+            >
+              <option value="">Choose a related class</option>
+              {classes
+                .filter((item) => castTargetIds.has(item.id))
+                .map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="block text-xs text-slate-700">
+            Cast form
+            <select
+              value={step.cast_mode}
+              onChange={(event) =>
+                onChange((current) => ({
+                  ...current,
+                  cast_mode: event.target.value as "pointer" | "reference",
+                  expected_cast_result:
+                    event.target.value === "pointer"
+                      ? "succeeds"
+                      : "succeeds",
+                }))
+              }
+              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+            >
+              <option value="pointer">Pointer cast</option>
+              <option value="reference">Reference cast</option>
+            </select>
+          </label>
+          <label className="block text-xs text-slate-700">
+            Expected cast result
+            <select
+              value={step.expected_cast_result}
+              onChange={(event) =>
+                onChange((current) => {
+                  const result = event.target.value as
+                    | "succeeds"
+                    | "returns_null"
+                    | "throws_bad_cast";
+                  return {
+                    ...current,
+                    expected_cast_result: result,
+                    expected_outcome:
+                      result === "throws_bad_cast"
+                        ? "throws"
+                        : "return_void",
+                    expected_exception_type:
+                      result === "throws_bad_cast"
+                        ? "std::bad_cast"
+                        : "",
+                    exception_message_rule: "ignore",
+                    expected_exception_message: "",
+                  };
+                })
+              }
+              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+            >
+              <option value="succeeds">Succeeds</option>
+              {step.cast_mode === "pointer" ? (
+                <option value="returns_null">Returns null</option>
+              ) : (
+                <option value="throws_bad_cast">Throws std::bad_cast</option>
+              )}
+            </select>
+          </label>
+        </>
+      )}
     </div>
   );
 }

@@ -27,6 +27,12 @@ class ObjectMethod:
     parameters: tuple[FunctionParameter, ...]
     return_value_type: ValueType
     is_const: bool
+    is_virtual: bool = False
+    is_pure_virtual: bool = False
+    is_override: bool = False
+    is_final: bool = False
+    overrides_method_id: str | None = None
+    override_mismatch_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,13 @@ class ObjectClass:
     methods: tuple[ObjectMethod, ...]
     operators: tuple[ObjectOperator, ...] = ()
     special_members: tuple[ObjectSpecialMember, ...] = ()
+    base_class_id: str | None = None
+    inheritance_access: str | None = None
+    inheritance_supported: bool = True
+    is_abstract: bool = False
+    has_virtual_destructor: bool = False
+    derived_class_ids: tuple[str, ...] = ()
+    inheritance_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +115,17 @@ _SUPPORTED_OPERATORS = {
     "+", "-", "*", "/", "+=", "-=", "*=", "==", "!=", "<", "<=", ">",
     ">=", "[]", "()", "<<",
 }
+_PURE_VIRTUAL_METHOD = re.compile(
+    r"(?:^|[;:])\s*"
+    r"(?P<prefix>virtual\s+[^;{}()]+?\s+[A-Za-z_]\w*)\s*"
+    r"\((?P<parameters>[^()]*)\)\s*"
+    r"(?P<suffix>(?:const\s*)?(?:override\s*)?(?:final\s*)?)"
+    r"=\s*0\s*;"
+)
+_PUBLIC_INHERITANCE = re.compile(
+    r"^\s*:\s*(?P<access>public|protected|private)\s+"
+    r"(?P<base>[A-Za-z_]\w*)\s*$"
+)
 
 
 def _operator_parameter(
@@ -531,7 +555,6 @@ def _analyze_class_members(
             access != "public"
             or "static" in prefix.split()
             or prefix.startswith("~")
-            or "virtual" in prefix.split()
         ):
             continue
         parameters, _ = _parse_parameters(
@@ -556,7 +579,9 @@ def _analyze_class_members(
             )
             continue
 
-        method_match = _METHOD_PREFIX.fullmatch(prefix)
+        is_virtual = prefix.startswith("virtual ")
+        method_prefix = prefix.removeprefix("virtual ").strip()
+        method_match = _METHOD_PREFIX.fullmatch(method_prefix)
         if method_match is None:
             continue
         method_name = method_match.group("name")
@@ -587,6 +612,67 @@ def _analyze_class_members(
                 parameters=parameters,
                 return_value_type=return_type,
                 is_const=is_const,
+                is_virtual=is_virtual,
+                is_override=bool(re.search(r"\boverride\b", suffix)),
+                is_final=bool(re.search(r"\bfinal\b", suffix)),
+            )
+        )
+
+    for match in _PURE_VIRTUAL_METHOD.finditer(body):
+        if depths[match.start()] != 0:
+            continue
+        if _member_access_at(labels, match.start(), default_access) != "public":
+            continue
+        prefix = " ".join(match.group("prefix").split())
+        method_prefix = prefix.removeprefix("virtual ").strip()
+        method_match = _METHOD_PREFIX.fullmatch(method_prefix)
+        if method_match is None:
+            continue
+        parameters, _ = _parse_parameters(
+            match.group("parameters"),
+            unqualified_vector_allowed=unqualified_types_allowed,
+        )
+        if parameters is None:
+            continue
+        return_type, _ = _parse_value_type(
+            method_match.group("return_type"),
+            allow_reference=False,
+            unqualified_vector_allowed=unqualified_types_allowed,
+        )
+        if return_type is None:
+            if method_match.group("return_type").strip() == "void":
+                return_type = ValueType(kind="void", display_type="void")
+            else:
+                continue
+        is_const = bool(re.search(r"\bconst\b", match.group("suffix")))
+        canonical_parameters = _canonical_parameters(parameters)
+        const_suffix = " const" if is_const else ""
+        method_id = (
+            f"{class_name}::{method_match.group('name')}"
+            f"({canonical_parameters}){const_suffix}"
+            f"->{return_type.canonical_type}"
+        )
+        if any(item.id == method_id for item in methods):
+            continue
+        methods.append(
+            ObjectMethod(
+                id=method_id,
+                name=method_match.group("name"),
+                display=(
+                    f"{method_match.group('name')}({canonical_parameters})"
+                    f"{const_suffix} -> {return_type.display_type}"
+                ),
+                parameters=parameters,
+                return_value_type=return_type,
+                is_const=is_const,
+                is_virtual=True,
+                is_pure_virtual=True,
+                is_override=bool(
+                    re.search(r"\boverride\b", match.group("suffix"))
+                ),
+                is_final=bool(
+                    re.search(r"\bfinal\b", match.group("suffix"))
+                ),
             )
         )
 
@@ -774,9 +860,26 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
     for match in _CLASS_START.finditer(masked):
         if depths[match.start()] != 0:
             continue
+        base_class_id = None
+        inheritance_access = None
+        inheritance_supported = True
         if ":" in match.group("header"):
-            rejected_inheritance = True
-            continue
+            inheritance = _PUBLIC_INHERITANCE.fullmatch(
+                match.group("header")
+            )
+            if (
+                inheritance is None
+                or "," in match.group("header")
+                or "virtual" in match.group("header").split()
+            ):
+                rejected_inheritance = True
+                inheritance_supported = False
+            else:
+                base_class_id = inheritance.group("base")
+                inheritance_access = inheritance.group("access")
+                if inheritance_access != "public":
+                    rejected_inheritance = True
+                    inheritance_supported = False
         body_end = _matching_delimiter(masked, match.end() - 1, "{", "}")
         if body_end is None:
             continue
@@ -791,7 +894,16 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
             class_names=class_names,
             )
         )
-        if constructors:
+        is_abstract = any(method.is_pure_virtual for method in methods)
+        if not constructors and not is_abstract:
+            constructors = (
+                ObjectConstructor(
+                    id=f"{name}::{name}()",
+                    display=f"{name}()",
+                    parameters=(),
+                ),
+            )
+        if constructors or is_abstract:
             classes.append(
                 ObjectClass(
                     id=name,
@@ -801,10 +913,122 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
                     methods=methods,
                     operators=operators,
                     special_members=special_members,
+                    base_class_id=base_class_id,
+                    inheritance_access=inheritance_access,
+                    inheritance_supported=inheritance_supported,
+                    is_abstract=is_abstract,
+                    has_virtual_destructor=bool(
+                        re.search(
+                            rf"\bvirtual\s+~{re.escape(name)}\s*\(",
+                            masked[match.end():body_end],
+                        )
+                    ),
                 )
             )
 
-    message = None
+    by_id = {item.id: item for item in classes}
+    resolved: list[ObjectClass] = []
+    for object_class in classes:
+        base = (
+            by_id.get(object_class.base_class_id)
+            if object_class.base_class_id
+            else None
+        )
+        missing_base = (
+            object_class.base_class_id is not None and base is None
+        )
+        if missing_base:
+            rejected_inheritance = True
+        methods = []
+        for method in object_class.methods:
+            matching = next(
+                (
+                    candidate
+                    for candidate in (base.methods if base else ())
+                    if candidate.name == method.name
+                    and _canonical_parameters(candidate.parameters)
+                    == _canonical_parameters(method.parameters)
+                    and candidate.is_const == method.is_const
+                ),
+                None,
+            )
+            same_name = next(
+                (
+                    candidate
+                    for candidate in (base.methods if base else ())
+                    if candidate.name == method.name
+                    and candidate.is_virtual
+                ),
+                None,
+            )
+            mismatch_reason = None
+            if same_name and matching is None:
+                if same_name.is_const != method.is_const:
+                    mismatch_reason = "const qualification"
+                elif len(same_name.parameters) != len(method.parameters):
+                    mismatch_reason = "parameter count"
+                elif _canonical_parameters(
+                    same_name.parameters
+                ) != _canonical_parameters(method.parameters):
+                    mismatch_reason = "parameter types"
+                elif (
+                    same_name.return_value_type.canonical_type
+                    != method.return_value_type.canonical_type
+                ):
+                    mismatch_reason = "return type"
+            methods.append(
+                replace(
+                    method,
+                    is_virtual=method.is_virtual
+                    or bool(matching and matching.is_virtual),
+                    overrides_method_id=(
+                        matching.id
+                        if matching and matching.is_virtual
+                        else None
+                    ),
+                    override_mismatch_reason=mismatch_reason,
+                )
+            )
+        inherited_pure = {
+            (method.name, _canonical_parameters(method.parameters), method.is_const)
+            for method in (base.methods if base else ())
+            if method.is_pure_virtual
+        }
+        implemented = {
+            (method.name, _canonical_parameters(method.parameters), method.is_const)
+            for method in methods
+            if not method.is_pure_virtual
+        }
+        unresolved_pure = inherited_pure - implemented
+        depth = (base.inheritance_depth + 1) if base else 0
+        resolved.append(
+            replace(
+                object_class,
+                methods=tuple(methods),
+                is_abstract=object_class.is_abstract or bool(unresolved_pure),
+                inheritance_depth=depth,
+                inheritance_supported=(
+                    object_class.inheritance_supported and not missing_base
+                ),
+            )
+        )
+    classes = [
+        replace(
+            item,
+            derived_class_ids=tuple(
+                candidate.id
+                for candidate in resolved
+                if candidate.base_class_id == item.id
+            ),
+        )
+        for item in resolved
+    ]
+
+    message = (
+        "Inheritance is unsupported in object scenarios."
+        if rejected_inheritance
+        else None
+    )
     standalone = _analyze_standalone_operators(
         masked,
         class_names,
@@ -829,7 +1053,13 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
     classes = [
         object_class
         for object_class in classes
-        if object_class.methods or object_class.operators
+        if object_class.inheritance_supported
+        and (
+            object_class.methods
+            or object_class.operators
+            or object_class.base_class_id
+            or object_class.derived_class_ids
+        )
     ]
     if not classes:
         message = (

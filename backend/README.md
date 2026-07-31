@@ -317,10 +317,20 @@ channels. A runtime failure or timeout marks the current step failed and all
 later steps not executed. Object state is observed only through public method
 calls; the harness never accesses fields or rewrites the student's class.
 
-This first stage supports inline definitions and existing safe value and const
-reference types. It excludes inheritance, virtual dispatch, static methods,
-implicit special members, expected exceptions, arbitrary object interactions,
-and separate header/source definitions.
+Object analysis also supports one validated public base class. Scenario steps
+can create derived values, non-owning base reference or pointer views, owning
+base pointers, sliced base values, and validated dynamic casts. Static and
+runtime types remain separate in result metadata. Virtual calls use ordinary
+C++ dispatch; non-virtual calls correctly use the static type.
+
+Pure virtual methods mark a class abstract, so it cannot be constructed
+directly but remains available as a base pointer/reference type. Deleting an
+owned derived object through a base pointer tracks whether the parsed base
+destructor is virtual. A non-virtual destructor produces a structural warning;
+only sanitizer or Valgrind evidence can confirm a cleanup failure.
+
+Multiple inheritance, virtual inheritance, static methods, arbitrary object
+expressions, and separate header/source definitions remain unsupported.
 
 ### Operator-overload scenarios
 

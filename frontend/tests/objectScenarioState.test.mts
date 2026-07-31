@@ -250,3 +250,60 @@ test("scenario payload order contains exactly the surviving steps", () => {
     ["stable-1", "stable-2", "stable-3", "stable-5", "stable-6"],
   );
 });
+
+test("polymorphism steps keep stable IDs through deletion and reordering", () => {
+  const steps = [
+    { id: "derived", step_type: "create_object", value: "Dog" },
+    {
+      id: "base-ref",
+      step_type: "create_base_reference",
+      source_object_id: "dog",
+      base_class_id: "Animal",
+      value: "animalRef",
+    },
+    {
+      id: "dispatch",
+      step_type: "polymorphic_method",
+      target_object_id: "animal-ref",
+      value: "sound",
+    },
+  ];
+  const remaining = removeScenarioStep(steps, "derived");
+  assert.deepEqual(
+    remaining.map((step) => step.id),
+    ["base-ref", "dispatch"],
+  );
+  const reordered = [remaining[1], remaining[0]];
+  assert.equal(reordered[0].id, "dispatch");
+  assert.equal(reordered[1].source_object_id, "dog");
+  assert.equal(reordered[1].base_class_id, "Animal");
+});
+
+test("constructor-free polymorphism scenario readiness validates each shape", () => {
+  const common = {
+    objects: [],
+    steps: [
+      {
+        step_type: "create_base_reference",
+        target_object_id: "",
+        method_id: "",
+        operator_id: "",
+        special_member_id: "",
+        result_name: "animalRef",
+        result_object_id: "animal-ref",
+        class_id: "",
+        constructor_id: "",
+        source_object_id: "dog",
+        base_class_id: "Animal",
+      },
+    ],
+  };
+  assert.equal(isObjectScenarioReady(common), true);
+  assert.equal(
+    isObjectScenarioReady({
+      ...common,
+      steps: [{ ...common.steps[0], base_class_id: "" }],
+    }),
+    false,
+  );
+});

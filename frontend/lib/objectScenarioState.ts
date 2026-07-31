@@ -41,6 +41,12 @@ export function isObjectScenarioReady(scenario: {
     result_object_id: string;
     class_id: string;
     constructor_id: string;
+    source_object_id?: string;
+    base_class_id?: string;
+    derived_class_id?: string;
+    cast_target_class_id?: string;
+    cast_mode?: string;
+    expected_cast_result?: string;
   }>;
 }): boolean {
   return (
@@ -59,10 +65,36 @@ export function isObjectScenarioReady(scenario: {
               step.class_id &&
               step.constructor_id,
           )
+        : ["create_base_reference", "create_base_pointer", "slice_object"].includes(
+              step.step_type,
+            )
+          ? Boolean(
+              step.source_object_id &&
+                step.base_class_id &&
+                step.result_name &&
+                step.result_object_id,
+            )
+          : step.step_type === "create_owned_base_pointer"
+            ? Boolean(
+                step.base_class_id &&
+                  step.derived_class_id &&
+                  step.constructor_id &&
+                  step.result_name &&
+                  step.result_object_id,
+              )
+            : step.step_type === "dynamic_cast"
+              ? Boolean(
+                  step.source_object_id &&
+                    step.cast_target_class_id &&
+                    step.cast_mode &&
+                    step.expected_cast_result,
+                )
         : Boolean(
             step.target_object_id &&
-              (["method", "observer"].includes(step.step_type)
+              (["method", "observer", "polymorphic_method"].includes(step.step_type)
                 ? step.method_id
+                : step.step_type === "delete_base_pointer"
+                  ? true
                 : step.step_type === "operator"
                   ? step.operator_id
                   : step.special_member_id),

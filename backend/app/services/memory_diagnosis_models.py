@@ -52,6 +52,12 @@ OperationContext = Literal[
     "object_cleanup",
     "scenario_cleanup",
     "temporary_object",
+    "polymorphic_call",
+    "base_pointer_deletion",
+    "derived_destruction",
+    "base_destruction",
+    "object_slicing",
+    "dynamic_cast",
     "unknown",
 ]
 

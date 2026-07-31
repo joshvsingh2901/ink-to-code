@@ -124,6 +124,14 @@ async def analyze_source_mode(
                             method.return_value_type
                         ),
                         is_const=method.is_const,
+                        is_virtual=method.is_virtual,
+                        is_pure_virtual=method.is_pure_virtual,
+                        is_override=method.is_override,
+                        is_final=method.is_final,
+                        overrides_method_id=method.overrides_method_id,
+                        override_mismatch_reason=(
+                            method.override_mismatch_reason
+                        ),
                     )
                     for method in object_class.methods
                 ],
@@ -177,13 +185,22 @@ async def analyze_source_mode(
                     )
                     for member in object_class.special_members
                 ],
+                base_class_id=object_class.base_class_id,
+                inheritance_access=object_class.inheritance_access,
+                inheritance_supported=object_class.inheritance_supported,
+                is_abstract=object_class.is_abstract,
+                has_virtual_destructor=(
+                    object_class.has_virtual_destructor
+                ),
+                derived_class_ids=list(object_class.derived_class_ids),
+                inheritance_depth=object_class.inheritance_depth,
             )
             for object_class in object_analysis.classes
         ],
         available_modes=available_modes,
         message=(
             object_analysis.message
-            if response_mode == "object" and not object_analysis.classes
+            if object_analysis.message
             else analysis.message
             if not available_modes
             else None

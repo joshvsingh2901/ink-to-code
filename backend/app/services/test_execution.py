@@ -143,6 +143,14 @@ class PreparedObjectStep:
     result_object_class_id: str | None = None
     constructor: ObjectConstructor | None = None
     constructor_class: ObjectClass | None = None
+    static_class_id: str | None = None
+    runtime_class_id: str | None = None
+    ownership_mode: str | None = None
+    source_expression_id: str | None = None
+    cast_target_class_id: str | None = None
+    cast_mode: str | None = None
+    expected_cast_result: str | None = None
+    virtual_destructor: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -2048,6 +2056,7 @@ def _build_object_harness(
             scenario_object.object_id: f"(*inktocode_object_{index})"
             for index, scenario_object in enumerate(scenario.objects)
         }
+        pointer_variables: dict[str, str] = {}
         for step_index, step in enumerate(scenario.steps):
             persistent_declaration = ""
             declarations = " ".join(
@@ -2059,7 +2068,96 @@ def _build_object_harness(
                 argument.expression for argument in step.arguments
             )
             target = object_variables.get(step.target_object_id, "")
-            if step.constructor is not None and step.constructor_class is not None:
+            if step.step_type in {
+                "create_base_reference",
+                "create_base_pointer",
+            }:
+                source = object_variables[step.source_object_id or ""]
+                result_variable = f"inktocode_result_{step_index}"
+                persistent_declaration = (
+                    f"{step.static_class_id}* {result_variable} = nullptr;"
+                )
+                call_statement = f"{result_variable} = &({source});"
+                if step.result_object_id:
+                    object_variables[step.result_object_id] = (
+                        f"(*{result_variable})"
+                    )
+                    pointer_variables[step.result_object_id] = result_variable
+                return_type = None
+                object_result_type = step.static_class_id
+                suppress_return = True
+            elif step.step_type == "slice_object":
+                source = object_variables[step.source_object_id or ""]
+                result_variable = f"inktocode_result_{step_index}"
+                persistent_declaration = (
+                    f"std::optional<{step.static_class_id}> "
+                    f"{result_variable};"
+                )
+                call_statement = f"{result_variable}.emplace({source});"
+                if step.result_object_id:
+                    object_variables[step.result_object_id] = (
+                        f"(*{result_variable})"
+                    )
+                return_type = None
+                object_result_type = step.static_class_id
+                suppress_return = True
+            elif (
+                step.step_type == "create_owned_base_pointer"
+                and step.constructor is not None
+                and step.constructor_class is not None
+            ):
+                result_variable = f"inktocode_result_{step_index}"
+                persistent_declaration = (
+                    f"{step.static_class_id}* {result_variable} = nullptr;"
+                )
+                call_statement = (
+                    f"{result_variable} = new {step.constructor_class.name}"
+                    f"({expressions});"
+                )
+                if step.result_object_id:
+                    object_variables[step.result_object_id] = (
+                        f"(*{result_variable})"
+                    )
+                    pointer_variables[step.result_object_id] = result_variable
+                return_type = None
+                object_result_type = step.runtime_class_id
+                suppress_return = True
+            elif step.step_type == "delete_base_pointer":
+                pointer = pointer_variables.get(step.target_object_id)
+                if pointer is None:
+                    raise ValueError(
+                        "Prepared deletion step has no owned pointer."
+                    )
+                call_statement = f"delete {pointer}; {pointer} = nullptr;"
+                return_type = None
+                object_result_type = None
+                suppress_return = True
+            elif step.step_type == "dynamic_cast":
+                source = object_variables[step.target_object_id]
+                target_type = step.cast_target_class_id
+                result_name = f"inktocode_step_{step_index}_result"
+                if step.cast_mode == "pointer":
+                    source_pointer = pointer_variables.get(
+                        step.target_object_id,
+                        f"&({source})",
+                    )
+                    call = (
+                        f"(dynamic_cast<{target_type}*>({source_pointer}) "
+                        "!= nullptr)"
+                    )
+                else:
+                    call = (
+                        f"(static_cast<void>(dynamic_cast<{target_type}&>"
+                        f"({source})), true)"
+                    )
+                return_type = ValueType(
+                    kind="scalar",
+                    display_type="bool",
+                    scalar_type="bool",
+                )
+                object_result_type = None
+                suppress_return = False
+            elif step.constructor is not None and step.constructor_class is not None:
                 result_variable = f"inktocode_result_{step_index}"
                 persistent_declaration = (
                     f"std::optional<{step.constructor_class.name}> "
@@ -2147,7 +2245,17 @@ def _build_object_harness(
                     "stream_reference",
                 }
             result_name = f"inktocode_step_{step_index}_result"
-            if step.special_member is not None or step.constructor is not None:
+            if (
+                step.special_member is not None
+                or step.constructor is not None
+                or step.step_type
+                in {
+                    "create_base_reference",
+                    "create_base_pointer",
+                    "slice_object",
+                    "delete_base_pointer",
+                }
+            ):
                 pass
             elif object_result_type:
                 result_variable = f"inktocode_result_{step_index}"
@@ -2966,6 +3074,23 @@ def _object_results(
                         status=status,
                         passed=False,
                         exception_result=failed_exception_result,
+                        static_type=prepared_step.static_class_id,
+                        runtime_type=prepared_step.runtime_class_id,
+                        ownership_mode=prepared_step.ownership_mode,
+                        dispatch_kind=(
+                            "virtual"
+                            if prepared_step.method
+                            and prepared_step.method.is_virtual
+                            else "non_virtual"
+                            if prepared_step.method
+                            else None
+                        ),
+                        slicing_occurred=(
+                            prepared_step.step_type == "slice_object"
+                        ),
+                        virtual_destructor=(
+                            prepared_step.virtual_destructor
+                        ),
                     )
                 )
                 continue
@@ -2992,12 +3117,24 @@ def _object_results(
                 and prepared_step.operator.return_kind == "value"
                 else None
             )
+            if prepared_step.step_type == "dynamic_cast":
+                result_type = ValueType(
+                    kind="scalar",
+                    display_type="bool",
+                    scalar_type="bool",
+                )
             if (
                 result_type is not None
                 and result_type.kind != "void"
                 and step_request.expected_outcome != "throws"
             ):
-                expected_return = step_request.expected_return or ""
+                expected_return = (
+                    "false"
+                    if prepared_step.expected_cast_result == "returns_null"
+                    else "true"
+                    if prepared_step.step_type == "dynamic_cast"
+                    else step_request.expected_return or ""
+                )
                 actual_return = _metadata_value(
                     result_type,
                     metadata.get("return"),
@@ -3079,6 +3216,45 @@ def _object_results(
                     return_result=return_result,
                     stdout_result=stdout_result,
                     exception_result=exception_result,
+                    static_type=prepared_step.static_class_id,
+                    runtime_type=prepared_step.runtime_class_id,
+                    ownership_mode=prepared_step.ownership_mode,
+                    dispatch_kind=(
+                        "virtual"
+                        if prepared_step.method
+                        and prepared_step.method.is_virtual
+                        else "non_virtual"
+                        if prepared_step.method
+                        else None
+                    ),
+                    selected_implementation=(
+                        (
+                            prepared_step.runtime_class_id
+                            if prepared_step.method.is_virtual
+                            else prepared_step.static_class_id
+                        )
+                        + f"::{prepared_step.method.name}"
+                        if prepared_step.method
+                        and prepared_step.static_class_id
+                        and prepared_step.runtime_class_id
+                        else None
+                    ),
+                    slicing_occurred=(
+                        prepared_step.step_type == "slice_object"
+                    ),
+                    cast_result=(
+                        "null"
+                        if prepared_step.step_type == "dynamic_cast"
+                        and metadata.get("return") is False
+                        else "succeeded"
+                        if prepared_step.step_type == "dynamic_cast"
+                        and metadata.get("outcome") == "returned"
+                        else "threw_bad_cast"
+                        if prepared_step.step_type == "dynamic_cast"
+                        and metadata.get("outcome") == "threw_standard"
+                        else None
+                    ),
+                    virtual_destructor=prepared_step.virtual_destructor,
                 )
             )
 
@@ -3216,7 +3392,12 @@ def _object_results(
                     ),
                     operation_context=next(
                         (
-                            step.step_type
+                            {
+                                "delete_base_pointer": "base_pointer_deletion",
+                                "polymorphic_method": "polymorphic_call",
+                                "slice_object": "object_slicing",
+                                "dynamic_cast": "dynamic_cast",
+                            }.get(step.step_type, step.step_type)
                             for step in reversed(test.steps)
                             if step.step_type
                             in {
@@ -3224,6 +3405,10 @@ def _object_results(
                                 "copy_assign",
                                 "move_construct",
                                 "move_assign",
+                                "delete_base_pointer",
+                                "polymorphic_method",
+                                "slice_object",
+                                "dynamic_cast",
                             }
                         ),
                         "scenario_cleanup",
@@ -3303,7 +3488,8 @@ def _prepare_object_scenarios(
         ):
             raise ValueError(f"{test.name} object names must be unique.")
         prepared_objects: list[PreparedScenarioObject] = []
-        available_objects: dict[str, tuple[str, str]] = {}
+        # static type, display name, runtime type, ownership mode
+        available_objects: dict[str, tuple[str, str, str, str]] = {}
         used_names = {item.name for item in requested_objects}
         for object_index, item in enumerate(requested_objects):
             object_class = next(
@@ -3317,6 +3503,11 @@ def _prepare_object_scenarios(
             if object_class is None:
                 raise ValueError(
                     f"{test.name} selected a class that is no longer available."
+                )
+            if object_class.is_abstract:
+                raise ValueError(
+                    f"{test.name} cannot construct abstract class "
+                    f"{object_class.name} directly."
                 )
             constructor = next(
                 (
@@ -3361,9 +3552,12 @@ def _prepare_object_scenarios(
                 available_objects[item.object_id] = (
                     object_class.id,
                     item.name,
+                    object_class.id,
+                    "value",
                 )
         prepared_steps: list[PreparedObjectStep] = []
         moved_from: set[str] = set()
+        deleted_owned_pointers: set[str] = set()
         for step_index, step in enumerate(test.steps):
             if step.step_type == "create_object":
                 object_class = next(
@@ -3378,6 +3572,11 @@ def _prepare_object_scenarios(
                     raise ValueError(
                         f"{test.name} step {step_index + 1} selected an "
                         "unsupported class."
+                    )
+                if object_class.is_abstract:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} cannot construct "
+                        f"abstract class {object_class.name} directly."
                     )
                 constructor = next(
                     (
@@ -3431,6 +3630,8 @@ def _prepare_object_scenarios(
                     available_objects[step.result_object_id or ""] = (
                         object_class.id,
                         step.result_name or "",
+                        object_class.id,
+                        "value",
                     )
                     used_names.add(step.result_name or "")
                 prepared_steps.append(
@@ -3451,6 +3652,257 @@ def _prepare_object_scenarios(
                     )
                 )
                 continue
+            if step.step_type in {
+                "create_base_reference",
+                "create_base_pointer",
+                "slice_object",
+            }:
+                source = available_objects.get(step.source_object_id or "")
+                if source is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} references an "
+                        "unavailable source object."
+                    )
+                source_class = next(
+                    item for item in analysis.classes if item.id == source[2]
+                )
+                if (
+                    not source_class.inheritance_supported
+                    or source_class.base_class_id != step.base_class_id
+                ):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected unrelated "
+                        "or unsupported base and derived classes."
+                    )
+                if (
+                    step.result_object_id in available_objects
+                    or step.result_name in used_names
+                ):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} result name and "
+                        "identifier must be unique."
+                    )
+                ownership = {
+                    "create_base_reference": "reference",
+                    "create_base_pointer": "non_owning_pointer",
+                    "slice_object": "value",
+                }[step.step_type]
+                runtime_type = (
+                    step.base_class_id
+                    if step.step_type == "slice_object"
+                    else source[2]
+                )
+                available_objects[step.result_object_id or ""] = (
+                    step.base_class_id or "",
+                    step.result_name or "",
+                    runtime_type or "",
+                    ownership,
+                )
+                used_names.add(step.result_name or "")
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=None,
+                        arguments=(),
+                        target_object_id=step.result_object_id or "",
+                        source_object_id=step.source_object_id,
+                        result_object_id=step.result_object_id,
+                        result_name=step.result_name,
+                        result_object_class_id=step.base_class_id,
+                        expression=(
+                            f"Create {step.result_name} as "
+                            f"{step.base_class_id}"
+                        ),
+                        step_type=step.step_type,
+                        static_class_id=step.base_class_id,
+                        runtime_class_id=runtime_type,
+                        ownership_mode=ownership,
+                    )
+                )
+                continue
+            if step.step_type == "create_owned_base_pointer":
+                base_class = next(
+                    (
+                        item
+                        for item in analysis.classes
+                        if item.id == step.base_class_id
+                    ),
+                    None,
+                )
+                derived_class = next(
+                    (
+                        item
+                        for item in analysis.classes
+                        if item.id == step.derived_class_id
+                    ),
+                    None,
+                )
+                if (
+                    base_class is None
+                    or derived_class is None
+                    or not derived_class.inheritance_supported
+                    or derived_class.base_class_id != base_class.id
+                    or derived_class.is_abstract
+                ):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected an invalid "
+                        "owned base-pointer relationship."
+                    )
+                constructor = next(
+                    (
+                        item
+                        for item in derived_class.constructors
+                        if item.id == step.constructor_id
+                    ),
+                    None,
+                )
+                if constructor is None:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected a stale "
+                        "derived constructor."
+                    )
+                if len(step.arguments) != len(constructor.parameters):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} constructor "
+                        f"requires {len(constructor.parameters)} argument(s)."
+                    )
+                arguments = tuple(
+                    _prepare_argument(
+                        parameter.value_type,
+                        argument,
+                        f"{test.name} step {step_index + 1} argument",
+                        test_index=scenario_index,
+                        parameter_index=step_index * 20 + index,
+                    )
+                    for index, (parameter, argument) in enumerate(
+                        zip(constructor.parameters, step.arguments, strict=True)
+                    )
+                )
+                if (
+                    step.result_object_id in available_objects
+                    or step.result_name in used_names
+                ):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} pointer name and "
+                        "identifier must be unique."
+                    )
+                if step.expected_outcome != "throws":
+                    available_objects[step.result_object_id or ""] = (
+                        base_class.id,
+                        step.result_name or "",
+                        derived_class.id,
+                        "owned_pointer",
+                    )
+                    used_names.add(step.result_name or "")
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=None,
+                        arguments=arguments,
+                        target_object_id=step.result_object_id or "",
+                        result_object_id=step.result_object_id,
+                        result_name=step.result_name,
+                        expression=(
+                            f"Create {step.result_name} owning "
+                            f"{derived_class.name} as {base_class.name} pointer"
+                        ),
+                        step_type=step.step_type,
+                        static_class_id=base_class.id,
+                        runtime_class_id=derived_class.id,
+                        ownership_mode="owned_pointer",
+                        constructor=constructor,
+                        constructor_class=derived_class,
+                        virtual_destructor=base_class.has_virtual_destructor,
+                    )
+                )
+                continue
+            if step.step_type == "delete_base_pointer":
+                target = available_objects.get(step.target_object_id or "")
+                if target is None or target[3] != "owned_pointer":
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} can delete only "
+                        "an available owned base pointer."
+                    )
+                if step.target_object_id in deleted_owned_pointers:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} repeats deletion."
+                    )
+                base_class = next(
+                    item for item in analysis.classes if item.id == target[0]
+                )
+                deleted_owned_pointers.add(step.target_object_id or "")
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=None,
+                        arguments=(),
+                        target_object_id=step.target_object_id or "",
+                        expression=f"Delete {target[1]} through {target[0]}*",
+                        step_type=step.step_type,
+                        static_class_id=target[0],
+                        runtime_class_id=target[2],
+                        ownership_mode=target[3],
+                        virtual_destructor=base_class.has_virtual_destructor,
+                    )
+                )
+                continue
+            if step.step_type == "dynamic_cast":
+                source = available_objects.get(step.source_object_id or "")
+                target_class = next(
+                    (
+                        item
+                        for item in analysis.classes
+                        if item.id == step.cast_target_class_id
+                    ),
+                    None,
+                )
+                static_class = next(
+                    (
+                        item
+                        for item in analysis.classes
+                        if source and item.id == source[0]
+                    ),
+                    None,
+                )
+                if (
+                    source is None
+                    or target_class is None
+                    or static_class is None
+                    or not any(
+                        method.is_virtual for method in static_class.methods
+                    )
+                    and not static_class.has_virtual_destructor
+                ):
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} has an invalid "
+                        "dynamic-cast source or target."
+                    )
+                related_ids = {
+                    source[0],
+                    source[2],
+                    static_class.base_class_id,
+                    *static_class.derived_class_ids,
+                }
+                if target_class.id not in related_ids:
+                    raise ValueError(
+                        f"{test.name} step {step_index + 1} selected an "
+                        "unrelated dynamic-cast target."
+                    )
+                prepared_steps.append(
+                    PreparedObjectStep(
+                        method=None,
+                        arguments=(),
+                        target_object_id=step.source_object_id or "",
+                        expression=(
+                            f"Cast {source[1]} to {target_class.name}"
+                        ),
+                        step_type=step.step_type,
+                        static_class_id=source[0],
+                        runtime_class_id=source[2],
+                        ownership_mode=source[3],
+                        cast_target_class_id=target_class.id,
+                        cast_mode=step.cast_mode,
+                        expected_cast_result=step.expected_cast_result,
+                    )
+                )
+                continue
             target_id = step.target_object_id or (
                 requested_objects[0].object_id
                 if requested_objects
@@ -3462,6 +3914,11 @@ def _prepare_object_scenarios(
                     f"{test.name} step {step_index + 1} references an "
                     "unavailable object. Objects expected to fail "
                     "construction cannot be used later."
+                )
+            if target_id in deleted_owned_pointers:
+                raise ValueError(
+                    f"{test.name} step {step_index + 1} cannot use a deleted "
+                    "base pointer."
                 )
             target_class = next(
                 item for item in analysis.classes if item.id == target[0]
@@ -3528,6 +3985,8 @@ def _prepare_object_scenarios(
                     available_objects[step.result_object_id] = (
                         source[0],
                         step.result_name,
+                        source[2],
+                        "value",
                     )
                     used_names.add(step.result_name)
                 if step.step_type in {"move_construct", "move_assign"}:
@@ -3572,7 +4031,11 @@ def _prepare_object_scenarios(
                 raise ValueError(
                     f"{test.name} step {step_index + 1} cannot use a moved-from object."
                 )
-            if step.step_type in {"method", "observer"}:
+            if step.step_type in {
+                "method",
+                "observer",
+                "polymorphic_method",
+            }:
                 method = next(
                     (
                         candidate
@@ -3625,6 +4088,9 @@ def _prepare_object_scenarios(
                         target_object_id=target_id,
                         expression=f"{target[1]}.{method.name}()",
                         step_type=step.step_type,
+                        static_class_id=target[0],
+                        runtime_class_id=target[2],
+                        ownership_mode=target[3],
                     )
                 )
                 continue
@@ -3736,6 +4202,8 @@ def _prepare_object_scenarios(
                 available_objects[step.result_object_id] = (
                     operator.return_object_class_id or "",
                     step.result_name,
+                    operator.return_object_class_id or "",
+                    "value",
                 )
                 used_names.add(step.result_name)
             elif step.expected_return is not None:

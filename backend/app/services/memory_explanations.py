@@ -64,6 +64,13 @@ def build_memory_diagnosis(
     ):
         title = "Memory leak during object cleanup"
         summary = "An owned resource remained allocated when the object was destroyed."
+    elif (
+        finding.category == "memory_leak"
+        and finding.operation_context == "base_pointer_deletion"
+    ):
+        title = "Derived cleanup was skipped"
+        summary = "The base pointer was deleted, but memory owned by the derived object remained allocated."
+        direction = "Use a virtual base destructor when deleting derived objects through base pointers."
     return MemoryDiagnosis(
         category=finding.category,
         title=title,

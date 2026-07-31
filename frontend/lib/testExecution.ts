@@ -42,6 +42,12 @@ export type ObjectMethod = {
   return_type: string;
   return_type_metadata: FunctionTypeMetadata;
   is_const: boolean;
+  is_virtual: boolean;
+  is_pure_virtual: boolean;
+  is_override: boolean;
+  is_final: boolean;
+  overrides_method_id: string | null;
+  override_mismatch_reason: string | null;
 };
 
 export type ObjectClass = {
@@ -52,6 +58,13 @@ export type ObjectClass = {
   methods: ObjectMethod[];
   operators: ObjectOperator[];
   special_members: ObjectSpecialMember[];
+  base_class_id: string | null;
+  inheritance_access: string | null;
+  inheritance_supported: boolean;
+  is_abstract: boolean;
+  has_virtual_destructor: boolean;
+  derived_class_ids: string[];
+  inheritance_depth: number;
 };
 
 export type ObjectSpecialMember = {
@@ -174,6 +187,13 @@ export type ObjectScenarioTestInput = {
   steps: Array<{
     step_type:
       | "create_object"
+      | "create_base_reference"
+      | "create_base_pointer"
+      | "create_owned_base_pointer"
+      | "polymorphic_method"
+      | "delete_base_pointer"
+      | "slice_object"
+      | "dynamic_cast"
       | "method"
       | "observer"
       | "operator"
@@ -193,6 +213,14 @@ export type ObjectScenarioTestInput = {
     result_name?: string;
     special_member_id?: string;
     source_object_id?: string;
+    base_class_id?: string;
+    derived_class_id?: string;
+    cast_target_class_id?: string;
+    cast_mode?: "pointer" | "reference";
+    expected_cast_result?:
+      | "succeeds"
+      | "returns_null"
+      | "throws_bad_cast";
     expected_return?: string;
     check_stdout?: boolean;
     expected_stdout?: string;
@@ -356,6 +384,13 @@ export type ObjectScenarioTestResult = ResultBase & {
     method_id: string | null;
     step_type:
       | "create_object"
+      | "create_base_reference"
+      | "create_base_pointer"
+      | "create_owned_base_pointer"
+      | "polymorphic_method"
+      | "delete_base_pointer"
+      | "slice_object"
+      | "dynamic_cast"
       | "method"
       | "observer"
       | "operator"
@@ -373,6 +408,19 @@ export type ObjectScenarioTestResult = ResultBase & {
     return_result: FunctionChannelResult | null;
     stdout_result: FunctionChannelResult | null;
     exception_result: ExceptionOutcomeResult | null;
+    static_type: string | null;
+    runtime_type: string | null;
+    ownership_mode:
+      | "value"
+      | "reference"
+      | "non_owning_pointer"
+      | "owned_pointer"
+      | null;
+    dispatch_kind: "virtual" | "non_virtual" | null;
+    selected_implementation: string | null;
+    slicing_occurred: boolean;
+    cast_result: "succeeded" | "null" | "threw_bad_cast" | null;
+    virtual_destructor: boolean | null;
   }>;
   big_five_diagnosis: BigFiveDiagnosis | null;
   constructor_exception_result: ExceptionOutcomeResult | null;
@@ -525,6 +573,14 @@ function isObjectClass(value: unknown): value is ObjectClass {
         typeof method.display === "string" &&
         typeof method.return_type === "string" &&
         typeof method.is_const === "boolean" &&
+        typeof method.is_virtual === "boolean" &&
+        typeof method.is_pure_virtual === "boolean" &&
+        typeof method.is_override === "boolean" &&
+        typeof method.is_final === "boolean" &&
+        (method.overrides_method_id === null ||
+          typeof method.overrides_method_id === "string") &&
+        (method.override_mismatch_reason === null ||
+          typeof method.override_mismatch_reason === "string") &&
         isFunctionTypeMetadata(method.return_type_metadata) &&
         validParameters(method.parameters),
     ) &&
@@ -580,7 +636,19 @@ function isObjectClass(value: unknown): value is ObjectClass {
         ].includes(member.kind) &&
         typeof member.display === "string" &&
         typeof member.is_defaulted === "boolean",
-    )
+    ) &&
+    (objectClass.base_class_id === null ||
+      typeof objectClass.base_class_id === "string") &&
+    (objectClass.inheritance_access === null ||
+      typeof objectClass.inheritance_access === "string") &&
+    typeof objectClass.inheritance_supported === "boolean" &&
+    typeof objectClass.is_abstract === "boolean" &&
+    typeof objectClass.has_virtual_destructor === "boolean" &&
+    Array.isArray(objectClass.derived_class_ids) &&
+    objectClass.derived_class_ids.every(
+      (item) => typeof item === "string",
+    ) &&
+    typeof objectClass.inheritance_depth === "number"
   );
 }
 
@@ -815,6 +883,13 @@ function isTestResult(
         typeof step.index === "number" &&
         [
           "create_object",
+          "create_base_reference",
+          "create_base_pointer",
+          "create_owned_base_pointer",
+          "polymorphic_method",
+          "delete_base_pointer",
+          "slice_object",
+          "dynamic_cast",
           "method",
           "observer",
           "operator",
@@ -837,7 +912,29 @@ function isTestResult(
         (step.stdout_result === null ||
           isFunctionChannelResult(step.stdout_result)) &&
         (step.exception_result === null ||
-          isExceptionOutcomeResult(step.exception_result)),
+          isExceptionOutcomeResult(step.exception_result)) &&
+        (step.static_type === null ||
+          typeof step.static_type === "string") &&
+        (step.runtime_type === null ||
+          typeof step.runtime_type === "string") &&
+        (step.ownership_mode === null ||
+          [
+            "value",
+            "reference",
+            "non_owning_pointer",
+            "owned_pointer",
+          ].includes(step.ownership_mode)) &&
+        (step.dispatch_kind === null ||
+          ["virtual", "non_virtual"].includes(step.dispatch_kind)) &&
+        (step.selected_implementation === null ||
+          typeof step.selected_implementation === "string") &&
+        typeof step.slicing_occurred === "boolean" &&
+        (step.cast_result === null ||
+          ["succeeded", "null", "threw_bad_cast"].includes(
+            step.cast_result,
+          )) &&
+        (step.virtual_destructor === null ||
+          typeof step.virtual_destructor === "boolean"),
     );
   return (
     programResult ||

@@ -39,6 +39,13 @@ import {
   isObjectScenarioReady,
 } from "@/lib/objectScenarioState";
 import { getObjectScenarioSummary } from "@/lib/objectScenarioSummary";
+import {
+  initialTemplateArgumentValues,
+  TEMPLATE_TYPE_OPTIONS,
+  templateArgumentsPayload,
+  templateInstantiationPreview,
+  templateSelectionLabel,
+} from "@/lib/templateTesting";
 
 type SidebarTab = "compiler" | "tests";
 type PrimaryDiagnostic = CompileDiagnostic & {
@@ -909,6 +916,12 @@ export default function EditorPage() {
   const [selectedFunctionId, setSelectedFunctionId] = useState<string | null>(
     null,
   );
+  const [templateArgumentMode, setTemplateArgumentMode] = useState<
+    "deduced" | "explicit"
+  >("deduced");
+  const [templateArgumentValues, setTemplateArgumentValues] = useState<
+    Record<string, { value: string; useDefault: boolean }>
+  >({});
   const [testModeError, setTestModeError] = useState<string | null>(null);
   const [isAnalyzingTests, setIsAnalyzingTests] = useState(true);
   const [isEdited, setIsEdited] = useState(false);
@@ -932,6 +945,21 @@ export default function EditorPage() {
   );
   const isMountedRef = useRef(true);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initializeTemplateSettings = (
+    selected: FunctionDescriptor | null,
+  ) => {
+    if (!selected || selected.template_kind !== "function_template") {
+      setTemplateArgumentMode("deduced");
+      setTemplateArgumentValues({});
+      return;
+    }
+    setTemplateArgumentMode(
+      selected.template_argument_mode === "deduced" ? "deduced" : "explicit",
+    );
+    setTemplateArgumentValues(
+      initialTemplateArgumentValues(selected.template_parameters),
+    );
+  };
 
   useEffect(() => {
     if (reviewedCode === null) {
@@ -989,6 +1017,9 @@ export default function EditorPage() {
               ) ?? null;
             selectedFunctionIdRef.current = nextId;
             setSelectedFunctionId(nextId);
+            if (nextId !== previousId) {
+              initializeTemplateSettings(nextFunction);
+            }
             setTestCases((current) =>
               current.map((test) => ({
                 ...test,
@@ -1330,6 +1361,18 @@ export default function EditorPage() {
               code: currentCode,
               language: "cpp" as const,
               target_function: selectedFunction!.id,
+              ...(selectedFunction!.template_kind === "function_template"
+                ? {
+                    template_argument_mode: templateArgumentMode,
+                    template_arguments:
+                      templateArgumentMode === "explicit"
+                        ? templateArgumentsPayload(
+                            selectedFunction!.template_parameters,
+                            templateArgumentValues,
+                          )
+                        : [],
+                  }
+                : {}),
               comparison_mode: comparisonMode,
               run_memory_checks: runMemoryChecks,
               tests: testCases.map((test) => ({
@@ -1383,6 +1426,7 @@ export default function EditorPage() {
                       name: object.name,
                       class_id: object.class_id,
                       constructor_id: object.constructor_id,
+                      template_arguments: object.template_arguments,
                       arguments: object.arguments,
                       ...exceptionExpectationPayload(object),
                     })),
@@ -1421,6 +1465,7 @@ export default function EditorPage() {
                           step_type: step.step_type,
                           class_id: step.class_id,
                           constructor_id: step.constructor_id,
+                          template_arguments: step.template_arguments,
                           arguments: step.arguments,
                           result_object_id: step.result_object_id,
                           result_name: step.result_name,
@@ -1665,6 +1710,7 @@ export default function EditorPage() {
         : null;
     selectedFunctionIdRef.current = nextId;
     setSelectedFunctionId(nextId);
+    initializeTemplateSettings(nextFunction);
     setTestCases((current) =>
       current.map((test) => ({
         ...test,
@@ -2323,6 +2369,167 @@ export default function EditorPage() {
                       </div>
                     )}
 
+                  {testTarget === "function" &&
+                    selectedFunction?.template_kind ===
+                      "function_template" && (
+                      <div className="mt-3 space-y-3 rounded-md border border-slate-200 p-3">
+                        <div>
+                          <p className="text-xs font-medium text-slate-700">
+                            Function template
+                          </p>
+                          <p className="mt-0.5 text-sm text-slate-900">
+                            {selectedFunction.name}
+                          </p>
+                        </div>
+                        <label className="block text-xs font-medium text-slate-600">
+                          Template argument mode
+                          <select
+                            aria-label="Template argument mode"
+                            value={templateArgumentMode}
+                            disabled={
+                              isRunningTests ||
+                              selectedFunction.template_argument_mode !==
+                                "deduced"
+                            }
+                            onChange={(event) => {
+                              setTemplateArgumentMode(
+                                event.target.value as "deduced" | "explicit",
+                              );
+                              setTestRunResult(null);
+                              setTestRunError(null);
+                            }}
+                            className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                          >
+                            <option value="deduced">
+                              Deduce automatically
+                            </option>
+                            <option value="explicit">
+                              Specify explicitly
+                            </option>
+                          </select>
+                        </label>
+                        {templateArgumentMode === "explicit" && (
+                          <div className="space-y-2">
+                            {selectedFunction.template_parameters.map(
+                              (parameter) => {
+                                const configured =
+                                  templateArgumentValues[parameter.name] ?? {
+                                    value: "",
+                                    useDefault: false,
+                                  };
+                                return (
+                                  <div
+                                    key={parameter.name}
+                                    className="min-w-0"
+                                  >
+                                    <label className="block text-xs font-medium text-slate-600">
+                                      {parameter.name}
+                                      {parameter.kind === "non_type" && (
+                                        <span className="ml-1 font-normal text-slate-400">
+                                          {parameter.non_type_type}
+                                        </span>
+                                      )}
+                                      {parameter.kind === "type" ? (
+                                        <select
+                                          aria-label={`Template type ${parameter.name}`}
+                                          value={
+                                            configured.useDefault
+                                              ? "__default__"
+                                              : configured.value
+                                          }
+                                          onChange={(event) => {
+                                            const useDefault =
+                                              event.target.value ===
+                                              "__default__";
+                                            setTemplateArgumentValues(
+                                              (current) => ({
+                                                ...current,
+                                                [parameter.name]: {
+                                                  value: useDefault
+                                                    ? parameter.default_argument ??
+                                                      ""
+                                                    : event.target.value,
+                                                  useDefault,
+                                                },
+                                              }),
+                                            );
+                                            setTestRunResult(null);
+                                            setTestRunError(null);
+                                          }}
+                                          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+                                        >
+                                          {parameter.default_argument !==
+                                            null && (
+                                            <option value="__default__">
+                                              Use default (
+                                              {parameter.default_argument})
+                                            </option>
+                                          )}
+                                          <option value="">
+                                            Choose a type
+                                          </option>
+                                          {TEMPLATE_TYPE_OPTIONS.map(
+                                            (option) => (
+                                              <option
+                                                key={option}
+                                                value={option}
+                                              >
+                                                {option}
+                                              </option>
+                                            ),
+                                          )}
+                                        </select>
+                                      ) : (
+                                        <input
+                                          aria-label={`Template value ${parameter.name}`}
+                                          value={
+                                            configured.useDefault
+                                              ? parameter.default_argument ?? ""
+                                              : configured.value
+                                          }
+                                          disabled={configured.useDefault}
+                                          maxLength={100}
+                                          onChange={(event) => {
+                                            setTemplateArgumentValues(
+                                              (current) => ({
+                                                ...current,
+                                                [parameter.name]: {
+                                                  value: event.target.value,
+                                                  useDefault: false,
+                                                },
+                                              }),
+                                            );
+                                            setTestRunResult(null);
+                                            setTestRunError(null);
+                                          }}
+                                          className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs"
+                                        />
+                                      )}
+                                    </label>
+                                  </div>
+                                );
+                              },
+                            )}
+                          </div>
+                        )}
+                        <div className="rounded bg-slate-50 px-2.5 py-2">
+                          <p className="text-[11px] text-slate-500">
+                            {templateArgumentMode === "deduced"
+                              ? "Inferred instantiation"
+                              : "Instantiation"}
+                          </p>
+                          <code className="mt-0.5 block break-all text-xs text-slate-800">
+                            {templateInstantiationPreview(
+                              selectedFunction,
+                              templateArgumentMode,
+                              templateArgumentValues,
+                              testCases[0]?.arguments ?? [],
+                            )}
+                          </code>
+                        </div>
+                      </div>
+                    )}
+
                   {testMode && testTarget === "object" && (
                     <ObjectScenarioTests
                       classes={testMode.classes}
@@ -2891,6 +3098,26 @@ export default function EditorPage() {
                                 </span>
                               )}
                           </div>
+                          {result.concrete_instantiation && (
+                            <div className="mt-2 rounded bg-slate-50 px-2.5 py-2 text-xs">
+                              <p className="text-[11px] text-slate-500">
+                                Instantiation
+                              </p>
+                              <code className="mt-0.5 block break-all text-slate-800">
+                                {result.concrete_instantiation}
+                              </code>
+                              {templateSelectionLabel(result) && (
+                                <p className="mt-1 text-slate-600">
+                                  {templateSelectionLabel(result)}
+                                </p>
+                              )}
+                              {result.template_argument_mode === "deduced" && (
+                                <p className="mt-1 text-slate-500">
+                                  Template arguments deduced
+                                </p>
+                              )}
+                            </div>
+                          )}
                           {result.memory_check_enabled && (
                             <div className="mt-2 text-xs leading-5 text-slate-600">
                               <p>{presentation.behaviorText}</p>

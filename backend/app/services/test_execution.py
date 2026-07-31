@@ -47,8 +47,10 @@ from app.services.function_analysis import (
     FunctionAnalysis,
     FunctionSignature,
     STRING_TYPE,
+    TemplateArgument,
     ValueType,
     analyze_test_mode,
+    instantiate_function_template,
 )
 from app.services.memory_classifier import classify_memory_findings
 from app.services.memory_runtime_parser import parse_memory_runtime
@@ -60,6 +62,7 @@ from app.services.object_analysis import (
     ObjectOperator,
     ObjectSpecialMember,
     analyze_object_scenarios,
+    instantiate_object_template,
 )
 
 TEST_TIMEOUT_SECONDS = 2
@@ -268,6 +271,51 @@ def _function_response(signature: FunctionSignature) -> FunctionResponse:
         ],
         display=signature.display,
         return_type_metadata=type_response(signature.return_value_type),
+        template_kind=signature.template_kind,
+        template_parameters=[
+            {
+                "name": parameter.name,
+                "kind": parameter.kind,
+                "non_type_type": parameter.non_type_type,
+                "default_argument": parameter.default_argument,
+                "deducible": any(
+                    parameter.name in raw_type
+                    for raw_type in signature.raw_parameter_types
+                ),
+            }
+            for parameter in signature.template_parameters
+        ],
+        template_argument_mode=signature.template_argument_mode,
+        effective_template_arguments=[
+            {
+                "parameter_name": argument.parameter_name,
+                "kind": argument.kind,
+                "value": argument.value,
+                "used_default": argument.used_default,
+            }
+            for argument in signature.effective_template_arguments
+        ],
+        concrete_instantiation=signature.concrete_instantiation,
+        specialization_selected=(
+            signature.specialization_selected
+        ),
+        explicit_specializations=[
+            {
+                "primary_template_name": specialization.primary_template_name,
+                "effective_template_arguments": list(
+                    specialization.effective_template_arguments
+                ),
+                "return_type": specialization.return_type,
+                "parameter_types": list(specialization.parameter_types),
+                "source_line": specialization.source_line,
+            }
+            for specialization in signature.explicit_specializations
+        ],
+        source_line=(
+            signature.source_line
+            if signature.template_kind != "none"
+            else None
+        ),
     )
 
 
@@ -1194,16 +1242,34 @@ def _safe_literal(type_name: str, raw_value: str, label: str) -> str:
             return f"(-{maximum}{suffix} - 1{suffix})"
         return f"{parsed}{suffix}"
 
-    if type_name == "double":
+    if type_name in {"float", "double"}:
         if not _DOUBLE_VALUE.fullmatch(value):
-            raise ValueError(f"{label} must be a finite decimal double value.")
+            raise ValueError(
+                f"{label} must be a finite decimal {type_name} value."
+            )
         parsed = float(value)
         if not math.isfinite(parsed):
-            raise ValueError(f"{label} must be a finite decimal double value.")
+            raise ValueError(
+                f"{label} must be a finite decimal {type_name} value."
+            )
         literal = repr(parsed)
         if "." not in literal and "e" not in literal.lower():
             literal += ".0"
-        return literal
+        return f"{literal}f" if type_name == "float" else literal
+
+    if type_name == "char":
+        if len(raw_value) != 1:
+            raise ValueError(f"{label} must contain exactly one character.")
+        escaped = {
+            "\\": "\\\\",
+            "'": "\\'",
+            "\n": "\\n",
+            "\r": "\\r",
+            "\t": "\\t",
+        }.get(raw_value, raw_value)
+        if ord(raw_value) < 32 and raw_value not in {"\n", "\r", "\t"}:
+            raise ValueError(f"{label} contains an unsupported character.")
+        return f"'{escaped}'"
 
     raise ValueError(f"{label} uses an unsupported type.")
 
@@ -1761,7 +1827,7 @@ def _build_function_harness(
             for declaration in argument.declarations
         )
         call = (
-            f"{function.name}("
+            f"{function.invocation_name or function.name}("
             f"{', '.join(argument.expression for argument in arguments)})"
         )
         serialized_mutations: list[str] = []
@@ -2239,7 +2305,10 @@ def _build_object_harness(
                         else f"operator{operator.symbol}({', '.join(operands)})"
                     )
                 return_type = operator.return_value_type
-                object_result_type = operator.return_object_class_id
+                object_result_type = (
+                    step.result_object_class_id
+                    or operator.return_object_class_id
+                )
                 suppress_return = operator.return_kind in {
                     "mutation_reference",
                     "stream_reference",
@@ -2656,6 +2725,13 @@ def _function_results(
                     **_memory_result_fields(
                         output, request.run_memory_checks, request.code,
                         exception_active=True,
+                        operation_context=(
+                            "template_specialization"
+                            if function.specialization_selected
+                            else "function_template_call"
+                            if function.template_kind == "function_template"
+                            else "exception_exit"
+                        ),
                     ),
                 )
             )
@@ -2805,7 +2881,14 @@ def _function_results(
                     match_type="exact" if passed else "mismatch",
                     exception_result=exception_result,
                     **_memory_result_fields(
-                        output, request.run_memory_checks, request.code
+                        output,
+                        request.run_memory_checks,
+                        request.code,
+                        operation_context=(
+                            "function_template_call"
+                            if function.template_kind == "function_template"
+                            else "normal_return"
+                        ),
                     ),
                 )
             )
@@ -2846,7 +2929,14 @@ def _function_results(
                     match_type=match_type,
                     exception_result=exception_result,
                     **_memory_result_fields(
-                        output, request.run_memory_checks, request.code
+                        output,
+                        request.run_memory_checks,
+                        request.code,
+                        operation_context=(
+                            "function_template_call"
+                            if function.template_kind == "function_template"
+                            else "normal_return"
+                        ),
                     ),
                 )
             )
@@ -2878,7 +2968,14 @@ def _function_results(
                     match_type=match_type,
                     exception_result=exception_result,
                     **_memory_result_fields(
-                        output, request.run_memory_checks, request.code
+                        output,
+                        request.run_memory_checks,
+                        request.code,
+                        operation_context=(
+                            "function_template_call"
+                            if function.template_kind == "function_template"
+                            else "normal_return"
+                        ),
                     ),
                 )
             )
@@ -2915,10 +3012,45 @@ def _function_results(
                 match_type=match_type,
                 exception_result=exception_result,
                 **_memory_result_fields(
-                    output, request.run_memory_checks, request.code
+                    output,
+                    request.run_memory_checks,
+                    request.code,
+                    operation_context=(
+                        "function_template_call"
+                        if function.template_kind == "function_template"
+                        else "normal_return"
+                    ),
                 ),
             )
         )
+    if function.template_kind == "function_template":
+        specialization_selected = function.specialization_selected
+        updates = {
+            "template_kind": (
+                "explicit_specialization"
+                if specialization_selected
+                else "function_template"
+            ),
+            "template_name": function.name,
+            "template_argument_mode": function.template_argument_mode,
+            "effective_template_arguments": [
+                {
+                    "parameter_name": argument.parameter_name,
+                    "kind": argument.kind,
+                    "value": argument.value,
+                    "used_default": argument.used_default,
+                }
+                for argument in function.effective_template_arguments
+            ],
+            "concrete_instantiation": function.concrete_instantiation,
+            "specialization_selected": specialization_selected,
+            "specialization_kind": (
+                "explicit_specialization"
+                if specialization_selected
+                else "primary"
+            ),
+        }
+        return [result.model_copy(update=updates) for result in results]
     return results
 
 
@@ -3436,9 +3568,48 @@ def _object_results(
                 ),
             )
         diagnosis = diagnose_big_five(request.code, test, scenario_result)
+        template_class = next(
+            (
+                item.object_class
+                for item in prepared.objects
+                if item.object_class.template_kind == "class_template"
+            ),
+            next(
+                (
+                    step.constructor_class
+                    for step in prepared.steps
+                    if step.constructor_class is not None
+                    and step.constructor_class.template_kind
+                    == "class_template"
+                ),
+                None,
+            ),
+        )
+        template_updates = (
+            {
+                "template_kind": "class_template",
+                "template_name": template_class.id,
+                "template_argument_mode": "explicit",
+                "effective_template_arguments": [
+                    {
+                        "parameter_name": argument.parameter_name,
+                        "kind": argument.kind,
+                        "value": argument.value,
+                        "used_default": argument.used_default,
+                    }
+                    for argument in template_class.effective_template_arguments
+                ],
+                "concrete_instantiation": template_class.concrete_type,
+            }
+            if template_class is not None
+            else {}
+        )
         results.append(
             scenario_result.model_copy(
-                update={"big_five_diagnosis": diagnosis}
+                update={
+                    "big_five_diagnosis": diagnosis,
+                    **template_updates,
+                }
             )
         )
     return results
@@ -3458,6 +3629,41 @@ def _prepare_object_scenarios(
     request: ObjectScenarioRunTestsRequest,
 ) -> list[PreparedObjectScenario]:
     analysis = analyze_object_scenarios(request.code)
+    unqualified_types_allowed = bool(
+        re.search(r"\busing\s+namespace\s+std\s*;", request.code)
+    )
+
+    def resolve_class(
+        class_id: str | None,
+        raw_arguments,
+    ) -> tuple[ObjectClass | None, ObjectClass | None]:
+        definition = next(
+            (
+                candidate
+                for candidate in analysis.classes
+                if candidate.id == class_id
+            ),
+            None,
+        )
+        if definition is None:
+            return None, None
+        supplied = tuple(
+            TemplateArgument(
+                parameter_name=argument.parameter_name,
+                kind=argument.kind,
+                value=argument.value,
+                used_default=argument.use_default,
+            )
+            for argument in raw_arguments
+        )
+        return (
+            definition,
+            instantiate_object_template(
+                definition,
+                supplied,
+                unqualified_types_allowed=unqualified_types_allowed,
+            ),
+        )
     prepared_scenarios: list[PreparedObjectScenario] = []
     for scenario_index, test in enumerate(request.tests):
         requested_objects = test.objects
@@ -3488,17 +3694,14 @@ def _prepare_object_scenarios(
         ):
             raise ValueError(f"{test.name} object names must be unique.")
         prepared_objects: list[PreparedScenarioObject] = []
+        concrete_classes_by_object_id: dict[str, ObjectClass] = {}
         # static type, display name, runtime type, ownership mode
         available_objects: dict[str, tuple[str, str, str, str]] = {}
         used_names = {item.name for item in requested_objects}
         for object_index, item in enumerate(requested_objects):
-            object_class = next(
-                (
-                    candidate
-                    for candidate in analysis.classes
-                    if candidate.id == item.class_id
-                ),
-                None,
+            object_definition, object_class = resolve_class(
+                item.class_id,
+                getattr(item, "template_arguments", ()),
             )
             if object_class is None:
                 raise ValueError(
@@ -3517,6 +3720,22 @@ def _prepare_object_scenarios(
                 ),
                 None,
             )
+            if constructor is None and object_definition is not None:
+                definition_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(
+                            object_definition.constructors
+                        )
+                        if candidate.id == item.constructor_id
+                    ),
+                    None,
+                )
+                if (
+                    definition_index is not None
+                    and definition_index < len(object_class.constructors)
+                ):
+                    constructor = object_class.constructors[definition_index]
             if constructor is None:
                 raise ValueError(
                     f"{test.name} selected a stale or wrong-class constructor."
@@ -3548,6 +3767,7 @@ def _prepare_object_scenarios(
                     expected_outcome=item.expected_outcome,
                 )
             )
+            concrete_classes_by_object_id[item.object_id] = object_class
             if item.expected_outcome != "throws":
                 available_objects[item.object_id] = (
                     object_class.id,
@@ -3560,13 +3780,9 @@ def _prepare_object_scenarios(
         deleted_owned_pointers: set[str] = set()
         for step_index, step in enumerate(test.steps):
             if step.step_type == "create_object":
-                object_class = next(
-                    (
-                        candidate
-                        for candidate in analysis.classes
-                        if candidate.id == step.class_id
-                    ),
-                    None,
+                object_definition, object_class = resolve_class(
+                    step.class_id,
+                    step.template_arguments,
                 )
                 if object_class is None:
                     raise ValueError(
@@ -3586,6 +3802,22 @@ def _prepare_object_scenarios(
                     ),
                     None,
                 )
+                if constructor is None and object_definition is not None:
+                    definition_index = next(
+                        (
+                            index
+                            for index, candidate in enumerate(
+                                object_definition.constructors
+                            )
+                            if candidate.id == step.constructor_id
+                        ),
+                        None,
+                    )
+                    if (
+                        definition_index is not None
+                        and definition_index < len(object_class.constructors)
+                    ):
+                        constructor = object_class.constructors[definition_index]
                 if constructor is None:
                     raise ValueError(
                         f"{test.name} step {step_index + 1} selected a stale "
@@ -3634,6 +3866,9 @@ def _prepare_object_scenarios(
                         "value",
                     )
                     used_names.add(step.result_name or "")
+                    concrete_classes_by_object_id[
+                        step.result_object_id or ""
+                    ] = object_class
                 prepared_steps.append(
                     PreparedObjectStep(
                         method=None,
@@ -3649,6 +3884,9 @@ def _prepare_object_scenarios(
                         result_object_class_id=object_class.id,
                         constructor=constructor,
                         constructor_class=object_class,
+                        static_class_id=object_class.name,
+                        runtime_class_id=object_class.name,
+                        ownership_mode="value",
                     )
                 )
                 continue
@@ -3920,7 +4158,7 @@ def _prepare_object_scenarios(
                     f"{test.name} step {step_index + 1} cannot use a deleted "
                     "base pointer."
                 )
-            target_class = next(
+            target_class = concrete_classes_by_object_id.get(target_id) or next(
                 item for item in analysis.classes if item.id == target[0]
             )
             special_kinds = {
@@ -3988,6 +4226,9 @@ def _prepare_object_scenarios(
                         source[2],
                         "value",
                     )
+                    concrete_classes_by_object_id[
+                        step.result_object_id
+                    ] = target_class
                     used_names.add(step.result_name)
                 if step.step_type in {"move_construct", "move_assign"}:
                     moved_from.add(source_id)
@@ -4022,7 +4263,7 @@ def _prepare_object_scenarios(
                         expression=readable,
                         step_type=step.step_type,
                         result_object_class_id=(
-                            source[0] if creates_object else None
+                            target_class.name if creates_object else None
                         ),
                     )
                 )
@@ -4044,6 +4285,33 @@ def _prepare_object_scenarios(
                     ),
                     None,
                 )
+                if (
+                    method is None
+                    and target_class.template_kind == "class_template"
+                ):
+                    definition = next(
+                        (
+                            item
+                            for item in analysis.classes
+                            if item.id == target_class.id
+                        ),
+                        None,
+                    )
+                    definition_index = next(
+                        (
+                            index
+                            for index, candidate in enumerate(
+                                definition.methods if definition else ()
+                            )
+                            if candidate.id == step.method_id
+                        ),
+                        None,
+                    )
+                    if (
+                        definition_index is not None
+                        and definition_index < len(target_class.methods)
+                    ):
+                        method = target_class.methods[definition_index]
                 if method is None:
                     raise ValueError(
                         f"{test.name} step {step_index + 1} selected a stale "
@@ -4094,15 +4362,44 @@ def _prepare_object_scenarios(
                     )
                 )
                 continue
-            operator = next(
-                (
-                    candidate
-                    for object_class in analysis.classes
-                    for candidate in object_class.operators
-                    if candidate.id == step.operator_id
-                ),
-                None,
-            )
+            operator = None
+            if target_class.template_kind == "class_template":
+                definition = next(
+                    (
+                        item
+                        for item in analysis.classes
+                        if item.id == target_class.id
+                    ),
+                    None,
+                )
+                definition_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(
+                            definition.operators if definition else ()
+                        )
+                        if candidate.id == step.operator_id
+                    ),
+                    None,
+                )
+                if (
+                    definition_index is not None
+                    and definition_index < len(target_class.operators)
+                ):
+                    operator = target_class.operators[definition_index]
+            if operator is None:
+                operator = next(
+                    (
+                        candidate
+                        for object_class in (
+                            tuple(concrete_classes_by_object_id.values())
+                            + analysis.classes
+                        )
+                        for candidate in object_class.operators
+                        if candidate.id == step.operator_id
+                    ),
+                    None,
+                )
             if operator is None:
                 raise ValueError(
                     f"{test.name} step {step_index + 1} selected a stale operator."
@@ -4205,6 +4502,9 @@ def _prepare_object_scenarios(
                     operator.return_object_class_id or "",
                     "value",
                 )
+                concrete_classes_by_object_id[
+                    step.result_object_id
+                ] = target_class
                 used_names.add(step.result_name)
             elif step.expected_return is not None:
                 raise ValueError("Reference and stream operator returns are not values.")
@@ -4253,6 +4553,11 @@ def _prepare_object_scenarios(
                     result_name=step.result_name,
                     expression=readable_expression,
                     step_type="operator",
+                    result_object_class_id=(
+                        target_class.name
+                        if operator.return_kind == "object_value"
+                        else None
+                    ),
                 )
             )
         prepared_scenarios.append(
@@ -4317,6 +4622,53 @@ def run_test_request(
                     "The selected function is no longer available. "
                     "Choose a detected function and retry."
                 ),
+                tests=[],
+            )
+        if function.template_kind == "function_template":
+            mode = request.template_argument_mode or (
+                "deduced"
+                if function.template_argument_mode == "deduced"
+                else "explicit"
+            )
+            supplied = tuple(
+                TemplateArgument(
+                    parameter_name=argument.parameter_name,
+                    kind=argument.kind,
+                    value=argument.value,
+                    used_default=argument.use_default,
+                )
+                for argument in request.template_arguments
+            )
+            try:
+                function = instantiate_function_template(
+                    function,
+                    supplied,
+                    argument_mode=mode,
+                    call_arguments=tuple(request.tests[0].arguments),
+                    unqualified_vector_allowed=bool(
+                        re.search(
+                            r"\busing\s+namespace\s+std\s*;",
+                            request.code,
+                        )
+                    ),
+                )
+            except ValueError as error:
+                return RunTestsResponse(
+                    mode="function",
+                    success=False,
+                    input_error=str(error),
+                    function=_function_response(function),
+                    tests=[],
+                )
+        elif request.template_argument_mode or request.template_arguments:
+            return RunTestsResponse(
+                mode="function",
+                success=False,
+                input_error=(
+                    "Template settings cannot be used with a non-template "
+                    "function."
+                ),
+                function=_function_response(function),
                 tests=[],
             )
         mutation_capable_parameters = [

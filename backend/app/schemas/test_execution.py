@@ -25,6 +25,29 @@ class FunctionParameterResponse(BaseModel):
     type_metadata: FunctionTypeResponse
 
 
+class TemplateParameterResponse(BaseModel):
+    name: str
+    kind: Literal["type", "non_type"]
+    non_type_type: str | None = None
+    default_argument: str | None = None
+    deducible: bool = False
+
+
+class TemplateArgumentResponse(BaseModel):
+    parameter_name: str
+    kind: Literal["type", "non_type"]
+    value: str
+    used_default: bool = False
+
+
+class ExplicitSpecializationResponse(BaseModel):
+    primary_template_name: str
+    effective_template_arguments: list[str]
+    return_type: str
+    parameter_types: list[str]
+    source_line: int = Field(ge=1)
+
+
 class FunctionResponse(BaseModel):
     id: str
     name: str
@@ -32,6 +55,30 @@ class FunctionResponse(BaseModel):
     return_type_metadata: FunctionTypeResponse
     parameters: list[FunctionParameterResponse]
     display: str
+    template_kind: Literal[
+        "none", "function_template", "explicit_specialization"
+    ] = Field(default="none", exclude_if=lambda value: value == "none")
+    template_parameters: list[TemplateParameterResponse] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    template_argument_mode: Literal["deduced", "explicit"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    effective_template_arguments: list[TemplateArgumentResponse] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    concrete_instantiation: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    specialization_selected: bool = Field(
+        default=False, exclude_if=lambda value: not value
+    )
+    explicit_specializations: list[ExplicitSpecializationResponse] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    source_line: int | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ObjectConstructorResponse(BaseModel):
@@ -110,6 +157,18 @@ class ObjectClassResponse(BaseModel):
     has_virtual_destructor: bool = False
     derived_class_ids: list[str] = Field(default_factory=list)
     inheritance_depth: int = Field(default=0, ge=0)
+    template_kind: Literal["none", "class_template"] = Field(
+        default="none", exclude_if=lambda value: value == "none"
+    )
+    template_parameters: list[TemplateParameterResponse] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    effective_template_arguments: list[TemplateArgumentResponse] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    concrete_type: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class SourceModeRequest(BaseModel):
@@ -254,6 +313,13 @@ class FunctionTestCase(BaseModel):
         return self
 
 
+class TemplateArgumentInput(BaseModel):
+    parameter_name: str = Field(pattern=r"^[A-Za-z_]\w*$", max_length=100)
+    kind: Literal["type", "non_type"]
+    value: str = Field(default="", max_length=100)
+    use_default: bool = False
+
+
 class ProgramRunTestsRequest(BaseModel):
     mode: Literal["program"]
     code: str = Field(min_length=1, max_length=1_000_000)
@@ -270,6 +336,10 @@ class FunctionRunTestsRequest(BaseModel):
     code: str = Field(min_length=1, max_length=1_000_000)
     language: Literal["cpp"]
     target_function: str = Field(min_length=1, max_length=300)
+    template_argument_mode: Literal["deduced", "explicit"] | None = None
+    template_arguments: list[TemplateArgumentInput] = Field(
+        default_factory=list, max_length=10
+    )
     comparison_mode: Literal["whitespace_tolerant", "exact"] = (
         "whitespace_tolerant"
     )
@@ -299,6 +369,9 @@ class ObjectScenarioStep(BaseModel):
     method_id: str | None = Field(default=None, max_length=500)
     class_id: str | None = Field(default=None, max_length=200)
     constructor_id: str | None = Field(default=None, max_length=500)
+    template_arguments: list[TemplateArgumentInput] = Field(
+        default_factory=list, max_length=10
+    )
     operator_id: str | None = Field(default=None, max_length=700)
     target_object_id: str | None = Field(default=None, max_length=100)
     arguments: list[str] = Field(default_factory=list, max_length=20)
@@ -442,6 +515,9 @@ class ObjectScenarioObject(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     class_id: str = Field(min_length=1, max_length=200)
     constructor_id: str = Field(min_length=1, max_length=500)
+    template_arguments: list[TemplateArgumentInput] = Field(
+        default_factory=list, max_length=10
+    )
     arguments: list[str] = Field(max_length=20)
     expected_outcome: Literal["return_void", "throws"] = "return_void"
     expected_exception_type: ExceptionType | None = None
@@ -615,6 +691,27 @@ class MemoryDiagnosticResult(BaseModel):
     memory_diagnoses: list[MemoryDiagnosisResponse] = Field(
         default_factory=list, max_length=3
     )
+    template_kind: Literal[
+        "function_template", "class_template", "explicit_specialization"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    template_name: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    template_argument_mode: Literal["deduced", "explicit"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    effective_template_arguments: list[TemplateArgumentResponse] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    concrete_instantiation: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    specialization_selected: bool = Field(
+        default=False, exclude_if=lambda value: not value
+    )
+    specialization_kind: Literal[
+        "primary", "explicit_specialization"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ProgramTestResult(MemoryDiagnosticResult):

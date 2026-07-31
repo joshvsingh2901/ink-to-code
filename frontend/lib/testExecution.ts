@@ -26,6 +26,35 @@ export type FunctionDescriptor = {
   return_type_metadata: FunctionTypeMetadata;
   parameters: FunctionParameter[];
   display: string;
+  template_kind: "none" | "function_template" | "explicit_specialization";
+  template_parameters: TemplateParameter[];
+  template_argument_mode: "deduced" | "explicit" | null;
+  effective_template_arguments: TemplateArgument[];
+  concrete_instantiation: string | null;
+  specialization_selected: boolean;
+  explicit_specializations: Array<{
+    primary_template_name: string;
+    effective_template_arguments: string[];
+    return_type: string;
+    parameter_types: string[];
+    source_line: number;
+  }>;
+  source_line: number | null;
+};
+
+export type TemplateParameter = {
+  name: string;
+  kind: "type" | "non_type";
+  non_type_type: string | null;
+  default_argument: string | null;
+  deducible: boolean;
+};
+
+export type TemplateArgument = {
+  parameter_name: string;
+  kind: "type" | "non_type";
+  value: string;
+  used_default: boolean;
 };
 
 export type ObjectConstructor = {
@@ -65,6 +94,10 @@ export type ObjectClass = {
   has_virtual_destructor: boolean;
   derived_class_ids: string[];
   inheritance_depth: number;
+  template_kind: "none" | "class_template";
+  template_parameters: TemplateParameter[];
+  effective_template_arguments: TemplateArgument[];
+  concrete_type: string | null;
 };
 
 export type ObjectSpecialMember = {
@@ -182,6 +215,12 @@ export type ObjectScenarioTestInput = {
     name: string;
     class_id: string;
     constructor_id: string;
+    template_arguments?: Array<{
+      parameter_name: string;
+      kind: "type" | "non_type";
+      value: string;
+      use_default: boolean;
+    }>;
     arguments: string[];
   } & ExceptionExpectationInput>;
   steps: Array<{
@@ -205,6 +244,12 @@ export type ObjectScenarioTestInput = {
     method_id?: string;
     class_id?: string;
     constructor_id?: string;
+    template_arguments?: Array<{
+      parameter_name: string;
+      kind: "type" | "non_type";
+      value: string;
+      use_default: boolean;
+    }>;
     operator_id?: string;
     target_object_id?: string;
     arguments?: string[];
@@ -280,6 +325,17 @@ type ResultBase = {
     | "formatting_mismatch"
     | "mismatch";
   exception_result?: ExceptionOutcomeResult | null;
+  template_kind:
+    | "function_template"
+    | "class_template"
+    | "explicit_specialization"
+    | null;
+  template_name: string | null;
+  template_argument_mode: "deduced" | "explicit" | null;
+  effective_template_arguments: TemplateArgument[];
+  concrete_instantiation: string | null;
+  specialization_selected: boolean;
+  specialization_kind: "primary" | "explicit_specialization" | null;
 };
 
 export type MemoryDiagnosis = {
@@ -491,6 +547,13 @@ export type RunTestsRequest =
       code: string;
       language: "cpp";
       target_function: string;
+      template_argument_mode?: "deduced" | "explicit";
+      template_arguments?: Array<{
+        parameter_name: string;
+        kind: "type" | "non_type";
+        value: string;
+        use_default: boolean;
+      }>;
       comparison_mode: "whitespace_tolerant" | "exact";
       run_memory_checks?: boolean;
       tests: FunctionCombinedTestInput[];
@@ -525,6 +588,57 @@ function isFunctionDescriptor(value: unknown): value is FunctionDescriptor {
     typeof descriptor.return_type === "string" &&
     isFunctionTypeMetadata(descriptor.return_type_metadata) &&
     typeof descriptor.display === "string" &&
+    (descriptor.template_kind === undefined ||
+      ["none", "function_template", "explicit_specialization"].includes(
+        descriptor.template_kind,
+      )) &&
+    (descriptor.template_parameters === undefined ||
+    (Array.isArray(descriptor.template_parameters) &&
+    descriptor.template_parameters.every(
+      (parameter) =>
+        parameter !== null &&
+        typeof parameter === "object" &&
+        typeof parameter.name === "string" &&
+        ["type", "non_type"].includes(parameter.kind) &&
+        (parameter.non_type_type === null ||
+          typeof parameter.non_type_type === "string") &&
+        (parameter.default_argument === null ||
+          typeof parameter.default_argument === "string") &&
+        typeof parameter.deducible === "boolean",
+    ))) &&
+    (descriptor.template_argument_mode === undefined ||
+      descriptor.template_argument_mode === null ||
+      ["deduced", "explicit"].includes(descriptor.template_argument_mode)) &&
+    (descriptor.effective_template_arguments === undefined ||
+      Array.isArray(descriptor.effective_template_arguments)) &&
+    (descriptor.concrete_instantiation === undefined ||
+      descriptor.concrete_instantiation === null ||
+      typeof descriptor.concrete_instantiation === "string") &&
+    (descriptor.specialization_selected === undefined ||
+      typeof descriptor.specialization_selected === "boolean") &&
+    (descriptor.explicit_specializations === undefined ||
+      (Array.isArray(descriptor.explicit_specializations) &&
+        descriptor.explicit_specializations.every(
+          (specialization) =>
+            specialization !== null &&
+            typeof specialization === "object" &&
+            typeof specialization.primary_template_name === "string" &&
+            Array.isArray(
+              specialization.effective_template_arguments,
+            ) &&
+            specialization.effective_template_arguments.every(
+              (argument) => typeof argument === "string",
+            ) &&
+            typeof specialization.return_type === "string" &&
+            Array.isArray(specialization.parameter_types) &&
+            specialization.parameter_types.every(
+              (parameter) => typeof parameter === "string",
+            ) &&
+            typeof specialization.source_line === "number",
+        ))) &&
+    (descriptor.source_line === undefined ||
+      descriptor.source_line === null ||
+      typeof descriptor.source_line === "number") &&
     Array.isArray(descriptor.parameters) &&
     descriptor.parameters.every(
       (parameter) =>
@@ -649,6 +763,23 @@ function isObjectClass(value: unknown): value is ObjectClass {
       (item) => typeof item === "string",
     ) &&
     typeof objectClass.inheritance_depth === "number"
+    &&
+    (objectClass.template_kind === undefined ||
+      ["none", "class_template"].includes(objectClass.template_kind)) &&
+    (objectClass.template_parameters === undefined ||
+    (Array.isArray(objectClass.template_parameters) &&
+    objectClass.template_parameters.every(
+      (parameter) =>
+        parameter !== null &&
+        typeof parameter === "object" &&
+        typeof parameter.name === "string" &&
+        ["type", "non_type"].includes(parameter.kind),
+    ))) &&
+    (objectClass.effective_template_arguments === undefined ||
+      Array.isArray(objectClass.effective_template_arguments)) &&
+    (objectClass.concrete_type === undefined ||
+      objectClass.concrete_type === null ||
+      typeof objectClass.concrete_type === "string")
   );
 }
 
@@ -732,7 +863,41 @@ function isResultBase(value: unknown): value is ResultBase {
     isMatchType(result.match_type) &&
     (result.exception_result === undefined ||
       result.exception_result === null ||
-      isExceptionOutcomeResult(result.exception_result))
+      isExceptionOutcomeResult(result.exception_result)) &&
+    (result.template_kind === undefined ||
+      result.template_kind === null ||
+      [
+        "function_template",
+        "class_template",
+        "explicit_specialization",
+      ].includes(result.template_kind)) &&
+    (result.template_name === undefined ||
+      result.template_name === null ||
+      typeof result.template_name === "string") &&
+    (result.template_argument_mode === undefined ||
+      result.template_argument_mode === null ||
+      ["deduced", "explicit"].includes(result.template_argument_mode)) &&
+    (result.effective_template_arguments === undefined ||
+    (Array.isArray(result.effective_template_arguments) &&
+    result.effective_template_arguments.every(
+      (argument) =>
+        argument !== null &&
+        typeof argument === "object" &&
+        typeof argument.parameter_name === "string" &&
+        ["type", "non_type"].includes(argument.kind) &&
+        typeof argument.value === "string" &&
+        typeof argument.used_default === "boolean",
+    ))) &&
+    (result.concrete_instantiation === undefined ||
+      result.concrete_instantiation === null ||
+      typeof result.concrete_instantiation === "string") &&
+    (result.specialization_selected === undefined ||
+      typeof result.specialization_selected === "boolean") &&
+    (result.specialization_kind === undefined ||
+      result.specialization_kind === null ||
+      ["primary", "explicit_specialization"].includes(
+        result.specialization_kind,
+      ))
   );
 }
 

@@ -380,6 +380,33 @@ compare addresses, count destructor calls, run sanitizers, or report leaks.
 Copy independence is verified only through user-selected mutations and public
 observer expectations.
 
+### Template testing
+
+The source-analysis endpoint exposes supported function and class templates as
+structured metadata. Template parameters retain declaration order, kind
+(`type` or `non_type`), declared non-type type, and a safely parsed default.
+The frontend sends parameter names plus validated selections; it never sends a
+raw template-id expression.
+
+Function templates support straightforward compiler-authoritative deduction
+or explicit arguments. Explicit type arguments come from the supported value
+type allowlist. Integral, boolean, and character non-type arguments accept
+bounded literal data only. The backend builds calls such as
+`maximum<int>(3, 5)` after revalidating every selection. Result metadata reports
+the concrete instantiation and reliably matched explicit specializations.
+
+Class-template object steps use the same structured arguments and instantiate
+their constructors, public methods, and existing operators through the object
+scenario harness. Exceptions and optional memory diagnostics use the existing
+independent result channels. Template substitution and instantiation failures
+remain compiler failures with the raw diagnostic retained.
+
+Partial specialization, variadic templates, parameter packs, concepts,
+template-template parameters, user-defined deduction guides, dependent-base
+analysis, metaprogramming-heavy APIs, and multi-file templates are not
+supported. These forms return a limitation rather than accepting raw C++ from
+the test form.
+
 ## Tests
 
 Tests mock the Gemini client and never make quota-consuming API calls:

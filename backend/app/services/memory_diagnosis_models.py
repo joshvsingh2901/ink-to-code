@@ -58,6 +58,12 @@ OperationContext = Literal[
     "base_destruction",
     "object_slicing",
     "dynamic_cast",
+    "function_template_call",
+    "class_template_construction",
+    "class_template_method",
+    "class_template_operator",
+    "template_specialization",
+    "template_instantiation_cleanup",
     "unknown",
 ]
 

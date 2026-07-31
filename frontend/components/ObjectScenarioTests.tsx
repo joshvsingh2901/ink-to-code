@@ -22,6 +22,14 @@ export type EditableScenarioObject = EditableExceptionExpectation & {
   class_id: string;
   constructor_id: string;
   arguments: string[];
+  template_arguments: EditableTemplateArgument[];
+};
+
+export type EditableTemplateArgument = {
+  parameter_name: string;
+  kind: "type" | "non_type";
+  value: string;
+  use_default: boolean;
 };
 
 export type EditableObjectStep = EditableExceptionExpectation & {
@@ -62,6 +70,7 @@ export type EditableObjectStep = EditableExceptionExpectation & {
   expected_return: string;
   check_stdout: boolean;
   expected_stdout: string;
+  template_arguments: EditableTemplateArgument[];
 };
 
 export type EditableObjectScenario = {
@@ -89,6 +98,15 @@ function newObject(classes: ObjectClass[], index: number): EditableScenarioObjec
     class_id: objectClass?.id ?? "",
     constructor_id: constructor?.id ?? "",
     arguments: constructor?.parameters.map(() => "") ?? [],
+    template_arguments:
+      objectClass?.template_parameters.map((parameter) => ({
+        parameter_name: parameter.name,
+        kind: parameter.kind,
+        value: parameter.default_argument ?? (
+          parameter.kind === "type" ? "int" : ""
+        ),
+        use_default: parameter.default_argument !== null,
+      })) ?? [],
     expected_outcome: "return_void",
     expected_exception_type: "",
     exception_message_rule: "ignore",
@@ -119,6 +137,7 @@ function newStep(targetId: string): EditableObjectStep {
     expected_return: "",
     check_stdout: false,
     expected_stdout: "",
+    template_arguments: [],
     expected_outcome: "return_void",
     expected_exception_type: "",
     exception_message_rule: "ignore",
@@ -164,6 +183,123 @@ function ValueField({
           {helperText}
         </p>
       )}
+    </div>
+  );
+}
+
+const TEMPLATE_TYPES = [
+  "int",
+  "long",
+  "long long",
+  "float",
+  "double",
+  "bool",
+  "char",
+  "std::string",
+] as const;
+
+function TemplateArgumentFields({
+  objectClass,
+  values,
+  onChange,
+}: {
+  objectClass: ObjectClass;
+  values: EditableTemplateArgument[];
+  onChange: (values: EditableTemplateArgument[]) => void;
+}) {
+  if (objectClass.template_kind !== "class_template") return null;
+  const effective = objectClass.template_parameters.map((parameter) => {
+    const configured = values.find(
+      (item) => item.parameter_name === parameter.name,
+    );
+    return configured?.use_default
+      ? parameter.default_argument ?? "?"
+      : configured?.value || "?";
+  });
+  return (
+    <div className="space-y-2 rounded-md border border-slate-200 p-2.5">
+      <p className="text-xs font-medium text-slate-700">Template arguments</p>
+      {objectClass.template_parameters.map((parameter) => {
+        const configured = values.find(
+          (item) => item.parameter_name === parameter.name,
+        ) ?? {
+          parameter_name: parameter.name,
+          kind: parameter.kind,
+          value: parameter.default_argument ?? "",
+          use_default: parameter.default_argument !== null,
+        };
+        const update = (next: EditableTemplateArgument) =>
+          onChange(
+            objectClass.template_parameters.map((candidate) =>
+              candidate.name === parameter.name
+                ? next
+                : values.find(
+                    (item) => item.parameter_name === candidate.name,
+                  ) ?? {
+                    parameter_name: candidate.name,
+                    kind: candidate.kind,
+                    value: candidate.default_argument ?? "",
+                    use_default: candidate.default_argument !== null,
+                  },
+            ),
+          );
+        return (
+          <label
+            key={parameter.name}
+            className="block text-xs font-medium text-slate-600"
+          >
+            {parameter.name}
+            {parameter.kind === "type" ? (
+              <select
+                aria-label={`Template type ${parameter.name}`}
+                value={configured.use_default ? "__default__" : configured.value}
+                onChange={(event) => {
+                  const useDefault = event.target.value === "__default__";
+                  update({
+                    parameter_name: parameter.name,
+                    kind: parameter.kind,
+                    value: useDefault
+                      ? parameter.default_argument ?? ""
+                      : event.target.value,
+                    use_default: useDefault,
+                  });
+                }}
+                className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
+              >
+                {parameter.default_argument !== null && (
+                  <option value="__default__">
+                    Use default ({parameter.default_argument})
+                  </option>
+                )}
+                <option value="">Choose a type</option>
+                {TEMPLATE_TYPES.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                aria-label={`Template value ${parameter.name}`}
+                value={configured.value}
+                maxLength={100}
+                onChange={(event) =>
+                  update({
+                    ...configured,
+                    value: event.target.value,
+                    use_default: false,
+                  })
+                }
+                className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs"
+              />
+            )}
+          </label>
+        );
+      })}
+      <p className="rounded bg-slate-50 px-2 py-1.5 text-[11px] text-slate-600">
+        Concrete type:{" "}
+        <code>{objectClass.name}&lt;{effective.join(", ")}&gt;</code>
+      </p>
     </div>
   );
 }
@@ -318,6 +454,18 @@ export function ObjectScenarioTests({
                             constructor_id: nextConstructor?.id ?? "",
                             arguments:
                               nextConstructor?.parameters.map(() => "") ?? [],
+                            template_arguments:
+                              nextClass?.template_parameters.map(
+                                (parameter) => ({
+                                  parameter_name: parameter.name,
+                                  kind: parameter.kind,
+                                  value:
+                                    parameter.default_argument ??
+                                    (parameter.kind === "type" ? "int" : ""),
+                                  use_default:
+                                    parameter.default_argument !== null,
+                                }),
+                              ) ?? [],
                           }));
                         }}
                         className="w-full rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-slate-200"
@@ -339,6 +487,19 @@ export function ObjectScenarioTests({
                             </option>
                         ))}
                       </select>
+                      {objectClass && (
+                        <TemplateArgumentFields
+                          objectClass={objectClass}
+                          values={object.template_arguments}
+                          onChange={(template_arguments) =>
+                            replaceObject((current) => ({
+                              ...current,
+                              template_arguments,
+                              arguments: constructor?.parameters.map(() => "") ?? [],
+                            }))
+                          }
+                        />
+                      )}
                       {objectClass && (
                         <select
                           aria-label={`${object.name} constructor`}
@@ -445,6 +606,10 @@ export function ObjectScenarioTests({
                           : operatorClass ?? source?.class_id ?? "",
                       constructor_id: "",
                       arguments: [],
+                      template_arguments:
+                        priorStep.step_type === "create_object"
+                          ? priorStep.template_arguments
+                          : source?.template_arguments ?? [],
                       expected_outcome: "return_void",
                       expected_exception_type: "",
                       exception_message_rule: "ignore",
@@ -801,6 +966,18 @@ export function ObjectScenarioTests({
                                 arguments:
                                   nextConstructor?.parameters.map(() => "") ??
                                   [],
+                                template_arguments:
+                                  nextClass?.template_parameters.map(
+                                    (parameter) => ({
+                                      parameter_name: parameter.name,
+                                      kind: parameter.kind,
+                                      value:
+                                        parameter.default_argument ??
+                                        (parameter.kind === "type" ? "int" : ""),
+                                      use_default:
+                                        parameter.default_argument !== null,
+                                    }),
+                                  ) ?? [],
                               }));
                             }}
                             className="mt-1 w-full min-w-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs"
@@ -823,6 +1000,21 @@ export function ObjectScenarioTests({
                             ))}
                           </select>
                         </label>
+                        {createClass && (
+                          <TemplateArgumentFields
+                            objectClass={createClass}
+                            values={step.template_arguments}
+                            onChange={(template_arguments) =>
+                              replaceStep((current) => ({
+                                ...current,
+                                template_arguments,
+                                arguments:
+                                  createConstructor?.parameters.map(() => "") ??
+                                  [],
+                              }))
+                            }
+                          />
+                        )}
                         {createClass && (
                           <label className="block text-xs text-slate-700">
                             Constructor

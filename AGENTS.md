@@ -599,3 +599,16 @@ The expected request should contain the current source code in structured JSON, 
 - Do not inject raw frontend class or method names into generated C++.
 - Keep polymorphism results concise and show technical lifecycle details only when expanded.
 - Do not add multiple inheritance or virtual inheritance without a separate design stage.
+
+## Template testing
+
+- Support function templates and class templates through validated structured metadata.
+- Never accept arbitrary raw template argument syntax from the frontend.
+- Build template identifiers server-side from validated arguments.
+- Let the compiler remain the final authority for deduction and substitution.
+- Template compilation failures remain compile errors.
+- Preserve template argument declaration order.
+- Defaults must be represented explicitly.
+- Runtime exceptions and memory diagnostics remain independent from template compilation.
+- Do not add partial specialization, variadic templates, concepts, or metaprogramming without a separate design stage.
+- Keep student-facing results concise and place full template metadata under Technical details.

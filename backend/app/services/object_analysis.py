@@ -4,11 +4,15 @@ from typing import Literal
 
 from app.services.function_analysis import (
     FunctionParameter,
+    TemplateArgument,
+    TemplateParameter,
     ValueType,
     _brace_depths,
     _mask_non_code,
     _parse_parameters,
     _parse_value_type,
+    _parse_template_parameters,
+    _replace_template_names,
 )
 
 
@@ -91,6 +95,11 @@ class ObjectClass:
     has_virtual_destructor: bool = False
     derived_class_ids: tuple[str, ...] = ()
     inheritance_depth: int = 0
+    template_kind: Literal["none", "class_template"] = "none"
+    template_parameters: tuple[TemplateParameter, ...] = ()
+    effective_template_arguments: tuple[TemplateArgument, ...] = ()
+    concrete_type: str | None = None
+    template_body: str | None = None
 
 
 @dataclass(frozen=True)
@@ -856,10 +865,51 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
     }
     classes: list[ObjectClass] = []
     rejected_inheritance = False
+    rejected_template = False
 
     for match in _CLASS_START.finditer(masked):
         if depths[match.start()] != 0:
             continue
+        template_match = re.search(
+            r"template\s*<(?P<parameters>[^<>]*)>\s*$",
+            masked[: match.start()],
+        )
+        template_parameters: tuple[TemplateParameter, ...] = ()
+        template_arguments: tuple[TemplateArgument, ...] = ()
+        template_kind: Literal["none", "class_template"] = "none"
+        if template_match:
+            if (
+                "..." in template_match.group("parameters")
+                or "<" in match.group("header")
+                or "requires" in masked[
+                    template_match.start():match.start()
+                ]
+            ):
+                rejected_template = True
+                continue
+            parsed_template, _ = _parse_template_parameters(
+                template_match.group("parameters")
+            )
+            if parsed_template is None:
+                rejected_template = True
+                continue
+            template_parameters = parsed_template
+            template_kind = "class_template"
+            template_arguments = tuple(
+                TemplateArgument(
+                    parameter_name=parameter.name,
+                    kind=parameter.kind,
+                    value=(
+                        parameter.default_argument
+                        if parameter.default_argument is not None
+                        else "int"
+                        if parameter.kind == "type"
+                        else "1"
+                    ),
+                    used_default=parameter.default_argument is not None,
+                )
+                for parameter in template_parameters
+            )
         base_class_id = None
         inheritance_access = None
         inheritance_supported = True
@@ -885,11 +935,23 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
             continue
         kind = match.group("kind")
         name = match.group("name")
+        raw_body = masked[match.end():body_end]
+        member_body = (
+            _replace_template_names(
+                raw_body,
+                {
+                    argument.parameter_name: argument.value
+                    for argument in template_arguments
+                },
+            )
+            if template_kind == "class_template"
+            else raw_body
+        )
         constructors, methods, operators, special_members = (
             _analyze_class_members(
             name,
             kind,
-            masked[match.end():body_end],
+            member_body,
             unqualified_types_allowed=unqualified_types_allowed,
             class_names=class_names,
             )
@@ -922,6 +984,21 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
                             rf"\bvirtual\s+~{re.escape(name)}\s*\(",
                             masked[match.end():body_end],
                         )
+                    ),
+                    template_kind=template_kind,
+                    template_parameters=template_parameters,
+                    effective_template_arguments=template_arguments,
+                    concrete_type=(
+                        f"{name}<"
+                        + ", ".join(
+                            argument.value for argument in template_arguments
+                        )
+                        + ">"
+                        if template_arguments
+                        else None
+                    ),
+                    template_body=(
+                        raw_body if template_kind == "class_template" else None
                     ),
                 )
             )
@@ -1027,6 +1104,8 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
     message = (
         "Inheritance is unsupported in object scenarios."
         if rejected_inheritance
+        else "This advanced class-template form is unsupported."
+        if rejected_template
         else None
     )
     standalone = _analyze_standalone_operators(
@@ -1065,9 +1144,115 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
         message = (
             "Inheritance is unsupported in object scenarios."
             if rejected_inheritance
+            else "This advanced class-template form is unsupported."
+            if rejected_template
             else (
                 "No class or struct with a usable public constructor "
                 "and public instance method was found."
             )
         )
     return ObjectAnalysis(classes=tuple(classes), message=message)
+
+
+def instantiate_object_template(
+    object_class: ObjectClass,
+    supplied_arguments: tuple[TemplateArgument, ...],
+    *,
+    unqualified_types_allowed: bool,
+) -> ObjectClass:
+    if object_class.template_kind != "class_template":
+        if supplied_arguments:
+            raise ValueError(
+                "Template arguments cannot be used with a non-template class."
+            )
+        return object_class
+    supplied = {
+        argument.parameter_name: argument for argument in supplied_arguments
+    }
+    if len(supplied) != len(supplied_arguments):
+        raise ValueError("Template argument names must be unique.")
+    resolved: list[TemplateArgument] = []
+    replacements: dict[str, str] = {}
+    supported_types = {
+        "int", "long", "long long", "float", "double", "bool", "char",
+        "std::string",
+    }
+    for parameter in object_class.template_parameters:
+        argument = supplied.get(parameter.name)
+        value = (
+            argument.value
+            if argument is not None and not argument.used_default
+            else parameter.default_argument
+        )
+        used_default = (
+            argument.used_default if argument is not None else True
+        )
+        if value is None:
+            raise ValueError(
+                f"Template argument {parameter.name} is required."
+            )
+        normalized = " ".join(value.strip().split())
+        if parameter.kind == "type":
+            if normalized == "string":
+                normalized = "std::string"
+            if normalized not in supported_types:
+                raise ValueError(
+                    f"Template type argument {parameter.name} is unsupported."
+                )
+        elif parameter.non_type_type in {"int", "long", "long long"}:
+            if not re.fullmatch(r"[+-]?\d+", normalized):
+                raise ValueError(
+                    f"Template argument {parameter.name} must be an integer literal."
+                )
+        elif parameter.non_type_type == "bool":
+            if normalized not in {"true", "false"}:
+                raise ValueError(
+                    f"Template argument {parameter.name} must be true or false."
+                )
+        elif parameter.non_type_type == "char":
+            if not re.fullmatch(r"'(?:[^'\\\\]|\\\\[nrt0'\\\\])'", normalized):
+                raise ValueError(
+                    f"Template argument {parameter.name} must be a character literal."
+                )
+        replacements[parameter.name] = normalized
+        resolved.append(
+            TemplateArgument(
+                parameter_name=parameter.name,
+                kind=parameter.kind,
+                value=normalized,
+                used_default=used_default,
+            )
+        )
+    body = _replace_template_names(
+        object_class.template_body or "", replacements
+    )
+    constructors, methods, operators, special_members = _analyze_class_members(
+        object_class.name,
+        object_class.kind,
+        body,
+        unqualified_types_allowed=unqualified_types_allowed,
+        class_names={object_class.name},
+    )
+    if not constructors:
+        constructors = (
+            ObjectConstructor(
+                id=f"{object_class.name}::{object_class.name}()",
+                display=f"{object_class.name}()",
+                parameters=(),
+            ),
+        )
+    concrete = (
+        f"{object_class.name}<"
+        + ", ".join(argument.value for argument in resolved)
+        + ">"
+    )
+    return replace(
+        object_class,
+        name=concrete,
+        constructors=constructors,
+        methods=methods,
+        operators=operators,
+        special_members=special_members,
+        effective_template_arguments=tuple(resolved),
+        concrete_type=concrete,
+    )

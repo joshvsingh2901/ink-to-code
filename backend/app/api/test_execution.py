@@ -79,6 +79,55 @@ async def analyze_source_mode(
                 return_type_metadata=type_response(
                     function.return_value_type
                 ),
+                template_kind=function.template_kind,
+                template_parameters=[
+                    {
+                        "name": parameter.name,
+                        "kind": parameter.kind,
+                        "non_type_type": parameter.non_type_type,
+                        "default_argument": parameter.default_argument,
+                        "deducible": any(
+                            parameter.name in raw_type
+                            for raw_type in function.raw_parameter_types
+                        ),
+                    }
+                    for parameter in function.template_parameters
+                ],
+                template_argument_mode=function.template_argument_mode,
+                effective_template_arguments=[
+                    {
+                        "parameter_name": argument.parameter_name,
+                        "kind": argument.kind,
+                        "value": argument.value,
+                        "used_default": argument.used_default,
+                    }
+                    for argument in function.effective_template_arguments
+                ],
+                concrete_instantiation=function.concrete_instantiation,
+                specialization_selected=(
+                    function.specialization_selected
+                ),
+                explicit_specializations=[
+                    {
+                        "primary_template_name": (
+                            specialization.primary_template_name
+                        ),
+                        "effective_template_arguments": list(
+                            specialization.effective_template_arguments
+                        ),
+                        "return_type": specialization.return_type,
+                        "parameter_types": list(
+                            specialization.parameter_types
+                        ),
+                        "source_line": specialization.source_line,
+                    }
+                    for specialization in function.explicit_specializations
+                ],
+                source_line=(
+                    function.source_line
+                    if function.template_kind != "none"
+                    else None
+                ),
             )
             for function in analysis.functions
         ],
@@ -194,15 +243,40 @@ async def analyze_source_mode(
                 ),
                 derived_class_ids=list(object_class.derived_class_ids),
                 inheritance_depth=object_class.inheritance_depth,
+                template_kind=object_class.template_kind,
+                template_parameters=[
+                    {
+                        "name": parameter.name,
+                        "kind": parameter.kind,
+                        "non_type_type": parameter.non_type_type,
+                        "default_argument": parameter.default_argument,
+                        "deducible": False,
+                    }
+                    for parameter in object_class.template_parameters
+                ],
+                effective_template_arguments=[
+                    {
+                        "parameter_name": argument.parameter_name,
+                        "kind": argument.kind,
+                        "value": argument.value,
+                        "used_default": argument.used_default,
+                    }
+                    for argument in object_class.effective_template_arguments
+                ],
+                concrete_type=object_class.concrete_type,
             )
             for object_class in object_analysis.classes
         ],
         available_modes=available_modes,
         message=(
-            object_analysis.message
-            if object_analysis.message
-            else analysis.message
+            (
+                analysis.message
+                if "template" in request.code
+                else object_analysis.message or analysis.message
+            )
             if not available_modes
+            else object_analysis.message
+            if object_analysis.message
             else None
         ),
     )

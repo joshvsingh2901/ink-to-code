@@ -5,11 +5,11 @@ export type FunctionParameter = {
 };
 
 export type FunctionTypeMetadata = {
-  kind: "scalar" | "vector" | "array" | "void";
+  kind: "scalar" | "vector" | "array" | "void" | "container" | "iterator";
   display_type: string;
   scalar_type: string | null;
   element_type: string | null;
-  vector_depth: 1 | 2 | null;
+  vector_depth: number | null;
   passing:
     | "value"
     | "const_reference"
@@ -17,6 +17,24 @@ export type FunctionTypeMetadata = {
     | "scalar_pointer"
     | "array_pointer";
   size_parameter_name: string | null;
+  // Container-specific fields (null/undefined for non-container kinds)
+  container_family?: "sequence" | "associative" | "unordered" | "adapter" | null;
+  container_name?: string | null;
+  key_type?: string | null;
+  mapped_type?: string | null;
+  fixed_size?: number | null;
+  nested_depth?: number | null;
+  ordered?: boolean | null;
+  associative?: boolean | null;
+  unordered?: boolean | null;
+  adapter?: boolean | null;
+  supported?: boolean;
+  unsupported_reason?: string | null;
+  // Iterator-specific fields (null/undefined for non-iterator kinds)
+  iterator_container?: string | null;
+  iterator_const?: boolean | null;
+  iterator_role?: "single" | "range_begin" | "range_end" | null;
+  iterator_group_index?: number | null;
 };
 
 export type FunctionDescriptor = {
@@ -789,15 +807,16 @@ function isFunctionTypeMetadata(
   if (!value || typeof value !== "object") return false;
   const metadata = value as Partial<FunctionTypeMetadata>;
   return (
-    ["scalar", "vector", "array", "void"].includes(metadata.kind ?? "") &&
+    ["scalar", "vector", "array", "void", "container", "iterator"].includes(
+      metadata.kind ?? "",
+    ) &&
     typeof metadata.display_type === "string" &&
     (metadata.scalar_type === null ||
       typeof metadata.scalar_type === "string") &&
     (metadata.element_type === null ||
       typeof metadata.element_type === "string") &&
     (metadata.vector_depth === null ||
-      metadata.vector_depth === 1 ||
-      metadata.vector_depth === 2) &&
+      typeof metadata.vector_depth === "number") &&
     [
       "value",
       "const_reference",

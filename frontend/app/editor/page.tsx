@@ -7,12 +7,15 @@ import {
   ObjectScenarioTests,
   type EditableObjectScenario,
 } from "@/components/ObjectScenarioTests";
+import { ContainerValueEditor } from "@/components/ContainerValueEditor";
+import IteratorValueEditor from "@/components/IteratorValueEditor";
 import {
   ExceptionExpectationFields,
   type EditableExceptionExpectation,
 } from "@/components/ExceptionExpectationFields";
 import { useUploads } from "@/components/UploadProvider";
 import { exceptionExpectationPayload } from "@/lib/exceptionTestState";
+import { previewContainerValue } from "@/lib/containerValues";
 import {
   compileCpp,
   type CompileDiagnostic,
@@ -46,6 +49,9 @@ import {
   templateInstantiationPreview,
   templateSelectionLabel,
 } from "@/lib/templateTesting";
+import { nextTestName } from "@/lib/testCaseNames";
+import QuestionContextPanel from "@/components/QuestionContextPanel";
+import AITestPanel from "@/components/AITestPanel";
 
 type SidebarTab = "compiler" | "tests";
 type PrimaryDiagnostic = CompileDiagnostic & {
@@ -117,7 +123,11 @@ function mutableParameters(functionDescriptor: FunctionDescriptor) {
     (parameter) =>
       parameter.type_metadata.passing === "mutable_reference" ||
       parameter.type_metadata.passing === "scalar_pointer" ||
-      parameter.type_metadata.passing === "array_pointer",
+      parameter.type_metadata.passing === "array_pointer" ||
+      (parameter.type_metadata.kind === "iterator" &&
+        parameter.type_metadata.iterator_const !== true &&
+        (parameter.type_metadata.iterator_role === "single" ||
+          parameter.type_metadata.iterator_role === "range_begin")),
   );
 }
 
@@ -886,7 +896,15 @@ function getIssueCategory(diagnostic: PrimaryDiagnostic): IssueCategory {
 
 export default function EditorPage() {
   const router = useRouter();
-  const { reviewedCode, setReviewedCode } = useUploads();
+  const {
+    reviewedCode,
+    setReviewedCode,
+    questionUpload,
+    questionText,
+    setQuestionText,
+    questionExtraction,
+    setQuestionExtraction,
+  } = useUploads();
   const [code, setCode] = useState(reviewedCode ?? "");
   const [filename, setFilename] = useState("solution.cpp");
   const [activeTab, setActiveTab] = useState<SidebarTab>("compiler");
@@ -924,6 +942,9 @@ export default function EditorPage() {
   >({});
   const [testModeError, setTestModeError] = useState<string | null>(null);
   const [isAnalyzingTests, setIsAnalyzingTests] = useState(true);
+  const [iteratorMutationChecked, setIteratorMutationChecked] = useState<
+    Record<string, boolean>
+  >({});
   const [isEdited, setIsEdited] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const initialCodeRef = useRef(reviewedCode ?? "");
@@ -1019,6 +1040,7 @@ export default function EditorPage() {
             setSelectedFunctionId(nextId);
             if (nextId !== previousId) {
               initializeTemplateSettings(nextFunction);
+              setIteratorMutationChecked({});
             }
             setTestCases((current) =>
               current.map((test) => ({
@@ -1352,7 +1374,12 @@ export default function EditorPage() {
         (parameter) =>
           parameter.type_metadata.passing === "mutable_reference" ||
           parameter.type_metadata.passing === "scalar_pointer" ||
-          parameter.type_metadata.passing === "array_pointer",
+          parameter.type_metadata.passing === "array_pointer" ||
+          (parameter.type_metadata.kind === "iterator" &&
+            parameter.type_metadata.iterator_const !== true &&
+            (parameter.type_metadata.iterator_role === "single" ||
+              parameter.type_metadata.iterator_role === "range_begin") &&
+            iteratorMutationChecked[parameter.name] === true),
       );
       const request =
         testTarget === "function"
@@ -1673,11 +1700,12 @@ export default function EditorPage() {
     if (testCases.length >= MAX_TEST_CASES) return;
     const sequence = nextTestIdRef.current;
     nextTestIdRef.current += 1;
+    const displayName = nextTestName(testCases);
     setTestCases((current) => [
       ...current,
       {
         id: `test-${sequence}`,
-        name: `Test ${sequence}`,
+        name: displayName,
         stdin: "",
         expected_stdout: "",
         arguments:
@@ -1711,6 +1739,7 @@ export default function EditorPage() {
     selectedFunctionIdRef.current = nextId;
     setSelectedFunctionId(nextId);
     initializeTemplateSettings(nextFunction);
+    setIteratorMutationChecked({});
     setTestCases((current) =>
       current.map((test) => ({
         ...test,
@@ -1834,7 +1863,12 @@ export default function EditorPage() {
     (parameter) =>
       parameter.type_metadata.passing === "mutable_reference" ||
       parameter.type_metadata.passing === "scalar_pointer" ||
-      parameter.type_metadata.passing === "array_pointer",
+      parameter.type_metadata.passing === "array_pointer" ||
+      (parameter.type_metadata.kind === "iterator" &&
+        parameter.type_metadata.iterator_const !== true &&
+        (parameter.type_metadata.iterator_role === "single" ||
+          parameter.type_metadata.iterator_role === "range_begin") &&
+        iteratorMutationChecked[parameter.name] === true),
   );
   const objectScenariosReady =
     objectScenarios.length > 0 &&
@@ -1845,6 +1879,8 @@ export default function EditorPage() {
     compileResult?.success === true &&
     compileResult.exit_code === 0 &&
     compileResult.diagnostics.length === 0;
+  // compileReady: the last compile succeeded AND the source hasn't changed since.
+  const compileReady = isCleanCompileSuccess && !isCompiling && !isChecking;
   const hasUnstructuredCompilerOutput =
     Boolean(compileResult) &&
     !isCleanCompileSuccess &&
@@ -2592,7 +2628,15 @@ export default function EditorPage() {
                             </p>
                             <div className="mt-1.5 space-y-2">
                               {selectedFunction.parameters.map(
-                                (parameter, parameterIndex) => (
+                                (parameter, parameterIndex) => {
+                                  // range_end is rendered inside the range_begin editor — skip here
+                                  if (
+                                    parameter.type_metadata.kind === "iterator" &&
+                                    parameter.type_metadata.iterator_role === "range_end"
+                                  ) {
+                                    return null;
+                                  }
+                                  return (
                                   <div
                                     key={`${test.id}-${parameter.name}`}
                                     className="min-w-0"
@@ -2619,75 +2663,146 @@ export default function EditorPage() {
                                       )}
                                       {parameter.type_metadata.vector_depth ===
                                       2 ? (
-                                        <textarea
-                                          id={`${test.id}-argument-${parameterIndex}`}
-                                          value={
-                                            test.arguments[parameterIndex] ?? ""
-                                          }
-                                          maxLength={1_000}
-                                          rows={4}
-                                          placeholder={
-                                            parameter.type_metadata
-                                              .element_type === "std::string"
-                                              ? '[["hello"], ["world"]]'
-                                              : "[[1, 2], [3, 4]]"
-                                          }
-                                          onChange={(event) =>
-                                            updateTestArgument(
-                                              test.id,
-                                              parameterIndex,
-                                              event.target.value,
-                                            )
-                                          }
-                                          className="w-full min-w-0 resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                        />
-                                      ) : (
-                                        <input
-                                          id={`${test.id}-argument-${parameterIndex}`}
-                                          value={
-                                            test.arguments[parameterIndex] ?? ""
-                                          }
-                                          maxLength={1_000}
-                                          placeholder={
-                                            parameter.type_metadata.kind ===
-                                              "vector" ||
-                                            parameter.type_metadata.kind ===
-                                              "array"
-                                              ? parameter.type_metadata
-                                                  .element_type ===
-                                                "std::string"
-                                                ? '["hello", "world"]'
-                                                : "[1, 2, 3]"
-                                              : undefined
-                                          }
-                                          onChange={(event) =>
-                                            updateTestArgument(
-                                              test.id,
-                                              parameterIndex,
-                                              event.target.value,
-                                            )
-                                          }
-                                          className="w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                        />
-                                      )}
-                                      {(parameter.type_metadata.kind ===
-                                        "vector" ||
-                                        parameter.type_metadata.kind ===
-                                          "array") && (
-                                        <p className="mt-1 text-[11px] text-slate-500">
-                                          {parameter.type_metadata
-                                            .vector_depth === 2
-                                            ? "Enter rows like [[1, 2], [3, 4]]"
-                                            : parameter.type_metadata
-                                                  .element_type ===
-                                                "std::string"
-                                              ? 'Enter values like ["hello", "world"]'
-                                              : "Enter values like [1, 2, 3]"}
+                                        <>
+                                          <textarea
+                                            id={`${test.id}-argument-${parameterIndex}`}
+                                            value={
+                                              test.arguments[parameterIndex] ?? ""
+                                            }
+                                            maxLength={1_000}
+                                            rows={4}
+                                            placeholder={
+                                              parameter.type_metadata
+                                                .element_type === "std::string"
+                                                ? '[["hello"], ["world"]]'
+                                                : "[[1, 2], [3, 4]]"
+                                            }
+                                            onChange={(event) =>
+                                              updateTestArgument(
+                                                test.id,
+                                                parameterIndex,
+                                                event.target.value,
+                                              )
+                                            }
+                                            className="w-full min-w-0 resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                          />
+                                          <p className="mt-1 text-[11px] text-slate-500">
+                                            Enter rows like [[1, 2], [3, 4]]
                                           </p>
+                                        </>
+                                      ) : parameter.type_metadata.kind ===
+                                        "container" ? (
+                                        <ContainerValueEditor
+                                          id={`${test.id}-argument-${parameterIndex}`}
+                                          label={parameter.name}
+                                          metadata={parameter.type_metadata}
+                                          value={test.arguments[parameterIndex] ?? ""}
+                                          usage="input"
+                                          onChange={(next) =>
+                                            updateTestArgument(
+                                              test.id,
+                                              parameterIndex,
+                                              next,
+                                            )
+                                          }
+                                        />
+                                      ) : parameter.type_metadata.kind ===
+                                        "iterator" ? (
+                                        (() => {
+                                          const tailIdx =
+                                            parameter.type_metadata.iterator_role === "range_begin"
+                                              ? selectedFunction.parameters.findIndex(
+                                                  (p) =>
+                                                    p.type_metadata.kind === "iterator" &&
+                                                    p.type_metadata.iterator_group_index ===
+                                                      parameter.type_metadata.iterator_group_index &&
+                                                    p.type_metadata.iterator_role === "range_end",
+                                                )
+                                              : -1;
+                                          return (
+                                            <IteratorValueEditor
+                                              id={`${test.id}-argument-${parameterIndex}`}
+                                              metadata={parameter.type_metadata}
+                                              headValue={test.arguments[parameterIndex] ?? ""}
+                                              onHeadChange={(next) =>
+                                                updateTestArgument(
+                                                  test.id,
+                                                  parameterIndex,
+                                                  next,
+                                                )
+                                              }
+                                              {...(tailIdx >= 0
+                                                ? {
+                                                    tailValue:
+                                                      test.arguments[tailIdx] ?? "",
+                                                    onTailChange: (next: string) =>
+                                                      updateTestArgument(
+                                                        test.id,
+                                                        tailIdx,
+                                                        next,
+                                                      ),
+                                                  }
+                                                : {})}
+                                              {...(parameter.type_metadata.iterator_const !== true
+                                                ? {
+                                                    mutationChecked:
+                                                      iteratorMutationChecked[parameter.name] ?? false,
+                                                    onMutationCheckedChange: (checked: boolean) =>
+                                                      setIteratorMutationChecked((prev) => ({
+                                                        ...prev,
+                                                        [parameter.name]: checked,
+                                                      })),
+                                                  }
+                                                : {})}
+                                            />
+                                          );
+                                        })()
+                                      ) : (
+                                        <>
+                                          <input
+                                            id={`${test.id}-argument-${parameterIndex}`}
+                                            value={
+                                              test.arguments[parameterIndex] ?? ""
+                                            }
+                                            maxLength={1_000}
+                                            placeholder={
+                                              parameter.type_metadata.kind ===
+                                                "vector" ||
+                                              parameter.type_metadata.kind ===
+                                                "array"
+                                                ? parameter.type_metadata
+                                                    .element_type ===
+                                                  "std::string"
+                                                  ? '["hello", "world"]'
+                                                  : "[1, 2, 3]"
+                                                : undefined
+                                            }
+                                            onChange={(event) =>
+                                              updateTestArgument(
+                                                test.id,
+                                                parameterIndex,
+                                                event.target.value,
+                                              )
+                                            }
+                                            className="w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                          />
+                                          {(parameter.type_metadata.kind ===
+                                            "vector" ||
+                                            parameter.type_metadata.kind ===
+                                              "array") && (
+                                            <p className="mt-1 text-[11px] text-slate-500">
+                                              {parameter.type_metadata
+                                                .element_type === "std::string"
+                                                ? 'Enter values like ["hello", "world"]'
+                                                : "Enter values like [1, 2, 3]"}
+                                            </p>
+                                          )}
+                                        </>
                                       )}
                                     </div>
                                   </div>
-                                ),
+                                  );
+                                },
                               )}
                               {selectedFunction.parameters.length === 0 && (
                                 <p className="text-xs text-slate-500">
@@ -2753,53 +2868,76 @@ export default function EditorPage() {
                                 </label>
                                 {selectedFunction.return_type_metadata
                                   .vector_depth === 2 ? (
-                                  <textarea
+                                  <>
+                                    <textarea
+                                      id={`${test.id}-expected-return`}
+                                      value={test.expected_return}
+                                      placeholder="[[1, 2], [3, 4]]"
+                                      maxLength={1_000}
+                                      rows={4}
+                                      onChange={(event) =>
+                                        updateTestCase(
+                                          test.id,
+                                          "expected_return",
+                                          event.target.value,
+                                        )
+                                      }
+                                      className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                    />
+                                    <p className="mt-1 text-[11px] text-slate-500">
+                                      Enter rows like [[1, 2], [3, 4]]
+                                    </p>
+                                  </>
+                                ) : selectedFunction.return_type_metadata
+                                    .kind === "container" ? (
+                                  <ContainerValueEditor
                                     id={`${test.id}-expected-return`}
+                                    label="Expected return"
+                                    metadata={selectedFunction.return_type_metadata}
                                     value={test.expected_return}
-                                    placeholder="[[1, 2], [3, 4]]"
-                                    maxLength={1_000}
-                                    rows={4}
-                                    onChange={(event) =>
+                                    usage="expected"
+                                    onChange={(next) =>
                                       updateTestCase(
                                         test.id,
                                         "expected_return",
-                                        event.target.value,
+                                        next,
                                       )
                                     }
-                                    className="mt-1 w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
                                   />
                                 ) : (
-                                  <input
-                                    id={`${test.id}-expected-return`}
-                                    value={test.expected_return}
-                                    placeholder={
-                                      selectedFunction.return_type_metadata
-                                        .kind === "vector"
-                                        ? selectedFunction.return_type_metadata
-                                            .element_type === "std::string"
-                                          ? '["hello", "world"]'
-                                          : "[1, 2, 3]"
-                                        : undefined
-                                    }
-                                    maxLength={1_000}
-                                    onChange={(event) =>
-                                      updateTestCase(
-                                        test.id,
-                                        "expected_return",
-                                        event.target.value,
-                                      )
-                                    }
-                                    className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
-                                  />
-                                )}
-                                {selectedFunction.return_type_metadata.kind ===
-                                  "vector" && (
-                                  <p className="mt-1 text-[11px] text-slate-500">
+                                  <>
+                                    <input
+                                      id={`${test.id}-expected-return`}
+                                      value={test.expected_return}
+                                      placeholder={
+                                        selectedFunction.return_type_metadata
+                                          .kind === "vector"
+                                          ? selectedFunction.return_type_metadata
+                                              .element_type === "std::string"
+                                            ? '["hello", "world"]'
+                                            : "[1, 2, 3]"
+                                          : undefined
+                                      }
+                                      maxLength={1_000}
+                                      onChange={(event) =>
+                                        updateTestCase(
+                                          test.id,
+                                          "expected_return",
+                                          event.target.value,
+                                        )
+                                      }
+                                      className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                    />
                                     {selectedFunction.return_type_metadata
-                                      .element_type === "std::string"
-                                      ? 'Enter values like ["hello", "world"]'
-                                      : "Enter values like [1, 2, 3]"}
-                                  </p>
+                                      .kind === "vector" && (
+                                      <p className="mt-1 text-[11px] text-slate-500">
+                                        {selectedFunction.return_type_metadata
+                                          .element_type === "std::string"
+                                          ? 'Enter values like ["hello", "world"]'
+                                          : "Enter values like [1, 2, 3]"}
+                                      </p>
+                                    )}
+                                  </>
                                 )}
                               </>
                             )}
@@ -2895,6 +3033,51 @@ export default function EditorPage() {
                                             }
                                             className="mt-1 w-full min-w-0 resize-y rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs leading-5 text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
                                           />
+                                        ) : parameter.type_metadata.kind ===
+                                          "container" ? (
+                                          <ContainerValueEditor
+                                            id={`${test.id}-expected-final-${parameterIndex}`}
+                                            label={parameter.name}
+                                            metadata={parameter.type_metadata}
+                                            value={
+                                              test.expected_final_arguments[
+                                                parameter.name
+                                              ] ?? ""
+                                            }
+                                            usage="expected"
+                                            onChange={(next) =>
+                                              updateExpectedFinalArgument(
+                                                test.id,
+                                                parameter.name,
+                                                next,
+                                              )
+                                            }
+                                          />
+                                        ) : parameter.type_metadata.kind ===
+                                          "iterator" ? (
+                                          <>
+                                            <input
+                                              id={`${test.id}-expected-final-${parameterIndex}`}
+                                              value={
+                                                test.expected_final_arguments[
+                                                  parameter.name
+                                                ] ?? ""
+                                              }
+                                              maxLength={1_000}
+                                              placeholder="[1, 2, 3]"
+                                              onChange={(event) =>
+                                                updateExpectedFinalArgument(
+                                                  test.id,
+                                                  parameter.name,
+                                                  event.target.value,
+                                                )
+                                              }
+                                              className="mt-1 w-full min-w-0 rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs text-slate-800 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+                                            />
+                                            <p className="mt-1 text-[11px] text-slate-500">
+                                              Expected final container contents, e.g. [1, 4, 6, 4]
+                                            </p>
+                                          </>
                                         ) : (
                                           <input
                                             id={`${test.id}-expected-final-${parameterIndex}`}
@@ -3056,6 +3239,45 @@ export default function EditorPage() {
                       </p>
                     </div>
                   )}
+                  <QuestionContextPanel
+                    questionText={questionText}
+                    onQuestionTextChange={setQuestionText}
+                    questionUpload={questionUpload}
+                    questionExtraction={questionExtraction}
+                    onQuestionExtractionChange={setQuestionExtraction}
+                    disabled={false}
+                  />
+
+                  <AITestPanel
+                    code={code}
+                    questionText={questionText}
+                    targetKind={
+                      testTarget === "program"
+                        ? "program"
+                        : testTarget === "function"
+                          ? "function"
+                          : testTarget === "object"
+                            ? "object"
+                            : null
+                    }
+                    targetId={
+                      testTarget === "function"
+                        ? (selectedFunctionId ?? null)
+                        : testTarget === "object"
+                          ? (testMode?.classes[0]?.id ?? null)
+                          : null
+                    }
+                    selectedFunction={selectedFunction}
+                    selectedClass={
+                      testTarget === "object" && testMode?.classes.length
+                        ? (testMode.classes[0] ?? null)
+                        : null
+                    }
+                    templateArgumentMode={templateArgumentMode}
+                    templateArgumentValues={templateArgumentValues}
+                    compileReady={compileReady}
+                  />
+
                   {testRunResult && testRunResult.tests.length > 0 && (
                     <ul className="mt-4 space-y-3" aria-label="Test results">
                       {testRunResult.tests.map((result, index) => {
@@ -3189,12 +3411,15 @@ export default function EditorPage() {
                                   <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
                                     <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
                                       Expected:{" "}
-                                      {result.return_result.expected ||
-                                        "(empty)"}
+                                      {previewContainerValue(
+                                        result.return_result.expected,
+                                      ) || "(empty)"}
                                     </pre>
                                     <pre className="overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-xs text-slate-800">
                                       Actual:{" "}
-                                      {result.return_result.actual || "(empty)"}
+                                      {previewContainerValue(
+                                        result.return_result.actual,
+                                      ) || "(empty)"}
                                     </pre>
                                   </div>
                                   {result.return_result.mismatch_detail && (

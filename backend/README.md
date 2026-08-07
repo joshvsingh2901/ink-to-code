@@ -19,9 +19,10 @@ Put your server-side Gemini key in `backend/.env`:
 ```dotenv
 GEMINI_API_KEY=your_key_here
 GEMINI_TRANSCRIPTION_MODEL=gemini-3.5-flash-lite
+GEMINI_TEST_GENERATION_MODEL=gemini-3.5-flash-lite
 ```
 
-`GEMINI_TRANSCRIPTION_MODEL` is optional. When blank or absent, the service uses `gemini-3.5-flash-lite`. Start the API with:
+`GEMINI_TRANSCRIPTION_MODEL` and `GEMINI_TEST_GENERATION_MODEL` are both optional. When blank or absent each defaults to `gemini-3.5-flash-lite`. `GEMINI_TEST_GENERATION_MODEL` controls only AI test generation; the transcription model is used as a fallback when it is absent. Start the API with:
 
 ```bash
 uvicorn app.main:app --reload --port 8000 --env-file .env
@@ -67,17 +68,19 @@ expressions are never accepted. A temporary harness calls the unchanged user
 target. Bool returns print as `true` or `false`, and doubles use 17 significant
 digits without fuzzy comparison.
 
-Function tests support one-dimensional `std::vector<T>` and two-dimensional
-`std::vector<std::vector<T>>` parameters and returns where `T` is `int`,
-`long`, `long long`, `double`, `bool`, or `std::string`. Parameters may be
-passed by value, const reference, or supported mutable reference; vector
-returns must be by value.
-Unqualified `vector<T>` is accepted only when the source contains
-`using namespace std;`. Inputs may use `[1, 2, 3]`, `1, 2, 3`, or `1 2 3`;
-`[]` represents an empty vector. Elements are validated as data and converted
-to safe literals before harness generation. Results use canonical
-`[1, 2, 3]` serialization and exact typed sequence comparison with no fuzzy
-numeric tolerance.
+Function tests and object scenarios support 15 standard-library STL containers:
+`std::vector`, `std::array`, `std::deque`, `std::list`, `std::set`, `std::multiset`,
+`std::map`, `std::multimap`, `std::unordered_set`, `std::unordered_multiset`,
+`std::unordered_map`, `std::unordered_multimap`, `std::stack`, `std::queue`, and
+`std::priority_queue`. Supported element, key, and value types are limited to scalar
+types (`int`, `long`, `long long`, `float`, `double`, `bool`, `char`) and `std::string`.
+Container metadata and values are validated as structured data and compiled safely
+server-side. Adapters (`stack`, `queue`, `priority_queue`) use default comparators and
+are compared in their logical pop/peek order. Nested containers inside non-vector
+containers are not supported; `std::vector<std::vector<T>>` (depth 2) remains the only
+supported nested form. Custom comparators, custom allocators, and C++20 ranges are not
+supported.
+
 
 Nested vectors use strict JSON-style outer and row lists such as
 `[[1, 2], [3, 4]]`. Rectangular, jagged, empty outer, and empty-row shapes are
@@ -152,6 +155,36 @@ quoted serialization internally.
 Scalar and string const references remain read-only inputs. Returned
 references, rvalue references, arbitrary pointer mutation, and custom reference
 types are unsupported.
+
+Function mode supports iterator parameters for `std::vector<T>::iterator`,
+`std::deque<T>::iterator`, `std::list<T>::iterator`, `std::array<T,N>::iterator`,
+and their `const_iterator` variants. Two adjacent same-type iterators are paired
+as a half-open range `[begin, end)` sharing a single backing container. A lone
+iterator of the same type is a single-iterator parameter. Three or more adjacent
+same-type iterators are rejected as ambiguous; adjacent iterators of different
+types become independent single-iterator parameters. `reverse_iterator`,
+set/map/unordered iterators, and nested-element iterators are rejected.
+
+Each iterator parameter is passed as a JSON object. Range-begin (and single)
+parameters carry `{"container": [...], "position": N}`. Range-end (tail) parameters
+carry only `{"position": N}` — no container key. The position must satisfy
+`0 ≤ position ≤ container.size()`; negative positions and positions exceeding
+the size are rejected with a clear error message. `std::next(storage.begin(), pos)`
+is used for all containers, so `std::list` iterators work correctly without
+random-access arithmetic.
+
+Non-const iterator heads are mutation-capable. Mutation comparisons use the final
+container contents as a JSON array, not an iterator value. An iterator return type
+is supported only when the function has exactly one parameter whose container type
+unambiguously matches the return iterator's container type; the return serializes
+as an index or `"end"`.
+
+Only `<iterator>` is added to the harness preamble. `<algorithm>` and `<numeric>`
+are never injected — the student must include them explicitly. Functions that use
+STL algorithms compile and run correctly when the student includes the right headers;
+ordinary iterator, mutation, and exception/memory paths work unchanged alongside
+algorithmic code. Callable parameters (function pointers, `std::function`, lambdas)
+are not supported as function parameters and are deferred entirely.
 
 Function tests may combine return values, captured standard output, and mutable
 arguments in one deterministic call. Non-void targets always require an
@@ -406,6 +439,38 @@ template-template parameters, user-defined deduction guides, dependent-base
 analysis, metaprogramming-heavy APIs, and multi-file templates are not
 supported. These forms return a limitation rather than accepting raw C++ from
 the test form.
+
+### AI-generated test cases
+
+`POST /api/transcribe-question` accepts `multipart/form-data` with the same
+page and metadata fields as the main transcription endpoint (`question_pages`,
+`question_metadata`) and returns `{ "question_text": "..." }`. It uses the
+Gemini API to extract the assignment question from uploaded question-category
+pages and is called automatically by the frontend when question pages are
+present; it makes a real Gemini call and consumes API quota.
+
+`POST /api/ai-tests/run` accepts a JSON body with the current C++ source,
+question text, and a structured target descriptor (function or object class
+with full signature metadata). It makes one Gemini call to generate structured
+test cases and immediately executes them against the unchanged student source
+using the same `run_test_request` harness as manual tests. Source files above
+20 000 characters return `source_too_large` without calling Gemini. At most
+one repair attempt is made if the initial generation produces invalid structured
+data. The response includes a stable `run_id`, all test results, a
+deterministic equal-weight practice score, and a `PRACTICE_DISCLAIMER` constant
+matching `"This is a practice score based on AI-generated tests, not an
+official course grade."`.
+
+`POST /api/ai-tests/rerun` accepts a `run_id` and the same test cases that
+were executed in the original run. It makes **zero** Gemini calls and re-runs
+exactly the previously generated tests against the current source. The response
+uses the same schema as `/run` and includes the original and new practice
+scores for comparison.
+
+The `max_question_chars` setting (default 10 000) limits how many characters
+of question text are sent to Gemini. Longer text is truncated before the
+request is made. AI test results are kept separate from manual test results;
+they never overwrite or replace the user's manually written cases.
 
 ## Tests
 

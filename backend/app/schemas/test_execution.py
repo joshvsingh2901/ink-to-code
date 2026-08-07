@@ -4,11 +4,11 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class FunctionTypeResponse(BaseModel):
-    kind: Literal["scalar", "vector", "array", "void"]
+    kind: Literal["scalar", "vector", "array", "void", "container", "iterator"]
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
-    vector_depth: Literal[1, 2] | None = None
+    vector_depth: int | None = None
     passing: Literal[
         "value",
         "const_reference",
@@ -17,6 +17,38 @@ class FunctionTypeResponse(BaseModel):
         "array_pointer",
     ]
     size_parameter_name: str | None = None
+    container_family: Literal["sequence", "associative", "unordered", "adapter"] | None = None
+    container_name: Literal[
+        "vector",
+        "array",
+        "deque",
+        "list",
+        "set",
+        "multiset",
+        "map",
+        "multimap",
+        "unordered_set",
+        "unordered_multiset",
+        "unordered_map",
+        "unordered_multimap",
+        "stack",
+        "queue",
+        "priority_queue",
+    ] | None = None
+    key_type: str | None = None
+    mapped_type: str | None = None
+    fixed_size: int | None = None
+    nested_depth: int | None = None
+    ordered: bool | None = None
+    associative: bool | None = None
+    unordered: bool | None = None
+    adapter: bool | None = None
+    supported: bool = True
+    unsupported_reason: str | None = None
+    iterator_container: str | None = None
+    iterator_const: bool | None = None
+    iterator_role: Literal["single", "range_begin", "range_end"] | None = None
+    iterator_group_index: int | None = None
 
 
 class FunctionParameterResponse(BaseModel):

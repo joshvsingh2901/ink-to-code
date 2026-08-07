@@ -52,6 +52,15 @@ class TranscriptionResponse(ModelTranscription):
     model: str = Field(min_length=1)
 
 
+class QuestionExtraction(BaseModel):
+    question_text: str
+
+
+class QuestionTextResponse(BaseModel):
+    question_text: str
+    model: str
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

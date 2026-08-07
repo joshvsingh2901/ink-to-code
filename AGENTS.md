@@ -84,11 +84,25 @@ Current MVP language:
 - Automated tests must mock external AI requests and must not consume Gemini API quota.
 - Backend failures should produce clear, structured errors rather than raw tracebacks to the frontend.
 
+## AI-generated test cases (implemented)
+
+AI test generation is now implemented. Contracts that must be preserved:
+
+- Gemini is invoked only for structured JSON test-plan responses. It never produces C++ source, harness code, compiler flags, or executable expressions.
+- Expected values come from the question text only; the student implementation is context, never an oracle.
+- Maximum 8 tests per run; exactly one generation call plus at most one repair call per user action.
+- AI tests and manual tests are completely separate: AI state never touches `testCases`; manual state never affects AI results.
+- The backend capability gate (`ai_test_capability.py`) is authoritative. The frontend never disables the Run AI Tests button based on an inconclusive support judgement.
+- `run_test_request` in `test_execution.py` is the only compile-and-run entry point for AI tests, exactly as for manual tests.
+- `run_memory_checks` is hard-coded `False` for all AI runs in v1; memory diagnostics remain a manual-test feature.
+- Rerun Same Tests makes zero Gemini calls; stored tests are revalidated against the current code on every rerun.
+- Question image extraction is automatic (no button click); one extraction call per question-page fingerprint, enforced client-side.
+- Sources above `AI_SOURCE_CHAR_LIMIT = 20_000` characters return `source_too_large` before any Gemini call.
+
 ## Current exclusions
 
 Do not add these unless explicitly requested:
 
-- Gemini-generated test cases;
 - automatic code repair;
 - AI-generated code fixes;
 - Docker-based sandboxing;
@@ -612,3 +626,73 @@ The expected request should contain the current source code in structured JSON, 
 - Runtime exceptions and memory diagnostics remain independent from template compilation.
 - Do not add partial specialization, variadic templates, concepts, or metaprogramming without a separate design stage.
 - Keep student-facing results concise and place full template metadata under Technical details.
+
+## STL container testing
+
+All 15 STL containers are parsed and testable: `vector`, `array`, `deque`, `list`, `set`,
+`multiset`, `unordered_set`, `unordered_multiset`, `map`, `multimap`, `unordered_map`,
+`unordered_multimap`, `stack`, `queue`, `priority_queue`.
+
+Behavioral contracts:
+
+- Container types and values must be represented as validated structured metadata.
+- Never accept arbitrary raw initializer syntax from the frontend.
+- Sequence order, set membership, map mappings, and multiplicity have distinct comparison rules.
+- Unordered containers must not fail because of iteration order.
+- Adapter containers (`stack`, `queue`, `priority_queue`) are compared in logical pop/peek order;
+  `stack` serializes top-to-bottom, `queue` front-to-back, `priority_queue` in pop order.
+- Nested containers inside any non-vector container are rejected at parse time.
+- `std::vector<std::vector<T>>` (depth 2) remains the only supported nested form.
+- Total element count per container is bounded (max 50).
+- Runtime tools remain the source of truth for confirmed memory failures.
+- Container exceptions remain independent from memory results.
+- Container results display a compact preview in the summary; full serialized values appear
+  in the collapsed Technical details region.
+
+Intentional limitations (do not expand without a separate design stage):
+
+- No nested containers inside `deque`, `list`, `set`, `map`, adapters, etc.
+- No `std::array<std::vector<T>, N>`.
+- No `std::vector<std::map<K,V>>` or other vector-of-non-scalar-container.
+- No custom comparators, custom allocators, or C++20 ranges.
+- No callable (function pointer, std::function, lambda) parameters.
+- Adapter mutable-reference parameters are rejected.
+
+## Iterator testing
+
+Iterators for `vector`, `deque`, `list`, and `array` may appear as function parameters or
+return types. Supported iterator types: `std::CONTAINER<T>::iterator` and
+`std::CONTAINER<T>::const_iterator`.
+
+Behavioral contracts:
+
+- Two adjacent same-type iterators are paired as a half-open range `[begin, end)`.
+- A single iterator of the same type is a "single" iterator.
+- Three or more adjacent same-type iterators are rejected as ambiguous.
+- Different-type adjacent iterators become separate single-iterator parameters.
+- `reverse_iterator`, `set::iterator`, `map::iterator`, and nested-element iterators
+  are rejected at analysis time.
+- Each range pair shares exactly one backing container, declared once (head parameter).
+  The tail carries only a position; no container key appears in its wire payload.
+- Positions are validated: `0 ≤ position ≤ container.size()`. Negative positions and
+  positions exceeding the size are rejected with a clear error message.
+- `std::next(storage.begin(), pos)` is used for ALL containers (not `begin() + n`),
+  so `std::list` iterators work correctly.
+- Non-const iterator heads (role `single` or `range_begin`) are mutation-capable.
+  Mutation comparisons use the final container contents as a JSON array.
+- Iterator return types are resolved structurally: the function must have exactly one
+  parameter whose container type matches the return iterator's container type. Zero or
+  two-or-more candidates mark the return type `supported=False`.
+- Returned iterator values serialize as an index (0-based) or `"end"`.
+- Only `<iterator>` is added to the harness preamble. `<algorithm>` and `<numeric>`
+  are never injected — the student must include them explicitly.
+- Runtime sanitizer tools remain the sole authority for iterator misuse (use after
+  invalidation, dereferencing `end()`, etc.). No static iterator-correctness analysis.
+
+Intentional limitations (do not expand without a separate design stage):
+
+- No callable parameters (deferred entirely).
+- No `reverse_iterator`, `set::iterator`, `map::iterator`, or `unordered_*::iterator`.
+- No nested element types in iterator parameters (e.g., `vector<vector<int>>::iterator`).
+- No raw algorithm injection — students must `#include <algorithm>` and `#include <numeric>`.
+

@@ -7,7 +7,11 @@ from google.genai import errors, types
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.schemas.transcription import ModelTranscription, TranscriptionResponse
+from app.schemas.transcription import (
+    ModelTranscription,
+    QuestionExtraction,
+    TranscriptionResponse,
+)
 from app.services.uploads import NormalizedPage
 
 logger = logging.getLogger(__name__)
@@ -73,6 +77,14 @@ When a character is genuinely ambiguous, use the closest visible reading in the 
 Reconsider overall and uncertain-region confidence from the visual evidence. Confidence values are model-estimated review aids, not calibrated probabilities.
 
 The handwritten images are the sole source of truth. The candidate transcription is only something to audit. Programming-question pages are not visual evidence and must never be used to repair, complete, or correct the handwriting."""
+
+
+QUESTION_EXTRACTION_PROMPT = (
+    "Extract the assignment question text exactly as written. "
+    "Preserve examples, constraints, and numbering. "
+    "Return plain text only. "
+    "Do not solve the question, do not add commentary."
+)
 
 
 class TranscriptionServiceError(RuntimeError):
@@ -434,6 +446,102 @@ def transcribe_pages(
         raise TranscriptionServiceError(
             "invalid_model_response",
             "The transcription service returned malformed structured output.",
+        ) from error
+
+
+def transcribe_question_pages(
+    question_pages: list[NormalizedPage],
+    settings: Settings,
+    *,
+    client: genai.Client | None = None,
+) -> str:
+    """Extract plain text from question images via one Gemini call."""
+    if not settings.gemini_api_key and client is None:
+        raise TranscriptionServiceError(
+            "missing_api_key",
+            "Gemini is not configured. Add GEMINI_API_KEY to the backend environment.",
+            503,
+        )
+
+    gemini_client = client or genai.Client(
+        api_key=settings.gemini_api_key,
+        http_options=types.HttpOptions(
+            timeout=60_000,
+            retry_options=types.HttpRetryOptions(
+                attempts=2,
+                http_status_codes=[408, 429, 500, 502, 503, 504],
+            ),
+        ),
+    )
+
+    parts: list[types.Part] = [
+        types.Part.from_text(text=QUESTION_EXTRACTION_PROMPT)
+    ]
+    for page in question_pages:
+        parts.extend([
+            types.Part.from_text(text=f"Question page {page.metadata.order}:"),
+            types.Part.from_bytes(data=page.content, mime_type=page.content_type),
+        ])
+    contents = [types.Content(role="user", parts=parts)]
+
+    generation_config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=QuestionExtraction,
+    )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=settings.test_generation_model,
+            contents=contents,
+            config=generation_config,
+        )
+        if _response_is_blocked(response):
+            raise TranscriptionServiceError(
+                "blocked_model_response",
+                "Gemini could not process these pages. Review the files and retry.",
+            )
+        if response.parsed is None:
+            raise TranscriptionServiceError(
+                "invalid_model_response",
+                "The question extraction service returned malformed structured output.",
+            )
+        parsed = response.parsed
+        if isinstance(parsed, QuestionExtraction):
+            question_text = parsed.question_text
+        else:
+            try:
+                question_text = QuestionExtraction.model_validate(parsed).question_text
+            except (ValidationError, Exception) as error:
+                raise TranscriptionServiceError(
+                    "invalid_model_response",
+                    "The question extraction service returned malformed structured output.",
+                ) from error
+        if not question_text.strip():
+            raise TranscriptionServiceError(
+                "empty_transcription",
+                "The question extraction service returned no text.",
+            )
+        return question_text
+    except TranscriptionServiceError:
+        raise
+    except errors.APIError as error:
+        raise _classify_api_error(error) from error
+    except httpx.TimeoutException as error:
+        raise TranscriptionServiceError(
+            "gemini_timeout",
+            "The question extraction request timed out. Please retry.",
+            504,
+        ) from error
+    except httpx.RequestError as error:
+        raise TranscriptionServiceError(
+            "gemini_unavailable",
+            "The question extraction service is temporarily unavailable.",
+            503,
+        ) from error
+    except (ValidationError, ValueError, TypeError) as error:
+        raise TranscriptionServiceError(
+            "invalid_model_response",
+            "The question extraction service returned malformed structured output.",
         ) from error
 
 

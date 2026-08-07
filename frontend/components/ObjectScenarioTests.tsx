@@ -1,9 +1,12 @@
 "use client";
 
 import type {
+  FunctionTypeMetadata,
   ObjectClass,
   ObjectOperatorParameter,
 } from "@/lib/testExecution";
+import { ContainerValueEditor } from "@/components/ContainerValueEditor";
+import { editorKindFor } from "@/lib/containerValues";
 import {
   ExceptionExpectationFields,
   type EditableExceptionExpectation,
@@ -99,7 +102,7 @@ function newObject(classes: ObjectClass[], index: number): EditableScenarioObjec
     constructor_id: constructor?.id ?? "",
     arguments: constructor?.parameters.map(() => "") ?? [],
     template_arguments:
-      objectClass?.template_parameters.map((parameter) => ({
+      objectClass?.template_parameters?.map((parameter) => ({
         parameter_name: parameter.name,
         kind: parameter.kind,
         value: parameter.default_argument ?? (
@@ -153,6 +156,7 @@ function ValueField({
   placeholder,
   helperText,
   onChange,
+  metadata,
 }: {
   id: string;
   label: string;
@@ -161,7 +165,22 @@ function ValueField({
   placeholder?: string;
   helperText?: string;
   onChange: (value: string) => void;
+  metadata?: FunctionTypeMetadata | null;
 }) {
+  if (metadata && editorKindFor(metadata) !== "scalar") {
+    return (
+      <ContainerValueEditor
+        id={id}
+        label={label}
+        metadata={metadata}
+        value={value}
+        onChange={onChange}
+        usage="input"
+        helperText={helperText}
+      />
+    );
+  }
+
   return (
     <div className="min-w-0">
       <label htmlFor={id} className="block text-xs font-medium text-slate-700">
@@ -455,7 +474,7 @@ export function ObjectScenarioTests({
                             arguments:
                               nextConstructor?.parameters.map(() => "") ?? [],
                             template_arguments:
-                              nextClass?.template_parameters.map(
+                              nextClass?.template_parameters?.map(
                                 (parameter) => ({
                                   parameter_name: parameter.name,
                                   kind: parameter.kind,
@@ -530,6 +549,7 @@ export function ObjectScenarioTests({
                           id={`${object.id}-${index}`}
                           label={parameter.name}
                           type={parameter.type_metadata.display_type}
+                          metadata={parameter.type_metadata}
                           value={object.arguments[index] ?? ""}
                           onChange={(value) =>
                             replaceObject((current) => ({
@@ -967,7 +987,7 @@ export function ObjectScenarioTests({
                                   nextConstructor?.parameters.map(() => "") ??
                                   [],
                                 template_arguments:
-                                  nextClass?.template_parameters.map(
+                                  nextClass?.template_parameters?.map(
                                     (parameter) => ({
                                       parameter_name: parameter.name,
                                       kind: parameter.kind,
@@ -1049,6 +1069,7 @@ export function ObjectScenarioTests({
                               id={`${step.id}-constructor-${argumentIndex}`}
                               label={parameter.name}
                               type={parameter.type_metadata.display_type}
+                              metadata={parameter.type_metadata}
                               value={step.arguments[argumentIndex] ?? ""}
                               onChange={(value) =>
                                 replaceStep((current) => ({
@@ -1132,6 +1153,7 @@ export function ObjectScenarioTests({
                             id={`${step.id}-argument-${index}`}
                             label={parameter.name}
                             type={parameter.type_metadata.display_type}
+                            metadata={parameter.type_metadata}
                             value={step.arguments[index] ?? ""}
                             onChange={(value) =>
                               replaceStep((current) => ({
@@ -1548,6 +1570,7 @@ function PolymorphismStepFields({
               id={`${step.id}-poly-argument-${index}`}
               label={parameter.name}
               type={parameter.type_metadata.display_type}
+              metadata={parameter.type_metadata}
               value={step.arguments[index] ?? ""}
               onChange={(value) =>
                 onChange((current) => ({

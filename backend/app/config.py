@@ -15,6 +15,8 @@ class Settings:
     gemini_api_key: str | None
     transcription_model: str
     environment: str
+    test_generation_model: str = "gemini-3.5-flash-lite"
+    max_question_chars: int = 8000
     cpp_execution_provider: str = "auto"
     cpp_runner_image: str = "inktocode-cpp-runner"
     cpp_runner_memory: str = "256m"
@@ -33,6 +35,12 @@ def get_settings() -> Settings:
         transcription_model=os.getenv("GEMINI_TRANSCRIPTION_MODEL")
         or "gemini-3.5-flash-lite",
         environment=os.getenv("ENVIRONMENT", "development"),
+        test_generation_model=(
+            os.getenv("GEMINI_TEST_GENERATION_MODEL")
+            or os.getenv("GEMINI_TRANSCRIPTION_MODEL")
+            or "gemini-3.5-flash-lite"
+        ),
+        max_question_chars=int(os.getenv("MAX_QUESTION_CHARS", "8000")),
         cpp_execution_provider=os.getenv(
             "CPP_EXECUTION_PROVIDER", "auto"
         ),

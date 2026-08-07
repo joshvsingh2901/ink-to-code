@@ -36,7 +36,16 @@ def compile_cpp(
             source_path = temporary_path / "main.cpp"
             source_path.write_bytes(code.encode("utf-8"))
 
-            command = [compiler, "-std=c++17", "-fsyntax-only", "main.cpp"]
+            command = [
+                compiler,
+                "-std=c++17",
+                # Disable transitive includes in libc++ (Apple Clang / macOS):
+                # without this, <vector> silently provides std::sort, hiding a
+                # missing #include <algorithm>.  Harmless no-op on libstdc++.
+                "-D_LIBCPP_REMOVE_TRANSITIVE_INCLUDES",
+                "-fsyntax-only",
+                "main.cpp",
+            ]
             completed = subprocess.run(
                 command,
                 cwd=temporary_path,

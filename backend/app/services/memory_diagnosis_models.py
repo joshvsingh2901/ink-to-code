@@ -64,8 +64,18 @@ OperationContext = Literal[
     "class_template_operator",
     "template_specialization",
     "template_instantiation_cleanup",
+    "container_access",
+    "container_mutation",
+    "container_return",
+    "container_copy",
+    "container_move",
+    "container_construction",
+    "container_destruction",
+    "nested_container_access",
+    "adapter_observation",
     "unknown",
 ]
+
 
 
 @dataclass(frozen=True)

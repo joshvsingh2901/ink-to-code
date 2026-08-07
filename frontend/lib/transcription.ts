@@ -161,6 +161,21 @@ export async function requestTranscription(formData: FormData) {
   }
 }
 
+/**
+ * Build a FormData payload containing only question pages (for question extraction).
+ * Mirrors `buildTranscriptionFormData` but sends only the "question" category.
+ */
+export async function buildQuestionFormData(questionUpload: UploadState) {
+  if (questionUpload.pages.length === 0) {
+    throw new TranscriptionRequestError(
+      "Add at least one question page before extracting.",
+    );
+  }
+  const formData = new FormData();
+  await appendUpload(formData, questionUpload, "question");
+  return formData;
+}
+
 export function createMockTranscription(pageCount: number): TranscriptionResult {
   return {
     code: `#include <iostream>\nusing namespace std;\n\nint main()\n{\n    int n\n    cin >> n;\n    count << n * 2;\n}`,

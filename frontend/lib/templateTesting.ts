@@ -17,6 +17,11 @@ export const TEMPLATE_TYPE_OPTIONS = [
   "bool",
   "char",
   "std::string",
+  "std::vector<int>",
+  "std::deque<int>",
+  "std::list<int>",
+  "std::set<int>",
+  "std::map<std::string, int>",
 ] as const;
 
 export function initialTemplateArgumentValues(

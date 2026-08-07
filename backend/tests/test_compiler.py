@@ -157,6 +157,7 @@ def test_compiler_uses_safe_argument_list_and_exact_source(monkeypatch):
     assert invocation["command"] == [
         "g++",
         "-std=c++17",
+        "-D_LIBCPP_REMOVE_TRANSITIVE_INCLUDES",
         "-fsyntax-only",
         "main.cpp",
     ]
@@ -384,3 +385,96 @@ def test_compiler_error_is_http_200_not_internal_server_error():
     assert response.status_code == 200
     assert response.json()["success"] is False
     assert response.json()["stderr"]
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_sort_with_only_vector_fails():
+    # Regression: on Apple libc++, <vector> used to transitively supply
+    # std::sort.  The compile path now disables transitive includes so the
+    # student gets the missing-header error naturally.
+    result = compile_cpp(
+        "#include <vector>\n"
+        "void sortValues(std::vector<int>& values)\n"
+        "{\n"
+        "    std::sort(values.begin(), values.end());\n"
+        "}\n"
+    )
+    assert result.success is False
+    assert any(
+        "sort" in d.message or "not declared" in d.message or "no member" in d.message
+        for d in result.diagnostics
+    ), f"expected sort-related diagnostic, got: {[d.message for d in result.diagnostics]}"
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_sort_diagnostic_mentions_sort_or_not_declared():
+    result = compile_cpp(
+        "#include <vector>\n"
+        "void f(std::vector<int>& v) { std::sort(v.begin(), v.end()); }\n"
+    )
+    assert result.success is False
+    assert "sort" in result.stderr or "not declared" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_sort_with_algorithm_header_passes():
+    result = compile_cpp(
+        "#include <algorithm>\n"
+        "#include <vector>\n"
+        "void sortValues(std::vector<int>& values)\n"
+        "{\n"
+        "    std::sort(values.begin(), values.end());\n"
+        "}\n"
+    )
+    assert result.success is True
+    assert result.diagnostics == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_accumulate_without_numeric_fails():
+    result = compile_cpp(
+        "#include <vector>\n"
+        "int f(const std::vector<int>& v) {\n"
+        "    return std::accumulate(v.begin(), v.end(), 0);\n"
+        "}\n"
+    )
+    assert result.success is False
+    assert "accumulate" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_accumulate_with_numeric_header_passes():
+    result = compile_cpp(
+        "#include <numeric>\n"
+        "#include <vector>\n"
+        "int f(const std::vector<int>& v) {\n"
+        "    return std::accumulate(v.begin(), v.end(), 0);\n"
+        "}\n"
+    )
+    assert result.success is True
+    assert result.diagnostics == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_simple_scalar_compilation_still_succeeds():
+    result = compile_cpp(
+        "int add(int a, int b) { return a + b; }\n"
+    )
+    assert result.success is True
+    assert result.diagnostics == []
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_iterator_harness_explicit_include_still_works():
+    # Iterator test harnesses explicitly include <iterator>; that explicit
+    # include must still compile correctly — the fix must not block it.
+    result = compile_cpp(
+        "#include <iterator>\n"
+        "#include <vector>\n"
+        "void f(std::vector<int>& v) {\n"
+        "    auto it = v.begin();\n"
+        "    std::advance(it, 1);\n"
+        "}\n"
+    )
+    assert result.success is True
+    assert result.diagnostics == []

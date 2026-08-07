@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -255,7 +256,24 @@ def _function_response(signature: FunctionSignature) -> FunctionResponse:
             vector_depth=value_type.vector_depth,
             passing=value_type.passing,
             size_parameter_name=value_type.size_parameter_name,
+            container_family=value_type.container_family,
+            container_name=value_type.container_name,
+            key_type=value_type.key_type,
+            mapped_type=value_type.mapped_type,
+            fixed_size=value_type.fixed_size,
+            nested_depth=value_type.nested_depth,
+            ordered=value_type.ordered,
+            associative=value_type.associative,
+            unordered=value_type.unordered,
+            adapter=value_type.adapter,
+            supported=getattr(value_type, "supported", True),
+            unsupported_reason=getattr(value_type, "unsupported_reason", None),
+            iterator_container=value_type.iterator_container,
+            iterator_const=value_type.iterator_const,
+            iterator_role=value_type.iterator_role,
+            iterator_group_index=value_type.iterator_group_index,
         )
+
 
     return FunctionResponse(
         id=signature.id,
@@ -1342,42 +1360,120 @@ def _split_vector_input(
     return value.split()
 
 
-def _vector_literal(
+def _container_literal(
     value_type: ValueType,
     raw_value: str,
     label: str,
 ) -> str:
-    element_type = value_type.element_type
-    if element_type is None:
-        raise ValueError(f"{label} uses an unsupported vector type.")
-    if value_type.vector_depth == 2:
+    c_name = value_type.container_name or ("vector" if value_type.kind == "vector" else "array")
+
+    if value_type.key_type is not None and value_type.mapped_type is not None:
+        key_t = value_type.key_type
+        val_t = value_type.mapped_type
+        entries: list[tuple[object, object]] = []
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, dict):
+                entries = list(parsed.items())
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "key" in item and "value" in item:
+                        entries.append((item["key"], item["value"]))
+                    elif isinstance(item, (list, tuple)) and len(item) == 2:
+                        entries.append((item[0], item[1]))
+                    else:
+                        raise ValueError()
+            else:
+                raise ValueError()
+        except (json.JSONDecodeError, ValueError):
+            pairs = _split_vector_input(raw_value, label, collection_name="map")
+            for pair in pairs:
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                elif ":" in pair:
+                    k, v = pair.split(":", 1)
+                else:
+                    raise ValueError(f"{label} map entries must be key=value or key:value.")
+                entries.append((k.strip(), v.strip()))
+
+        if len(entries) > 50:
+            raise ValueError(f"{label} exceeds maximum allowed container elements limit of 50.")
+
+        pair_literals = []
+        for idx, (k_val, v_val) in enumerate(entries):
+            k_lit = _literal_from_typed_value(key_t, k_val, f"{label} entry {idx+1} key")
+            v_lit = _literal_from_typed_value(val_t, v_val, f"{label} entry {idx+1} value")
+            pair_literals.append(f"{{{k_lit}, {v_lit}}}")
+
+        container_type_cpp = f"std::{c_name}<{key_t}, {val_t}>"
+        return f"{container_type_cpp}{{{', '.join(pair_literals)}}}"
+
+    element_type = value_type.element_type or "int"
+
+    if (value_type.nested_depth and value_type.nested_depth >= 2) or value_type.vector_depth == 2:
         rows = _typed_nested_vector_values(value_type, raw_value, label)
-        row_literals = [
-            "{" + ", ".join(
-                _literal_from_typed_value(
-                    element_type,
-                    element,
-                    f"{label} row {row_index + 1} "
-                    f"element {element_index + 1}",
-                )
-                for element_index, element in enumerate(row)
-            ) + "}"
-            for row_index, row in enumerate(rows)
-        ]
-        return (
-            f"std::vector<std::vector<{element_type}>>"
-            f"{{{', '.join(row_literals)}}}"
-        )
+        if len(rows) > 50:
+            raise ValueError(f"{label} exceeds maximum allowed container elements limit of 50.")
+        row_literals = []
+        for row_index, row in enumerate(rows):
+            if len(row) > 50:
+                raise ValueError(f"{label} row {row_index+1} exceeds maximum allowed container elements limit of 50.")
+            lits = [
+                _literal_from_typed_value(element_type, element, f"{label} row {row_index+1} element {elem_idx+1}")
+                for elem_idx, element in enumerate(row)
+            ]
+            row_literals.append("{" + ", ".join(lits) + "}")
+
+        base_cpp = f"std::vector<{element_type}>"
+        depth = value_type.nested_depth or value_type.vector_depth or 2
+        if depth == 3:
+            container_type_cpp = f"std::vector<std::vector<{base_cpp}>>"
+        else:
+            container_type_cpp = f"std::vector<{base_cpp}>"
+        return f"{container_type_cpp}{{{', '.join(row_literals)}}}"
+
     elements = (
         _parse_string_vector(raw_value, label)
         if element_type == STRING_TYPE
         else _split_vector_input(raw_value, label)
     )
+    if len(elements) > 50:
+        raise ValueError(f"{label} exceeds maximum allowed container elements limit of 50.")
+
+    if value_type.fixed_size is not None:
+        if len(elements) != value_type.fixed_size:
+            raise ValueError(f"{label} requires exactly {value_type.fixed_size} elements for std::array.")
+
     literals = [
         _safe_literal(element_type, element, f"{label} element {index + 1}")
         for index, element in enumerate(elements)
     ]
+
+    if c_name == "array":
+        size = value_type.fixed_size if value_type.fixed_size is not None else len(literals)
+        return f"std::array<{element_type}, {size}>{{{', '.join(literals)}}}"
+    elif c_name == "stack":
+        return f"std::stack<{element_type}>(std::deque<{element_type}>{{{', '.join(literals)}}})"
+    elif c_name == "queue":
+        return f"std::queue<{element_type}>(std::deque<{element_type}>{{{', '.join(literals)}}})"
+    elif c_name == "priority_queue":
+        elems = ", ".join(literals)
+        return (
+            f"([]() {{ std::vector<{element_type}> __v{{{elems}}};"
+            f" return std::priority_queue<{element_type}>(__v.begin(), __v.end()); }}())"
+        )
+    elif c_name in {"vector", "deque", "list", "set", "multiset", "unordered_set", "unordered_multiset"}:
+        return f"std::{c_name}<{element_type}>{{{', '.join(literals)}}}"
+
     return f"std::vector<{element_type}>{{{', '.join(literals)}}}"
+
+
+def _vector_literal(
+    value_type: ValueType,
+    raw_value: str,
+    label: str,
+) -> str:
+    return _container_literal(value_type, raw_value, label)
 
 
 def _literal_from_typed_value(
@@ -1450,11 +1546,157 @@ def _safe_value_literal(
     raw_value: str,
     label: str,
 ) -> str:
-    if value_type.kind == "vector":
-        return _vector_literal(value_type, raw_value, label)
+    if value_type.kind in {"container", "vector", "array"} or value_type.container_name:
+        return _container_literal(value_type, raw_value, label)
     if value_type.scalar_type is None:
         raise ValueError(f"{label} uses an unsupported scalar type.")
     return _safe_literal(value_type.scalar_type, raw_value, label)
+
+
+def _parse_iterator_argument(
+    raw: str,
+    value_type: ValueType,
+    label: str,
+    *,
+    is_tail: bool,
+    head_container_payload: list | None = None,
+) -> dict:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"{label} must be an iterator position object.")
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be an iterator position object.")
+    if is_tail:
+        if "container" in payload:
+            raise ValueError(
+                f"{label} must not carry its own container; the range start owns it."
+            )
+        container_data = head_container_payload
+    else:
+        if "container" not in payload:
+            raise ValueError(f"{label} must include a container array.")
+        container_data = payload["container"]
+        if not isinstance(container_data, list):
+            raise ValueError(f"{label} container must be a JSON array.")
+    element_count = len(container_data) if container_data is not None else 0
+    position_raw = payload.get("position")
+    if not isinstance(position_raw, int):
+        raise ValueError(f"{label} position must be an integer.")
+    if position_raw < 0:
+        raise ValueError(f"{label} position cannot be negative.")
+    if position_raw > element_count:
+        raise ValueError(
+            f"{label} position {position_raw} exceeds container size {element_count}."
+        )
+    return {"container": container_data, "position": position_raw}
+
+
+def _iterator_cpp_type(value_type: ValueType) -> str:
+    c = value_type.iterator_container
+    e = value_type.element_type or "int"
+    if c == "array":
+        return f"std::array<{e}, {value_type.fixed_size}>"
+    if c == "vector":
+        return f"std::vector<{e}>"
+    if c == "deque":
+        return f"std::deque<{e}>"
+    if c == "list":
+        return f"std::list<{e}>"
+    return f"std::vector<{e}>"
+
+
+def _iterator_expression(storage: str, position: int, *, is_const: bool) -> str:
+    begin = "cbegin()" if is_const else "begin()"
+    return f"std::next({storage}.{begin}, {position})"
+
+
+def _prepare_iterator_arguments(
+    function: FunctionSignature,
+    raw_arguments: list[str],
+    test_index: int,
+) -> dict[int, HarnessArgument]:
+    result: dict[int, HarnessArgument] = {}
+    visited_groups: set[int] = set()
+    for param_index, parameter in enumerate(function.parameters):
+        vt = parameter.value_type
+        if vt.kind != "iterator":
+            continue
+        if vt.iterator_role == "range_end":
+            continue
+        group_index = vt.iterator_group_index
+        if group_index is None or group_index in visited_groups:
+            continue
+        visited_groups.add(group_index)
+        label = f"argument {parameter.name}"
+        head_payload = _parse_iterator_argument(
+            raw_arguments[param_index],
+            vt,
+            label,
+            is_tail=False,
+        )
+        container_data = head_payload["container"]
+        head_position = head_payload["position"]
+        synthetic_vt = ValueType(
+            kind="vector" if vt.iterator_container == "vector" else "container",
+            display_type=f"std::{vt.iterator_container}<{vt.element_type}>",
+            element_type=vt.element_type,
+            fixed_size=vt.fixed_size,
+            passing="value",
+            container_name=vt.iterator_container,
+            container_family="sequence",
+            ordered=True,
+            associative=False,
+            unordered=False,
+            adapter=False,
+        )
+        literal = _container_literal(
+            synthetic_vt,
+            json.dumps(container_data),
+            label,
+        )
+        cpp_type = _iterator_cpp_type(vt)
+        storage = f"inktocode_iterbase_{test_index}_{group_index}"
+        decl = f"{cpp_type} {storage} = {literal};"
+        result[param_index] = HarnessArgument(
+            expression=_iterator_expression(
+                storage, head_position, is_const=bool(vt.iterator_const)
+            ),
+            declarations=(decl,),
+            mutation_expression=storage,
+        )
+        if vt.iterator_role == "range_begin":
+            tail_index = next(
+                (
+                    i
+                    for i in range(param_index + 1, len(function.parameters))
+                    if function.parameters[i].value_type.iterator_group_index == group_index
+                ),
+                None,
+            )
+            if tail_index is not None:
+                tail_vt = function.parameters[tail_index].value_type
+                tail_label = f"argument {function.parameters[tail_index].name}"
+                tail_payload = _parse_iterator_argument(
+                    raw_arguments[tail_index],
+                    tail_vt,
+                    tail_label,
+                    is_tail=True,
+                    head_container_payload=container_data,
+                )
+                tail_position = tail_payload["position"]
+                if head_position > tail_position:
+                    raise ValueError(
+                        f"{label} range start must not be after range end."
+                    )
+                result[tail_index] = HarnessArgument(
+                    expression=_iterator_expression(
+                        storage,
+                        tail_position,
+                        is_const=bool(tail_vt.iterator_const),
+                    ),
+                )
+    return result
 
 
 def _prepare_argument(
@@ -1469,11 +1711,13 @@ def _prepare_argument(
         storage_name = (
             f"inktocode_mutable_{test_index}_{parameter_index}_storage"
         )
-        if value_type.kind == "vector":
-            literal = _vector_literal(value_type, raw_value, label)
-            storage_type = f"std::vector<{value_type.element_type}>"
-            if value_type.vector_depth == 2:
-                storage_type = f"std::vector<{storage_type}>"
+        if value_type.kind in {"container", "vector", "array"} or value_type.container_name:
+            literal = _container_literal(value_type, raw_value, label)
+            storage_type = value_type.display_type
+            if storage_type.startswith("const "):
+                storage_type = storage_type[6:]
+            if storage_type.endswith("&"):
+                storage_type = storage_type[:-1].rstrip()
         else:
             if value_type.scalar_type is None:
                 raise ValueError(f"{label} uses an unsupported mutable type.")
@@ -1490,7 +1734,7 @@ def _prepare_argument(
             ),
             mutation_expression=storage_name,
         )
-    if value_type.kind != "array":
+    if value_type.kind != "array" or value_type.container_name == "array":
         return HarnessArgument(
             expression=_safe_value_literal(value_type, raw_value, label)
         )
@@ -1522,6 +1766,7 @@ def _prepare_argument(
         array_element_count=len(elements),
         mutation_expression=storage_name,
     )
+
 
 
 def _typed_vector_values(
@@ -1573,6 +1818,134 @@ def _classify_vector_match(
     if expected_values != actual_values:
         return "mismatch"
     return "exact" if expected == actual else "whitespace_normalized"
+
+
+_MAP_CONTAINERS = {"map", "multimap", "unordered_map", "unordered_multimap"}
+_SET_CONTAINERS = {"set", "unordered_set"}
+_MULTISET_CONTAINERS = {"multiset", "unordered_multiset"}
+_SEQUENCE_CONTAINERS = {"deque", "list"}
+_ADAPTER_CONTAINERS = {"stack", "queue", "priority_queue"}
+
+
+def _canonical_map_entries(
+    parsed: object,
+) -> list[tuple[object, object]] | None:
+    if isinstance(parsed, dict):
+        return list(parsed.items())
+    if not isinstance(parsed, list):
+        return None
+    entries: list[tuple[object, object]] = []
+    for item in parsed:
+        if isinstance(item, dict) and "key" in item and "value" in item:
+            entries.append((item["key"], item["value"]))
+        elif isinstance(item, list) and len(item) == 2:
+            entries.append((item[0], item[1]))
+        else:
+            return None
+    return entries
+
+
+def _canonical_tokens(values: list[object]) -> list[str]:
+    return [
+        json.dumps(value, sort_keys=True, ensure_ascii=False) for value in values
+    ]
+
+
+def _classify_container_match(
+    value_type: ValueType,
+    expected: str,
+    actual: str,
+) -> str:
+    try:
+        exp = json.loads(expected)
+        act = json.loads(actual)
+    except (json.JSONDecodeError, ValueError):
+        return "mismatch"
+
+    name = value_type.container_name
+
+    if name in _MAP_CONTAINERS:
+        exp_entries = _canonical_map_entries(exp)
+        act_entries = _canonical_map_entries(act)
+        if exp_entries is None or act_entries is None:
+            return "mismatch"
+        exp_tokens = _canonical_tokens([list(e) for e in exp_entries])
+        act_tokens = _canonical_tokens([list(e) for e in act_entries])
+        return "exact" if Counter(exp_tokens) == Counter(act_tokens) else "mismatch"
+
+    if not isinstance(exp, list) or not isinstance(act, list):
+        return "mismatch"
+
+    if name in _SEQUENCE_CONTAINERS or name in _ADAPTER_CONTAINERS:
+        return "exact" if exp == act else "mismatch"
+
+    if name in _SET_CONTAINERS:
+        return (
+            "exact"
+            if set(_canonical_tokens(exp)) == set(_canonical_tokens(act))
+            else "mismatch"
+        )
+
+    if name in _MULTISET_CONTAINERS:
+        return (
+            "exact"
+            if Counter(_canonical_tokens(exp)) == Counter(_canonical_tokens(act))
+            else "mismatch"
+        )
+
+    return "exact" if expected == actual else "mismatch"
+
+
+def _container_mismatch_detail(
+    value_type: ValueType,
+    expected: str,
+    actual: str,
+) -> str | None:
+    try:
+        exp = json.loads(expected)
+        act = json.loads(actual)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    name = value_type.container_name
+
+    if (name in _SEQUENCE_CONTAINERS or name in _ADAPTER_CONTAINERS) and isinstance(exp, list) and isinstance(act, list):
+        if len(exp) != len(act):
+            return f"Expected {len(exp)} element(s), actual {len(act)}."
+        for index, (exp_item, act_item) in enumerate(zip(exp, act)):
+            if exp_item != act_item:
+                if name == "stack":
+                    return f"First mismatch at position {index} from top."
+                if name == "queue":
+                    return f"First mismatch at position {index} from front."
+                if name == "priority_queue":
+                    return f"First mismatch at pop position {index}."
+                return f"First mismatch at index {index}."
+        return None
+
+    if name in _MAP_CONTAINERS:
+        exp_entries = _canonical_map_entries(exp)
+        act_entries = _canonical_map_entries(act)
+        if exp_entries is None or act_entries is None:
+            return None
+        exp_counts = Counter(_canonical_tokens([list(e) for e in exp_entries]))
+        act_counts = Counter(_canonical_tokens([list(e) for e in act_entries]))
+    elif (
+        name in _SET_CONTAINERS or name in _MULTISET_CONTAINERS
+    ) and isinstance(exp, list) and isinstance(act, list):
+        exp_counts = Counter(_canonical_tokens(exp))
+        act_counts = Counter(_canonical_tokens(act))
+    else:
+        return None
+
+    missing = sorted((exp_counts - act_counts).elements())
+    unexpected = sorted((act_counts - exp_counts).elements())
+    parts: list[str] = []
+    if missing:
+        parts.append(f"Missing: {', '.join(missing[:3])}.")
+    if unexpected:
+        parts.append(f"Unexpected: {', '.join(unexpected[:3])}.")
+    return " ".join(parts) if parts else None
 
 
 def _vector_output(function: FunctionSignature, call: str) -> str:
@@ -1879,6 +2252,27 @@ def _build_function_harness(
                         length_expression,
                     )
                 )
+            elif parameter.value_type.kind == "iterator":
+                backing_vt = ValueType(
+                    kind="vector" if parameter.value_type.iterator_container == "vector" else "container",
+                    display_type=f"std::{parameter.value_type.iterator_container}<{parameter.value_type.element_type}>",
+                    element_type=parameter.value_type.element_type,
+                    fixed_size=parameter.value_type.fixed_size,
+                    passing="value",
+                    container_name=parameter.value_type.iterator_container,
+                    container_family="sequence",
+                    ordered=True,
+                    associative=False,
+                    unordered=False,
+                    adapter=False,
+                )
+                serialized_value = _serialized_value_output(
+                    mutable_expression, backing_vt
+                )
+            elif parameter.value_type.kind == "container":
+                serialized_value = _serialized_value_output(
+                    mutable_expression, parameter.value_type
+                )
             elif parameter.value_type.scalar_type == STRING_TYPE:
                 serialized_value = (
                     "inktocode_write_quoted_string"
@@ -1926,6 +2320,25 @@ def _build_function_harness(
                         element_type,
                         "inktocode_return_value.size()",
                     )
+                )
+            elif function.return_value_type.kind == "iterator":
+                backing_index = function.return_value_type.iterator_group_index
+                if backing_index is not None and backing_index < len(arguments):
+                    iter_base = arguments[backing_index].mutation_expression or ""
+                else:
+                    iter_base = ""
+                if iter_base:
+                    serialized_return = (
+                        f'if (inktocode_return_value == {iter_base}.end()) '
+                        f'{{ std::cout << "\\"end\\""; }} '
+                        f'else {{ std::cout << std::distance({iter_base}.begin(), '
+                        f'inktocode_return_value); }}'
+                    )
+                else:
+                    serialized_return = 'std::cout << "null";'
+            elif function.return_value_type.kind == "container":
+                serialized_return = _serialized_value_output(
+                    "inktocode_return_value", function.return_value_type
                 )
             elif function.return_value_type.scalar_type == STRING_TYPE:
                 serialized_return = (
@@ -2003,16 +2416,77 @@ def _build_function_harness(
         "#include <fstream>\n"
         "#include <functional>\n"
         "#include <iomanip>\n"
-        "#include <iostream>\n\n"
+        "#include <iostream>\n"
+        "#include <iterator>\n\n"
         "#include <new>\n"
+        "#include <queue>\n"
+        "#include <stack>\n"
         "#include <stdexcept>\n"
         "#include <string>\n"
         "#include <typeinfo>\n"
+        "#include <utility>\n"
         "#include <vector>\n\n"
         f"{code}\n\n"
         f"{_string_serializer_source()}\n\n"
+        f"{_container_serializer_source()}\n\n"
         f"{_exception_support_source()}\n\n"
         f"{generated_main}\n"
+    )
+
+
+def _container_serializer_source() -> str:
+    return "\n".join(
+        [
+            "inline void inktocode_serialize(int val) { std::cout << val; }",
+            "inline void inktocode_serialize(long val) { std::cout << val; }",
+            "inline void inktocode_serialize(long long val) { std::cout << val; }",
+            "inline void inktocode_serialize(float val) { std::cout << std::setprecision(17) << val; }",
+            "inline void inktocode_serialize(double val) { std::cout << std::setprecision(17) << val; }",
+            "inline void inktocode_serialize(bool val) { std::cout << (val ? \"true\" : \"false\"); }",
+            "inline void inktocode_serialize(char val) { std::cout << '\\'' << val << '\\''; }",
+            "inline void inktocode_serialize(const std::string& val) { inktocode_write_quoted_string(val); }",
+            "template <typename K, typename V>",
+            "inline void inktocode_serialize(const std::pair<K, V>& p) {",
+            "    std::cout << \"{\\\"key\\\": \";",
+            "    inktocode_serialize(p.first);",
+            "    std::cout << \", \\\"value\\\": \";",
+            "    inktocode_serialize(p.second);",
+            "    std::cout << \"}\";",
+            "}",
+            "template <typename Container>",
+            "auto inktocode_serialize_container(const Container& c, int) -> decltype(c.begin(), void()) {",
+            "    std::cout << \"[\";",
+            "    bool first = true;",
+            "    for (const auto& item : c) {",
+            "        if (!first) std::cout << \", \";",
+            "        first = false;",
+            "        inktocode_serialize(item);",
+            "    }",
+            "    std::cout << \"]\";",
+            "}",
+            "template <typename T, typename Container>",
+            "inline void inktocode_serialize_adapter(std::stack<T, Container> adp) {",
+            "    std::vector<T> items;",
+            "    while (!adp.empty()) { items.push_back(adp.top()); adp.pop(); }",
+            "    inktocode_serialize_container(items, 0);",
+            "}",
+            "template <typename T, typename Container>",
+            "inline void inktocode_serialize_adapter(std::queue<T, Container> adp) {",
+            "    std::vector<T> items;",
+            "    while (!adp.empty()) { items.push_back(adp.front()); adp.pop(); }",
+            "    inktocode_serialize_container(items, 0);",
+            "}",
+            "template <typename T, typename Container, typename Compare>",
+            "inline void inktocode_serialize_adapter(std::priority_queue<T, Container, Compare> adp) {",
+            "    std::vector<T> items;",
+            "    while (!adp.empty()) { items.push_back(adp.top()); adp.pop(); }",
+            "    inktocode_serialize_container(items, 0);",
+            "}",
+            "template <typename T>",
+            "inline void inktocode_serialize(const T& val) {",
+            "    inktocode_serialize_container(val, 0);",
+            "}",
+        ]
     )
 
 
@@ -2020,17 +2494,10 @@ def _serialized_value_output(
     expression: str,
     value_type: ValueType,
 ) -> str:
-    if value_type.kind == "vector":
-        element_type = value_type.element_type
-        if element_type is None:
-            raise ValueError("Vector result has no element type.")
-        if value_type.vector_depth == 2:
-            return _nested_collection_output(expression, element_type)
-        return _collection_output(
-            expression,
-            element_type,
-            f"{expression}.size()",
-        )
+    if value_type.container_name in _ADAPTER_CONTAINERS:
+        return f"inktocode_serialize_adapter({expression});"
+    if value_type.kind in {"container", "vector", "array"} or value_type.container_name:
+        return f"inktocode_serialize({expression});"
     if value_type.scalar_type == STRING_TYPE:
         return f"inktocode_write_quoted_string({expression});"
     if value_type.scalar_type == "bool":
@@ -2041,6 +2508,7 @@ def _serialized_value_output(
             f"({DOUBLE_OUTPUT_PRECISION}) << {expression};"
         )
     return f"std::cout << {expression};"
+
 
 
 def _progress_statement(index: int) -> str:
@@ -2431,6 +2899,8 @@ def _build_object_harness(
         "#include <iostream>\n"
         "#include <new>\n"
         "#include <optional>\n"
+        "#include <queue>\n"
+        "#include <stack>\n"
         "#include <stdexcept>\n"
         "#include <string>\n"
         "#include <typeinfo>\n"
@@ -2438,6 +2908,7 @@ def _build_object_harness(
         "#include <vector>\n\n"
         f"{code}\n\n"
         f"{_string_serializer_source()}\n\n"
+        f"{_container_serializer_source()}\n\n"
         f"{_exception_support_source()}\n\n"
         f"{generated_main}\n"
     )
@@ -2495,10 +2966,16 @@ def _program_results(
 
 
 def _metadata_value(value_type: ValueType, value: object) -> str:
-    if value_type.kind in {"vector", "array"}:
+    if value_type.kind == "iterator":
+        if value == "end":
+            return "end"
+        if isinstance(value, int):
+            return str(value)
+        return ""
+    if value_type.kind in {"vector", "array", "container"}:
         return (
             json.dumps(value, ensure_ascii=False)
-            if isinstance(value, list)
+            if isinstance(value, (list, dict))
             else ""
         )
     if value_type.scalar_type == STRING_TYPE:
@@ -2511,6 +2988,8 @@ def _metadata_value(value_type: ValueType, value: object) -> str:
 
 
 def _typed_match(value_type: ValueType, expected: str, actual: str) -> str:
+    if value_type.kind == "iterator":
+        return "exact" if expected.strip() == actual.strip() else "mismatch"
     if value_type.kind in {"vector", "array"}:
         return (
             "mismatch"
@@ -2518,6 +2997,8 @@ def _typed_match(value_type: ValueType, expected: str, actual: str) -> str:
             == "mismatch"
             else "exact"
         )
+    if value_type.kind == "container":
+        return _classify_container_match(value_type, expected, actual)
     return "exact" if expected == actual else "mismatch"
 
 
@@ -2526,6 +3007,12 @@ def _typed_mismatch_detail(
     expected: str,
     actual: str,
 ) -> str | None:
+    if value_type.kind == "iterator":
+        e_label = "end()" if expected.strip() == "end" else f"position {expected.strip()}"
+        a_label = "end()" if actual.strip() == "end" else f"position {actual.strip()}"
+        return f"Expected {e_label}, actual {a_label}."
+    if value_type.kind == "container":
+        return _container_mismatch_detail(value_type, expected, actual)
     if value_type.kind != "vector" or value_type.vector_depth != 2:
         return None
     try:
@@ -2635,6 +3122,23 @@ def _exception_outcome_result(
         message_matched=message_matched,
         expectation_passed=expectation_passed,
         execution_continued=execution_continued,
+    )
+
+
+def _backing_value_type_for_iterator(vt: ValueType) -> ValueType:
+    """Return the container ValueType that represents an iterator's backing store."""
+    return ValueType(
+        kind="vector" if vt.iterator_container == "vector" else "container",
+        display_type=f"std::{vt.iterator_container}<{vt.element_type}>",
+        element_type=vt.element_type,
+        fixed_size=vt.fixed_size,
+        passing="value",
+        container_name=vt.iterator_container,
+        container_family="sequence",
+        ordered=True,
+        associative=False,
+        unordered=False,
+        adapter=False,
     )
 
 
@@ -2756,10 +3260,15 @@ def _function_results(
                 if isinstance(raw_mutations, dict)
                 else None
             )
-            actual_value = _metadata_value(parameter.value_type, raw_value)
+            cmp_vt = (
+                _backing_value_type_for_iterator(parameter.value_type)
+                if parameter.value_type.kind == "iterator"
+                else parameter.value_type
+            )
+            actual_value = _metadata_value(cmp_vt, raw_value)
             mutation_passed = (
                 _typed_match(
-                    parameter.value_type,
+                    cmp_vt,
                     expected_values[parameter.name],
                     actual_value,
                 )
@@ -2769,7 +3278,7 @@ def _function_results(
                 None
                 if mutation_passed
                 else _typed_mismatch_detail(
-                    parameter.value_type,
+                    cmp_vt,
                     expected_values[parameter.name],
                     actual_value,
                 )
@@ -4676,6 +5185,11 @@ def run_test_request(
             for parameter in function.parameters
             if parameter.value_type.passing
             in {"mutable_reference", "scalar_pointer", "array_pointer"}
+            or (
+                parameter.value_type.kind == "iterator"
+                and parameter.value_type.iterator_const is False
+                and parameter.value_type.iterator_role in {"single", "range_begin"}
+            )
         ]
         mutation_tests = [
             test
@@ -4710,28 +5224,47 @@ def run_test_request(
                     function=_function_response(function),
                     tests=[],
                 )
-            mutable_names = {
+            # Required: non-iterator mutable params must always be present.
+            # Optional: non-const mutable iterator groups may be omitted.
+            _required_mutation_names = {
                 parameter.name
                 for parameter in mutation_capable_parameters
+                if parameter.value_type.passing
+                in {"mutable_reference", "scalar_pointer", "array_pointer"}
             }
+            _optional_mutation_names = {
+                parameter.name
+                for parameter in mutation_capable_parameters
+            } - _required_mutation_names
+            _all_mutation_capable_names = (
+                _required_mutation_names | _optional_mutation_names
+            )
             if any(
-                set(expectations) != mutable_names
+                not _required_mutation_names.issubset(set(expectations))
+                or not set(expectations).issubset(_all_mutation_capable_names)
                 for expectations in expectation_maps
             ):
                 return RunTestsResponse(
                     mode="function",
                     success=False,
                     input_error=(
-                        "Every mutable parameter must have exactly one "
-                        "expected final value, and immutable parameters "
-                        "cannot have mutation expectations."
+                        "Every mutable parameter must have an expected "
+                        "final value; iterator groups are optional. "
+                        "Immutable parameters cannot have mutation "
+                        "expectations."
                     ),
                     function=_function_response(function),
                     tests=[],
                 )
+            # Only capture/compare iterators that the caller explicitly opted in to.
+            _active_optional_names = set().union(
+                *(set(exp) & _optional_mutation_names for exp in expectation_maps)
+            )
             mutation_parameter_names = tuple(
                 parameter.name
                 for parameter in mutation_capable_parameters
+                if parameter.name
+                in (_required_mutation_names | _active_optional_names)
             )
         for test_index, test in enumerate(request.tests):
             if len(test.arguments) != len(function.parameters):
@@ -4747,11 +5280,20 @@ def run_test_request(
                 )
             try:
                 is_void = function.return_value_type.kind == "void"
+                _iter_return_backing_idx: int | None = (
+                    function.return_value_type.iterator_group_index
+                    if (
+                        function.return_value_type.kind == "iterator"
+                        and function.return_value_type.supported
+                    )
+                    else None
+                )
                 required_mutable_parameters = [
                     parameter
-                    for parameter in function.parameters
+                    for param_idx, parameter in enumerate(function.parameters)
                     if parameter.value_type.passing
                     in {"mutable_reference", "scalar_pointer"}
+                    and param_idx != _iter_return_backing_idx
                 ]
                 if (
                     test.expected_outcome != "throws"
@@ -4794,8 +5336,15 @@ def run_test_request(
                         f"{test.name} cannot expect void completion from a "
                         "non-void function."
                     )
+                iterator_args = _prepare_iterator_arguments(
+                    function,
+                    list(test.arguments),
+                    test_index,
+                )
                 prepared_arguments = [
-                    _prepare_argument(
+                    iterator_args[parameter_index]
+                    if parameter_index in iterator_args
+                    else _prepare_argument(
                         parameter.value_type,
                         argument,
                         f"{test.name} argument {parameter.name}",
@@ -4825,7 +5374,9 @@ def run_test_request(
                             f"{test.name} expected final "
                             f"{mutable_parameter.name}"
                         )
-                        if mutable_parameter.value_type.kind in {
+                        if mutable_parameter.value_type.kind == "iterator":
+                            pass
+                        elif mutable_parameter.value_type.kind in {
                             "vector",
                             "array",
                         }:
@@ -4876,7 +5427,11 @@ def run_test_request(
                             f"cannot exceed the {element_count or 0} "
                             f"provided element(s) for {parameter.name}."
                         )
-                if not is_void and test.expected_outcome != "throws":
+                if (
+                    not is_void
+                    and test.expected_outcome != "throws"
+                    and function.return_value_type.kind != "iterator"
+                ):
                     _safe_value_literal(
                         function.return_value_type,
                         test.expected_return or "",

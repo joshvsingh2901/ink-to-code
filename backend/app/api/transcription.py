@@ -5,11 +5,17 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
-from app.schemas.transcription import ErrorBody, ErrorResponse, TranscriptionResponse
+from app.schemas.transcription import (
+    ErrorBody,
+    ErrorResponse,
+    QuestionTextResponse,
+    TranscriptionResponse,
+)
 from app.services.transcription import (
     TranscriptionServiceError,
     log_transcription_error,
     transcribe_pages,
+    transcribe_question_pages,
 )
 from app.services.uploads import UploadValidationError, validate_and_normalize_pages
 
@@ -61,6 +67,38 @@ async def transcribe(
 
         return await run_in_threadpool(
             transcribe_pages, code_pages, normalized_question_pages, settings
+        )
+    except UploadValidationError as error:
+        return error_response("upload_validation_failed", str(error), 400)
+    except TranscriptionServiceError as error:
+        log_transcription_error(error, settings)
+        return error_response(error.code, error.message, error.status_code)
+
+
+@router.post(
+    "/transcribe-question",
+    response_model=QuestionTextResponse,
+    responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+async def transcribe_question(
+    question_pages: Annotated[list[UploadFile], File()],
+    question_metadata: Annotated[str, Form()],
+) -> QuestionTextResponse | JSONResponse:
+    settings = get_settings()
+    try:
+        normalized_pages = await validate_and_normalize_pages(
+            question_pages,
+            question_metadata,
+            category="question",
+            minimum=1,
+            maximum=5,
+        )
+        question_text = await run_in_threadpool(
+            transcribe_question_pages, normalized_pages, settings
+        )
+        return QuestionTextResponse(
+            question_text=question_text,
+            model=settings.test_generation_model,
         )
     except UploadValidationError as error:
         return error_response("upload_validation_failed", str(error), 400)

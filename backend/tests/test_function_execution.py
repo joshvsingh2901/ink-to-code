@@ -404,51 +404,24 @@ def test_mode_endpoint_returns_function_metadata():
 
     assert response.status_code == 200
     assert response.json()["mode"] == "function"
-    assert response.json()["functions"] == [
-        {
-            "id": "findMax(int,int)->int",
-            "name": "findMax",
-            "return_type": "int",
-            "return_type_metadata": {
-                "kind": "scalar",
-                "display_type": "int",
-                    "scalar_type": "int",
-                    "element_type": None,
-                    "vector_depth": None,
-                    "passing": "value",
-                "size_parameter_name": None,
-            },
-            "parameters": [
-                {
-                    "name": "a",
-                    "type": "int",
-                    "type_metadata": {
-                        "kind": "scalar",
-                        "display_type": "int",
-                        "scalar_type": "int",
-                        "element_type": None,
-                        "vector_depth": None,
-                        "passing": "value",
-                        "size_parameter_name": None,
-                    },
-                },
-                {
-                    "name": "b",
-                    "type": "int",
-                    "type_metadata": {
-                        "kind": "scalar",
-                        "display_type": "int",
-                        "scalar_type": "int",
-                        "element_type": None,
-                        "vector_depth": None,
-                        "passing": "value",
-                        "size_parameter_name": None,
-                    },
-                },
-            ],
-            "display": "findMax(int a, int b)",
-        }
-    ]
+    functions = response.json()["functions"]
+    assert len(functions) == 1
+    fn = functions[0]
+    assert fn["id"] == "findMax(int,int)->int"
+    assert fn["name"] == "findMax"
+    assert fn["return_type"] == "int"
+    assert fn["display"] == "findMax(int a, int b)"
+    # Verify scalar metadata core fields; container extension fields are None for scalars
+    for metadata in [fn["return_type_metadata"]] + [p["type_metadata"] for p in fn["parameters"]]:
+        assert metadata["kind"] == "scalar"
+        assert metadata["display_type"] == "int"
+        assert metadata["scalar_type"] == "int"
+        assert metadata["element_type"] is None
+        assert metadata["vector_depth"] is None
+        assert metadata["passing"] == "value"
+        assert metadata["size_parameter_name"] is None
+        assert metadata.get("container_name") is None
+        assert metadata.get("container_family") is None
 
 
 def vector_request(

@@ -15,6 +15,8 @@ SUPPORTED_VECTOR_ELEMENT_TYPES = {
     "int", "long", "long long", "double", "bool"
 }
 STRING_TYPE = "std::string"
+MAX_CONTAINER_NESTING_DEPTH = 3
+MAX_CONTAINER_ELEMENTS = 50
 SUPPORTED_TEMPLATE_TYPE_ARGUMENTS = (
     "int",
     "long",
@@ -24,6 +26,11 @@ SUPPORTED_TEMPLATE_TYPE_ARGUMENTS = (
     "bool",
     "char",
     STRING_TYPE,
+    "std::vector<int>",
+    "std::deque<int>",
+    "std::list<int>",
+    "std::set<int>",
+    "std::map<std::string, int>",
 )
 
 
@@ -52,13 +59,55 @@ class ExplicitFunctionSpecialization:
     source_line: int
 
 
+ContainerFamily = Literal["sequence", "associative", "unordered", "adapter"]
+ContainerName = Literal[
+    "vector",
+    "array",
+    "deque",
+    "list",
+    "set",
+    "multiset",
+    "map",
+    "multimap",
+    "unordered_set",
+    "unordered_multiset",
+    "unordered_map",
+    "unordered_multimap",
+    "stack",
+    "queue",
+    "priority_queue",
+]
+
+# Single source of truth for comparison/serialization semantics per container
+# (used by both parsing here and by the execution/comparison stage). "vector"
+# is included for lookup completeness even though its own parsing stays on
+# the pre-existing dedicated vector code path below (see _CONTAINER_TYPE).
+CONTAINER_PROPERTIES: dict[str, dict[str, object]] = {
+    "vector": {"family": "sequence", "ordered": True, "associative": False, "unordered": False, "adapter": False, "map_like": False, "fixed_size": False},
+    "array": {"family": "sequence", "ordered": True, "associative": False, "unordered": False, "adapter": False, "map_like": False, "fixed_size": True},
+    "deque": {"family": "sequence", "ordered": True, "associative": False, "unordered": False, "adapter": False, "map_like": False, "fixed_size": False},
+    "list": {"family": "sequence", "ordered": True, "associative": False, "unordered": False, "adapter": False, "map_like": False, "fixed_size": False},
+    "set": {"family": "associative", "ordered": True, "associative": True, "unordered": False, "adapter": False, "map_like": False, "fixed_size": False},
+    "multiset": {"family": "associative", "ordered": True, "associative": True, "unordered": False, "adapter": False, "map_like": False, "fixed_size": False},
+    "map": {"family": "associative", "ordered": True, "associative": True, "unordered": False, "adapter": False, "map_like": True, "fixed_size": False},
+    "multimap": {"family": "associative", "ordered": True, "associative": True, "unordered": False, "adapter": False, "map_like": True, "fixed_size": False},
+    "unordered_set": {"family": "unordered", "ordered": False, "associative": False, "unordered": True, "adapter": False, "map_like": False, "fixed_size": False},
+    "unordered_multiset": {"family": "unordered", "ordered": False, "associative": False, "unordered": True, "adapter": False, "map_like": False, "fixed_size": False},
+    "unordered_map": {"family": "unordered", "ordered": False, "associative": False, "unordered": True, "adapter": False, "map_like": True, "fixed_size": False},
+    "unordered_multimap": {"family": "unordered", "ordered": False, "associative": False, "unordered": True, "adapter": False, "map_like": True, "fixed_size": False},
+    "stack": {"family": "adapter", "ordered": True, "associative": False, "unordered": False, "adapter": True, "map_like": False, "fixed_size": False},
+    "queue": {"family": "adapter", "ordered": True, "associative": False, "unordered": False, "adapter": True, "map_like": False, "fixed_size": False},
+    "priority_queue": {"family": "adapter", "ordered": True, "associative": False, "unordered": False, "adapter": True, "map_like": False, "fixed_size": False},
+}
+
+
 @dataclass(frozen=True)
 class ValueType:
-    kind: Literal["scalar", "vector", "array", "void"]
+    kind: Literal["scalar", "vector", "array", "void", "container", "iterator"]
     display_type: str
     scalar_type: str | None = None
     element_type: str | None = None
-    vector_depth: Literal[1, 2] | None = None
+    vector_depth: int | None = None
     passing: Literal[
         "value",
         "const_reference",
@@ -67,6 +116,22 @@ class ValueType:
         "array_pointer",
     ] = "value"
     size_parameter_name: str | None = None
+    container_family: ContainerFamily | None = None
+    container_name: ContainerName | None = None
+    key_type: str | None = None
+    mapped_type: str | None = None
+    fixed_size: int | None = None
+    nested_depth: int | None = None
+    ordered: bool | None = None
+    associative: bool | None = None
+    unordered: bool | None = None
+    adapter: bool | None = None
+    supported: bool = True
+    unsupported_reason: str | None = None
+    iterator_container: str | None = None
+    iterator_const: bool | None = None
+    iterator_role: Literal["single", "range_begin", "range_end"] | None = None
+    iterator_group_index: int | None = None
 
     @property
     def canonical_type(self) -> str:
@@ -85,9 +150,11 @@ class ValueType:
                 if self.passing == "const_reference"
                 else base
             )
-        base = f"std::vector<{self.element_type}>"
-        if self.vector_depth == 2:
-            base = f"std::vector<{base}>"
+        base = self.display_type
+        if base.startswith("const "):
+            base = base[6:]
+        if base.endswith("&"):
+            base = base[:-1].rstrip()
         if self.passing == "mutable_reference":
             return f"{base}&"
         return (
@@ -95,6 +162,7 @@ class ValueType:
             if self.passing == "const_reference"
             else base
         )
+
 
 
 @dataclass(frozen=True)
@@ -193,7 +261,7 @@ class FunctionAnalysis:
 
 _FUNCTION_DEFINITION = re.compile(
     r"(?P<return_type>"
-    r"(?:const\s+)?(?:std::)?vector\s*<[^{}();]+>\s*(?:const\s*)?[&*]?"
+    r"(?:const\s+)?(?:std::)?[A-Za-z_]\w*\s*<[^{}();\n]+>(?:\s*::\s*(?:const_)?iterator)?\s*(?:const\s*)?[&*]?"
     r"|(?:const\s+)?(?:std::)?string\s*(?:const\s*)?[&*]?"
     r"|(?:const\s+)?(?:long\s+long|long|int|float|double|bool|char)\s*"
     r"(?:const\s*)?&&?"
@@ -202,6 +270,7 @@ _FUNCTION_DEFINITION = re.compile(
     r")\s+(?P<name>[A-Za-z_]\w*)\s*"
     r"\((?P<parameters>[^()]*)\)\s*(?:noexcept\s*)?\{",
 )
+
 _PARAMETER_DECLARATION = re.compile(
     r"(?P<type>.+?)\s+(?P<name>[A-Za-z_]\w*)"
 )
@@ -243,6 +312,26 @@ _STRING_TYPE = re.compile(
     r"(?P<prefix_const>const\s+)?"
     r"(?P<qualified>std::)?string\s*"
     r"(?P<suffix_const>const\s*)?(?P<modifier>[&*])?"
+)
+# Includes "vector" so it can be recognized as a nested element inside the
+# other 14 containers (e.g. map<string, vector<int>>). A bare top-level
+# "vector<...>" parameter/return still routes to the dedicated _VECTOR_TYPE
+# path unchanged (see _parse_value_type), preserving its existing narrower
+# element-type and nesting-depth behavior exactly.
+_CONTAINER_NAME_PATTERN = "|".join(
+    sorted(CONTAINER_PROPERTIES, key=len, reverse=True)
+)
+_CONTAINER_TYPE = re.compile(
+    r"(?P<prefix_const>const\s+)?"
+    r"(?P<qualified>std::)?"
+    rf"(?P<name>{_CONTAINER_NAME_PATTERN})"
+    r"\s*<\s*(?P<args>.+)\s*>\s*"
+    r"(?P<suffix_const>const\s*)?(?P<modifier>[&*])?"
+)
+_ITERATOR_TYPE = re.compile(
+    r"(?P<qualified>std::)?"
+    r"(?P<container>vector|deque|list|array)\s*<\s*(?P<args>.+)\s*>\s*"
+    r"::\s*(?P<constness>const_)?iterator"
 )
 
 
@@ -452,10 +541,34 @@ def _parse_value_type(
             None,
         )
 
+    iterator_match = _ITERATOR_TYPE.fullmatch(normalized)
+    if iterator_match is not None:
+        return _parse_iterator_type(
+            iterator_match,
+            normalized,
+            allow_reference=allow_reference,
+            unqualified_allowed=unqualified_vector_allowed,
+        )
+    if (
+        "::iterator" in normalized
+        or "::const_iterator" in normalized
+        or "reverse_iterator" in normalized
+    ):
+        return None, f"Unsupported iterator type: {normalized}."
+
+    container_match = _CONTAINER_TYPE.fullmatch(normalized)
+    if container_match is not None and container_match.group("name") != "vector":
+        return _parse_container_type(
+            container_match,
+            normalized,
+            allow_reference=allow_reference,
+            unqualified_allowed=unqualified_vector_allowed,
+        )
+
     vector_match = _VECTOR_TYPE.fullmatch(normalized)
     if vector_match is None:
-        if "vector" in normalized:
-            return None, f"Unsupported vector type: {normalized}."
+        if any(name in normalized for name in ("vector", "array", "deque", "list", "set", "map", "stack", "queue")):
+            return None, f"Unsupported container type: {normalized}."
         return None, f"Unsupported type: {normalized}."
 
     if vector_match.group("qualified") is None and not unqualified_vector_allowed:
@@ -465,7 +578,7 @@ def _parse_value_type(
         )
     raw_element_type = " ".join(vector_match.group("element").split())
     nested_match = _VECTOR_ELEMENT_TYPE.fullmatch(raw_element_type)
-    vector_depth: Literal[1, 2] = 1
+    vector_depth = 1
     if nested_match is not None:
         if (
             nested_match.group("qualified") is None
@@ -501,6 +614,7 @@ def _parse_value_type(
             None,
             f"Unsupported vector element type: {raw_element_type}.",
         )
+
     modifier = vector_match.group("modifier")
     is_const = bool(
         vector_match.group("prefix_const")
@@ -542,9 +656,320 @@ def _parse_value_type(
             element_type=element_type,
             vector_depth=vector_depth,
             passing=passing,
+            container_family="sequence",
+            container_name="vector",
+            nested_depth=vector_depth,
+            ordered=True,
+            associative=False,
+            unordered=False,
+            adapter=False,
+            supported=True,
         ),
         None,
     )
+
+
+def _parse_container_key_type(raw_type: str) -> tuple[ValueType | None, str | None]:
+    normalized = " ".join(raw_type.split())
+    if normalized.startswith("const "):
+        normalized = normalized[6:].strip()
+    if normalized in SUPPORTED_SCALAR_TYPES:
+        return ValueType(kind="scalar", display_type=normalized, scalar_type=normalized), None
+    if normalized in {"string", STRING_TYPE, "std::string"}:
+        return (
+            ValueType(kind="scalar", display_type=STRING_TYPE, scalar_type=STRING_TYPE),
+            None,
+        )
+    return (
+        None,
+        f"Unsupported container key type '{raw_type}'. Keys must be a "
+        "supported scalar or std::string.",
+    )
+
+
+def _parse_scalar_or_container_type(
+    raw_type: str,
+    *,
+    unqualified_allowed: bool,
+) -> tuple[ValueType | None, str | None]:
+    normalized = " ".join(raw_type.split())
+    if normalized.startswith("const "):
+        normalized = normalized[6:].strip()
+
+    if normalized in SUPPORTED_SCALAR_TYPES:
+        return ValueType(kind="scalar", display_type=normalized, scalar_type=normalized), None
+
+    if normalized in {"string", STRING_TYPE, "std::string"}:
+        if normalized == "string" and not unqualified_allowed:
+            return None, "Unqualified string types require `using namespace std;`."
+        return (
+            ValueType(kind="scalar", display_type=STRING_TYPE, scalar_type=STRING_TYPE),
+            None,
+        )
+
+    match = _CONTAINER_TYPE.fullmatch(normalized)
+    if match is not None:
+        return _parse_container_type(
+            match,
+            normalized,
+            allow_reference=False,
+            unqualified_allowed=unqualified_allowed,
+        )
+
+    return None, f"Unsupported container element type: {raw_type}."
+
+
+def _parse_container_type(
+    match: re.Match[str],
+    normalized: str,
+    *,
+    allow_reference: bool,
+    unqualified_allowed: bool,
+) -> tuple[ValueType | None, str | None]:
+    c_name = match.group("name")
+    c_props = CONTAINER_PROPERTIES[c_name]
+
+    if match.group("qualified") is None and not unqualified_allowed:
+        return None, f"Unqualified {c_name} types require `using namespace std;`."
+
+    modifier = match.group("modifier")
+    is_const = bool(match.group("prefix_const") or match.group("suffix_const"))
+
+    if modifier == "*":
+        return None, "Container pointer parameters and returns are unsupported."
+    if modifier == "&":
+        if not allow_reference:
+            return None, "Container return values must be returned by value."
+        passing: Literal["value", "const_reference", "mutable_reference"] = (
+            "const_reference" if is_const else "mutable_reference"
+        )
+    else:
+        if is_const and not allow_reference:
+            return None, "Container return values must be returned by value."
+        passing = "value"
+
+    if c_props["adapter"] and passing == "mutable_reference":
+        return (None, f"std::{c_name} mutable references are not supported.")
+
+    raw_args = match.group("args").strip()
+    fixed_size: int | None = None
+    key_type: str | None = None
+    mapped_type: str | None = None
+    element_type: str | None = None
+    nested_depth = 1
+
+    if c_props["fixed_size"]:
+        items = _split_template_items(raw_args)
+        if len(items) != 2:
+            return None, f"std::array requires an element type and a size: {raw_args}."
+        element_str, size_str = items
+        try:
+            fixed_size = int(size_str)
+        except ValueError:
+            return None, f"std::array size must be a non-negative integer literal: {size_str}."
+        if fixed_size < 0 or fixed_size > MAX_CONTAINER_ELEMENTS:
+            return (
+                None,
+                f"std::array size must be between 0 and {MAX_CONTAINER_ELEMENTS}.",
+            )
+        elem_vt, elem_err = _parse_scalar_or_container_type(
+            element_str, unqualified_allowed=unqualified_allowed
+        )
+        if elem_vt is None:
+            return None, elem_err or f"Unsupported element type '{element_str}'."
+        element_type = elem_vt.display_type
+        if elem_vt.kind == "container":
+            nested_depth = 1 + (elem_vt.nested_depth or 1)
+    elif c_props["map_like"]:
+        items = _split_template_items(raw_args)
+        if len(items) != 2:
+            return None, f"{c_name} requires a key type and a value type: {raw_args}."
+        key_str, val_str = items
+        key_vt, key_err = _parse_container_key_type(key_str)
+        if key_vt is None:
+            return None, key_err
+        key_type = key_vt.display_type
+
+        val_vt, val_err = _parse_scalar_or_container_type(
+            val_str, unqualified_allowed=unqualified_allowed
+        )
+        if val_vt is None:
+            return None, val_err or f"Unsupported value type '{val_str}'."
+        mapped_type = val_vt.display_type
+        element_type = f"std::pair<const {key_type}, {mapped_type}>"
+        if val_vt.kind == "container":
+            nested_depth = 1 + (val_vt.nested_depth or 1)
+    else:
+        elem_vt, elem_err = _parse_scalar_or_container_type(
+            raw_args, unqualified_allowed=unqualified_allowed
+        )
+        if elem_vt is None:
+            return None, elem_err or f"Unsupported container element type '{raw_args}'."
+        element_type = elem_vt.display_type
+        if elem_vt.kind == "container":
+            nested_depth = 1 + (elem_vt.nested_depth or 1)
+
+    if nested_depth > 1:
+        return (
+            None,
+            f"Nested container element types inside std::{c_name} are not yet supported.",
+        )
+
+    if nested_depth > MAX_CONTAINER_NESTING_DEPTH:
+        return (
+            None,
+            "Container nesting depth exceeds the maximum supported limit "
+            f"of {MAX_CONTAINER_NESTING_DEPTH}.",
+        )
+
+    if c_props["fixed_size"]:
+        base_display = f"std::array<{element_type}, {fixed_size}>"
+    elif c_props["map_like"]:
+        base_display = f"std::{c_name}<{key_type}, {mapped_type}>"
+    else:
+        base_display = f"std::{c_name}<{element_type}>"
+
+    full_display = (
+        f"const {base_display}&"
+        if passing == "const_reference"
+        else f"{base_display}&"
+        if passing == "mutable_reference"
+        else base_display
+    )
+
+    return (
+        ValueType(
+            kind="container",
+            display_type=full_display,
+            element_type=element_type,
+            passing=passing,
+            container_family=c_props["family"],
+            container_name=c_name,
+            key_type=key_type,
+            mapped_type=mapped_type,
+            fixed_size=fixed_size,
+            nested_depth=nested_depth,
+            ordered=c_props["ordered"],
+            associative=c_props["associative"],
+            unordered=c_props["unordered"],
+            adapter=c_props["adapter"],
+            supported=True,
+        ),
+        None,
+    )
+
+
+def _parse_iterator_type(
+    match: re.Match[str],
+    normalized: str,
+    *,
+    allow_reference: bool,
+    unqualified_allowed: bool,
+) -> tuple[ValueType | None, str | None]:
+    if match.group("qualified") is None and not unqualified_allowed:
+        return None, f"Unsupported type: {normalized}."
+    if allow_reference is False and normalized.endswith("&"):
+        return None, "Iterator references are not supported."
+    container_name = match.group("container")
+    args_raw = match.group("args").strip()
+    is_const = bool(match.group("constness"))
+
+    if container_name == "array":
+        parts = _split_template_items(args_raw)
+        if len(parts) != 2:
+            return None, f"std::array iterator requires element type and size: {normalized}."
+        element_raw = parts[0].strip()
+        try:
+            fixed_size = int(parts[1].strip())
+        except ValueError:
+            return None, f"std::array iterator size must be an integer: {normalized}."
+    else:
+        element_raw = args_raw
+        fixed_size = None
+
+    element_vt, _err = _parse_scalar_or_container_type(
+        element_raw,
+        unqualified_allowed=unqualified_allowed,
+    )
+    if element_vt is None or element_vt.kind != "scalar":
+        return None, "Iterators over nested containers are not supported."
+
+    return (
+        ValueType(
+            kind="iterator",
+            display_type=normalized,
+            element_type=element_raw,
+            fixed_size=fixed_size,
+            passing="value",
+            iterator_container=container_name,
+            iterator_const=is_const,
+        ),
+        None,
+    )
+
+
+def _assign_iterator_groups(
+    parameters: list[FunctionParameter],
+) -> tuple[list[FunctionParameter] | None, str | None]:
+    result = list(parameters)
+    i = 0
+    while i < len(parameters):
+        param = parameters[i]
+        if param.value_type.kind != "iterator":
+            i += 1
+            continue
+        key = (
+            param.value_type.iterator_container,
+            param.value_type.element_type,
+            param.value_type.iterator_const,
+            param.value_type.fixed_size,
+        )
+        run_end = i + 1
+        while run_end < len(parameters):
+            candidate = parameters[run_end]
+            if candidate.value_type.kind != "iterator":
+                break
+            candidate_key = (
+                candidate.value_type.iterator_container,
+                candidate.value_type.element_type,
+                candidate.value_type.iterator_const,
+                candidate.value_type.fixed_size,
+            )
+            if candidate_key != key:
+                break
+            run_end += 1
+        run_length = run_end - i
+        if run_length > 2:
+            return None, "More than two adjacent iterators of the same type are ambiguous."
+        if run_length == 2:
+            result[i] = replace(
+                parameters[i],
+                value_type=replace(
+                    parameters[i].value_type,
+                    iterator_role="range_begin",
+                    iterator_group_index=i,
+                ),
+            )
+            result[i + 1] = replace(
+                parameters[i + 1],
+                value_type=replace(
+                    parameters[i + 1].value_type,
+                    iterator_role="range_end",
+                    iterator_group_index=i,
+                ),
+            )
+            i += 2
+        else:
+            result[i] = replace(
+                parameters[i],
+                value_type=replace(
+                    parameters[i].value_type,
+                    iterator_role="single",
+                    iterator_group_index=i,
+                ),
+            )
+            i += 1
+    return result, None
 
 
 def _parse_parameters(
@@ -556,12 +981,13 @@ def _parse_parameters(
         return (), None
 
     parsed: list[FunctionParameter] = []
-    for raw_parameter in parameters.split(","):
+    for raw_parameter in _split_template_items(parameters):
         parameter = " ".join(raw_parameter.split())
         if not parameter or "=" in parameter or "..." in parameter:
             return None, "Default and variadic parameters are unsupported."
         if "(&" in parameter and "[" in parameter:
             return None, "References to arrays are unsupported."
+
         array_match = _ARRAY_PARAMETER.fullmatch(parameter)
         if array_match is not None:
             element_type = " ".join(array_match.group("element").split())
@@ -678,7 +1104,10 @@ def _parse_parameters(
                 size_parameter_name=size_parameter.name,
             ),
         )
-    return tuple(linked), None
+    grouped, error = _assign_iterator_groups(linked)
+    if grouped is None:
+        return None, error
+    return tuple(grouped), None
 
 
 def _scalar_pointer_uses_unsupported_arithmetic(
@@ -914,6 +1343,52 @@ def _parse_template_candidate(
     )
 
 
+def _resolve_iterator_return_backing(
+    return_value_type: ValueType,
+    parameters: tuple[FunctionParameter, ...],
+) -> ValueType:
+    """Resolve which backing container a returned iterator belongs to.
+
+    Resolves structurally only — cannot verify the returned iterator actually
+    points into the resolved container. Cross-container returns are undefined
+    student behavior and are documented as such.
+    """
+    key_container = return_value_type.iterator_container
+    key_element = return_value_type.element_type
+    key_fixed = return_value_type.fixed_size
+    candidates: list[int] = []
+    for param_index, param in enumerate(parameters):
+        vt = param.value_type
+        if vt.kind == "iterator" and vt.iterator_role in {"single", "range_begin"}:
+            if (
+                vt.iterator_container == key_container
+                and vt.element_type == key_element
+                and vt.fixed_size == key_fixed
+            ):
+                candidates.append(param_index)
+        elif vt.kind in {"vector", "container"}:
+            if (
+                vt.container_name == key_container
+                and vt.element_type == key_element
+                and vt.fixed_size == key_fixed
+                and vt.passing != "value"
+            ):
+                candidates.append(param_index)
+    if len(candidates) == 1:
+        return replace(
+            return_value_type,
+            iterator_group_index=candidates[0],
+            supported=True,
+        )
+    return replace(
+        return_value_type,
+        supported=False,
+        unsupported_reason=(
+            "The returned iterator's container cannot be identified unambiguously."
+        ),
+    )
+
+
 def _parse_candidate(
     candidate: re.Match[str],
     masked_source: str,
@@ -973,6 +1448,10 @@ def _parse_candidate(
                 f"Scalar pointer arithmetic is unsupported for "
                 f"{parameter.name}.",
             )
+    if return_value_type.kind == "iterator":
+        return_value_type = _resolve_iterator_return_backing(
+            return_value_type, parameters
+        )
     return (
         FunctionSignature(
             name=candidate.group("name"),

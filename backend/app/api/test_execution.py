@@ -48,7 +48,24 @@ async def analyze_source_mode(
             vector_depth=value_type.vector_depth,
             passing=value_type.passing,
             size_parameter_name=value_type.size_parameter_name,
+            container_family=value_type.container_family,
+            container_name=value_type.container_name,
+            key_type=value_type.key_type,
+            mapped_type=value_type.mapped_type,
+            fixed_size=value_type.fixed_size,
+            nested_depth=value_type.nested_depth,
+            ordered=value_type.ordered,
+            associative=value_type.associative,
+            unordered=value_type.unordered,
+            adapter=value_type.adapter,
+            supported=getattr(value_type, "supported", True),
+            unsupported_reason=getattr(value_type, "unsupported_reason", None),
+            iterator_container=getattr(value_type, "iterator_container", None),
+            iterator_const=getattr(value_type, "iterator_const", None),
+            iterator_role=getattr(value_type, "iterator_role", None),
+            iterator_group_index=getattr(value_type, "iterator_group_index", None),
         )
+
 
     available_modes = (
         [analysis.mode] if analysis.mode != "unsupported" else []

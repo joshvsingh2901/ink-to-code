@@ -1,11 +1,15 @@
 
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
 .env.*
+!.env.example
 node_modules/
 .next/
 .DS_Store
-
 .venv/
 backend/.venv/
+.claude/settings.local.json
+AGENTS.md
+CLAUDE.md

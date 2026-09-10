@@ -114,10 +114,10 @@ def run(command, *, timeout, stdin="", environment=None, output_limit=65536):
         )
 
 
-def compile_program(output, sanitized=True, timeout=10):
+def compile_program(output, sanitized=True, timeout=10, source="main.cpp"):
     command = ["clang++" if sanitized else "g++"]
     command += SANITIZER_FLAGS if sanitized else ["-std=c++17", "-O0", "-g"]
-    command += ["main.cpp", "-o", output]
+    command += [source, "-o", output]
     return run(command, timeout=timeout)
 
 
@@ -271,11 +271,21 @@ def capability_probe():
         )
         return
 
-    (WORK / "main.cpp").write_text(
+    # Write the probe program to its own file rather than overwriting
+    # /work/main.cpp. The host seeds main.cpp and runner-request.json mode
+    # 0644 owned by the API's user; on native Linux bind mounts that makes
+    # them read-only to this container's UID 10001, so an in-place rewrite
+    # fails with EACCES. Creating a new entry only needs write permission on
+    # the work directory, which the host grants. Host-seeded inputs stay
+    # immutable to the sandbox in every mode.
+    probe_source = "probe.cpp"
+    (WORK / probe_source).write_text(
         "int main(){ volatile int* p = new int(7); (void)p; return 0; }",
         encoding="utf-8",
     )
-    compiled, _, _ = compile_program("probe", sanitized=True)
+    compiled, _, _ = compile_program(
+        "probe", sanitized=True, source=probe_source
+    )
     sanitizer_available = compiled.returncode == 0
     leak_available = False
     if sanitizer_available:
@@ -292,7 +302,9 @@ def capability_probe():
         )
     valgrind_available = False
     if valgrind:
-        plain, _, _ = compile_program("probe-plain", sanitized=False)
+        plain, _, _ = compile_program(
+            "probe-plain", sanitized=False, source=probe_source
+        )
         if plain.returncode == 0:
             checked, _, _ = run(
                 ["valgrind", *VALGRIND_FLAGS, str(WORK / "probe-plain")],

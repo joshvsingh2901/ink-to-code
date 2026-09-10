@@ -1,14 +1,21 @@
 """Real Docker-backed regression checks for the untrusted C++ boundary."""
 
+import json
 import os
 import shutil
+import uuid
 from pathlib import Path
 
 import pytest
 
 from app.schemas.test_execution import ProgramTestCase
 from app.services.compiler import CompilerServiceError, compile_cpp
-from app.services.execution_providers import DockerExecutionProvider
+from app.services.execution_providers import (
+    _CAPABILITY_PROBE_TIMEOUT_SECONDS,
+    DockerExecutionProvider,
+    _docker_base_command,
+    _run_docker_command,
+)
 from app.services.test_execution import run_cpp_tests
 
 
@@ -193,3 +200,59 @@ def test_real_compile_failure_preserves_compiler_diagnostic():
     assert result.success is False
     assert "missing_name" in (result.compile_error or "")
     assert result.tests == []
+
+
+def test_runner_never_needs_to_write_host_seeded_workspace_inputs(
+    tmp_path: Path,
+):
+    """The runner must treat host-seeded workspace inputs as read-only.
+
+    The API seeds main.cpp and runner-request.json as its own user, then
+    mounts the directory into a container running as UID 10001. On native
+    Linux bind mounts those files are therefore not writable by the
+    container, and any in-place rewrite fails with EACCES. Docker Desktop
+    hides this by presenting bind-mounted files as owned by the accessing
+    user, which is why it only reproduced on Linux CI.
+
+    Mode 0444 reproduces the same constraint on both platforms, so this
+    regression is caught locally as well as in CI.
+    """
+    _docker_ready()
+    original_source = "int main() { return 0; }\n"
+    work = tmp_path / "workspace"
+    work.mkdir()
+    (work / "main.cpp").write_text(original_source, encoding="utf-8")
+    (work / "runner-request.json").write_text(
+        json.dumps({"mode": "capability_probe"}), encoding="utf-8"
+    )
+    (work / "main.cpp").chmod(0o444)
+    (work / "runner-request.json").chmod(0o444)
+    work.chmod(0o777)
+
+    container_name = f"inktocode-ownership-{uuid.uuid4().hex}"
+    provider = DockerExecutionProvider()
+    completed = _run_docker_command(
+        _docker_base_command(work, container_name, provider.settings),
+        container_name,
+        timeout_seconds=_CAPABILITY_PROBE_TIMEOUT_SECONDS,
+    )
+
+    assert completed is not None, "probe container did not complete"
+    result_path = work / "runner-result.json"
+    stderr = (
+        completed.stderr.decode("utf-8", errors="replace")
+        if completed.stderr
+        else ""
+    )
+    assert result_path.is_file(), (
+        "runner wrote no result with read-only host-seeded inputs; "
+        f"exit={completed.returncode} stderr={stderr[-2000:]}"
+    )
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload.get("compiler_available") is True
+    assert payload.get("address_sanitizer_available") is True
+
+    # The sandbox must not have modified the host's seeded source.
+    assert (
+        work / "main.cpp"
+    ).read_text(encoding="utf-8") == original_source

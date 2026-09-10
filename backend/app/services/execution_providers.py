@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import subprocess
 import tempfile
@@ -11,6 +12,8 @@ from typing import Literal, Protocol
 from app.config import Settings, get_settings
 
 
+logger = logging.getLogger(__name__)
+
 ProviderName = Literal["docker"]
 MemoryTool = Literal[
     "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
@@ -18,6 +21,15 @@ MemoryTool = Literal[
 _SAFE_IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,199}")
 _SAFE_RESOURCE = re.compile(r"[A-Za-z0-9.]+")
 _OUTPUT_LIMIT = 64 * 1024
+# The probe runs two compiles (one linking the ASan/UBSan runtime) plus a
+# Valgrind pass on a trivial program. Measured local wall time is ~1-2s, but
+# shared/throttled CI runners need more headroom than a single fixed compile
+# or run timeout would give; this is a one-time, lru_cache'd check, not a
+# per-request limit, so a generous bound here costs nothing in the hot path.
+# Real per-request compile/run timeouts remain governed by
+# Settings.cpp_docker_compile_timeout_seconds /
+# cpp_docker_run_timeout_seconds and are unaffected by this constant.
+_CAPABILITY_PROBE_TIMEOUT_SECONDS = 90
 
 
 @dataclass(frozen=True)
@@ -502,13 +514,39 @@ def docker_capabilities(
         (work / "runner-request.json").chmod(0o644)
         work.chmod(0o777)
         container_name = f"inktocode-probe-{uuid.uuid4().hex}"
+        probe_command = _docker_base_command(work, container_name, settings)
         completed = _run_docker_command(
-            _docker_base_command(work, container_name, settings),
+            probe_command,
             container_name,
-            timeout_seconds=30,
+            timeout_seconds=_CAPABILITY_PROBE_TIMEOUT_SECONDS,
         )
         result_path = work / "runner-result.json"
-        if completed is None or not result_path.is_file():
+        if completed is None or not _is_regular_result_file(result_path):
+            # Diagnostic only: never surfaced to end users. The public
+            # `unavailable_reason` below stays a fixed, generic string —
+            # the same one `select_memory_provider()` forwards verbatim
+            # into RunTestsResponse.memory_summary for real users, so it
+            # must never carry raw stderr or host detail. This log line is
+            # for operators/CI only; it does not run any user-submitted
+            # source, only the probe's own fixed trivial program.
+            if completed is None:
+                logger.warning(
+                    "C++ memory runner capability probe: docker run did "
+                    "not complete within %ss (command=%r).",
+                    _CAPABILITY_PROBE_TIMEOUT_SECONDS,
+                    probe_command,
+                )
+            else:
+                stderr_tail = completed.stderr[-2000:].decode(
+                    "utf-8", errors="replace"
+                )
+                logger.warning(
+                    "C++ memory runner capability probe: container exited "
+                    "%s with no result file (command=%r). stderr tail: %s",
+                    completed.returncode,
+                    probe_command,
+                    stderr_tail,
+                )
             return ProviderCapabilities(
                 "docker", True, True, False, False, False, False, False,
                 "The C++ memory runner capability probe failed.",

@@ -1,9 +1,11 @@
 """Schemas for AI test generation, validation, and results."""
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.config import get_settings
 from app.schemas.test_execution import (
+    BoundedTestValue,
     ExceptionType,
     FunctionCombinedTestResult,
     FunctionTestCase,
@@ -11,6 +13,9 @@ from app.schemas.test_execution import (
     ObjectScenarioTestResult,
     TemplateArgumentInput,
 )
+
+# Evaluated once at import time (Field constraints are static).
+_MAX_SOURCE_CHARS = get_settings().max_source_chars
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +98,7 @@ class AiModelFunctionTest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     category: AiCoverageCategory
     reason: str = Field(min_length=1, max_length=200)
-    arguments: list[str] = Field(max_length=20)
+    arguments: list[BoundedTestValue] = Field(max_length=20)
     expected_outcome: Literal["return_value", "return_void", "throws"]
     expected_return: str | None = Field(default=None, max_length=1000)
     expected_stdout: str | None = Field(default=None, max_length=2000)
@@ -127,7 +132,7 @@ class AiModelScenarioObject(BaseModel):
     model_config = _STRICT
     name: str = Field(min_length=1, max_length=50)
     constructor_id: str
-    arguments: list[str] = Field(max_length=20)
+    arguments: list[BoundedTestValue] = Field(max_length=20)
     expected_outcome: Literal["return_void", "throws"] = "return_void"
     expected_exception_type: ExceptionType | None = None
 
@@ -146,7 +151,9 @@ class AiModelScenarioStep(BaseModel):
     step_type: Literal["method", "observer"]
     target_object_name: str
     method_id: str
-    arguments: list[str] = Field(default_factory=list, max_length=20)
+    arguments: list[BoundedTestValue] = Field(
+        default_factory=list, max_length=20
+    )
     expected_outcome: Literal["return_value", "return_void", "throws"]
     expected_return: str | None = Field(default=None, max_length=1000)
     check_stdout: bool = False
@@ -259,7 +266,7 @@ class AiTestRunResponse(BaseModel):
 
 
 class AiTestRunRequest(BaseModel):
-    code: str = Field(min_length=1, max_length=1_000_000)
+    code: str = Field(min_length=1, max_length=_MAX_SOURCE_CHARS)
     language: Literal["cpp"]
     question_text: str = Field(min_length=1, max_length=8000)
     target_kind: Literal["function", "object"]
@@ -271,7 +278,7 @@ class AiTestRunRequest(BaseModel):
 
 
 class AiTestRerunRequest(BaseModel):
-    code: str = Field(min_length=1, max_length=1_000_000)
+    code: str = Field(min_length=1, max_length=_MAX_SOURCE_CHARS)
     language: Literal["cpp"]
     target_kind: Literal["function", "object"]
     target_id: str = Field(min_length=1, max_length=300)

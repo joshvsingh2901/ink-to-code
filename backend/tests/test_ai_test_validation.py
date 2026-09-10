@@ -34,6 +34,15 @@ ITERATOR_SOURCE = (
     "int sumRange(std::vector<int>::iterator first, "
     "std::vector<int>::iterator last) { return 0; }"
 )
+MUTABLE_VECTOR_REF_SOURCE = (
+    "void removeNegatives(std::vector<int>& values) {}"
+)
+CONST_VECTOR_REF_SOURCE = (
+    "int sumEven(const std::vector<int>& values) { return 0; }"
+)
+DEQUE_REF_SOURCE = (
+    "int sumDeque(const std::deque<int>& values) { return 0; }"
+)
 OBJECT_SOURCE = """
 class Counter {
 public:
@@ -166,6 +175,98 @@ def test_iterator_head_and_tail_payloads_normalize():
     # Raw JSON strings stored as-is for re-parsing by test_execution.py.
     assert result.test_case.arguments[0] == head_raw
     assert result.test_case.arguments[1] == tail_raw
+
+
+@pytest.mark.parametrize(
+    ("source", "fn_name", "raw_argument", "outcome_kwargs"),
+    [
+        (
+            MUTABLE_VECTOR_REF_SOURCE,
+            "removeNegatives",
+            "[1, -2, 0, 4]",
+            {
+                "expected_outcome": "return_void",
+                "expected_mutations": [
+                    {"parameter_name": "values", "expected_final_value": "[1, 0, 4]"}
+                ],
+            },
+        ),
+        (
+            CONST_VECTOR_REF_SOURCE,
+            "sumEven",
+            "[1, 2, 3, 4]",
+            {"expected_outcome": "return_value", "expected_return": "6"},
+        ),
+        (
+            CONTAINER_SOURCE,
+            "sumVec",
+            "[1, 2, 3]",
+            {"expected_outcome": "return_value", "expected_return": "6"},
+        ),
+        (
+            DEQUE_REF_SOURCE,
+            "sumDeque",
+            "[1, 2, 3]",
+            {"expected_outcome": "return_value", "expected_return": "6"},
+        ),
+    ],
+)
+def test_container_argument_stored_raw_not_converted_to_cpp_expression(
+    source: str,
+    fn_name: str,
+    raw_argument: str,
+    outcome_kwargs: dict,
+):
+    """SIGNATURE regression lock: validation must not pre-apply the raw->C++
+    conversion that run_test_request performs later, or execution rejects the
+    already-converted expression as 'not data values'."""
+    target_id = _fn_id(source, fn_name)
+    cap = assess_ai_capability(source, "function", target_id)
+    sig = _fn_sig(source, fn_name)
+
+    ai_test = AiModelFunctionTest(
+        name="t1",
+        category="normal",
+        reason="raw literal must round-trip unchanged",
+        arguments=[raw_argument],
+        **outcome_kwargs,
+    )
+    result = validate_function_test(ai_test, cap, sig)
+
+    assert isinstance(result, ValidatedAiTest)
+    assert result.test_case.arguments[0] == raw_argument
+    assert "std::" not in result.test_case.arguments[0]
+
+
+def test_invalid_container_argument_is_still_rejected():
+    # The raw-storage fix must not weaken validation — an invalid literal
+    # (a brace expression, not a data value) must still be rejected.
+    target_id = _fn_id(CONTAINER_SOURCE, "sumVec")
+    cap = assess_ai_capability(CONTAINER_SOURCE, "function", target_id)
+    sig = _fn_sig(CONTAINER_SOURCE, "sumVec")
+
+    ai_test = AiModelFunctionTest(
+        name="bad",
+        category="normal",
+        reason="malformed literal",
+        arguments=["{1, 2, 3}"],
+        expected_outcome="return_value",
+        expected_return="6",
+    )
+    result = validate_function_test(ai_test, cap, sig)
+
+    assert not isinstance(result, ValidatedAiTest)
+
+
+def test_invalid_scalar_argument_is_still_rejected():
+    target_id = _fn_id(SCALAR_SOURCE, "add")
+    cap = assess_ai_capability(SCALAR_SOURCE, "function", target_id)
+    sig = _fn_sig(SCALAR_SOURCE, "add")
+
+    ai_test = _make_test(arguments=["not-a-number", "2"], expected_return="2")
+    result = validate_function_test(ai_test, cap, sig)
+
+    assert not isinstance(result, ValidatedAiTest)
 
 
 # ---------------------------------------------------------------------------

@@ -13,3 +13,6 @@ backend/.venv/
 .claude/settings.local.json
 AGENTS.md
 CLAUDE.md
+.browser-*.mjs
+.playwright-mcp/
+.impeccable/

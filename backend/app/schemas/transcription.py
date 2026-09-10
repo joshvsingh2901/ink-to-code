@@ -15,6 +15,18 @@ class PageMetadata(BaseModel):
     original_filename: str = Field(min_length=1, max_length=500)
     original_pdf_page_number: StrictInt | None = Field(default=None, ge=1)
 
+    @field_validator("file_id", "original_filename")
+    @classmethod
+    def filename_must_be_display_only(cls, value: str) -> str:
+        if (
+            value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("Filenames must not contain paths or control characters")
+        return value
+
     @model_validator(mode="after")
     def validate_pdf_page_number(self) -> "PageMetadata":
         if self.source_type == "pdf" and self.original_pdf_page_number is None:
@@ -68,3 +80,4 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+    request_id: str | None = None

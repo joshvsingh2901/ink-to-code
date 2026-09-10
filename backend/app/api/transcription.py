@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
+from app.middleware.request_context import current_request_id
 from app.schemas.transcription import (
     ErrorBody,
     ErrorResponse,
@@ -17,14 +18,21 @@ from app.services.transcription import (
     transcribe_pages,
     transcribe_question_pages,
 )
+from app.services.resource_limits import ResourceBusyError, gemini_slot
 from app.services.uploads import UploadValidationError, validate_and_normalize_pages
 
 router = APIRouter(prefix="/api", tags=["transcription"])
 
 
 def error_response(code: str, message: str, status_code: int) -> JSONResponse:
-    body = ErrorResponse(error=ErrorBody(code=code, message=message))
-    return JSONResponse(status_code=status_code, content=body.model_dump())
+    body = ErrorResponse(
+        error=ErrorBody(code=code, message=message),
+        request_id=current_request_id(),
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content=body.model_dump(exclude_none=True),
+    )
 
 
 @router.post(
@@ -53,6 +61,7 @@ async def transcribe(
         if question_files or question_metadata is not None:
             if question_metadata is None:
                 raise UploadValidationError(
+                    "invalid_upload_metadata",
                     "Question metadata is required when question pages are supplied."
                 )
             normalized_question_pages = await validate_and_normalize_pages(
@@ -65,11 +74,16 @@ async def transcribe(
         else:
             normalized_question_pages = []
 
-        return await run_in_threadpool(
-            transcribe_pages, code_pages, normalized_question_pages, settings
-        )
+        async with gemini_slot():
+            return await run_in_threadpool(
+                transcribe_pages, code_pages, normalized_question_pages, settings
+            )
+    except ResourceBusyError as error:
+        response = error_response(error.code, error.message, 503)
+        response.headers["Retry-After"] = str(error.retry_after)
+        return response
     except UploadValidationError as error:
-        return error_response("upload_validation_failed", str(error), 400)
+        return error_response(error.code, error.message, 400)
     except TranscriptionServiceError as error:
         log_transcription_error(error, settings)
         return error_response(error.code, error.message, error.status_code)
@@ -93,15 +107,20 @@ async def transcribe_question(
             minimum=1,
             maximum=5,
         )
-        question_text = await run_in_threadpool(
-            transcribe_question_pages, normalized_pages, settings
-        )
+        async with gemini_slot():
+            question_text = await run_in_threadpool(
+                transcribe_question_pages, normalized_pages, settings
+            )
         return QuestionTextResponse(
             question_text=question_text,
             model=settings.test_generation_model,
         )
+    except ResourceBusyError as error:
+        response = error_response(error.code, error.message, 503)
+        response.headers["Retry-After"] = str(error.retry_after)
+        return response
     except UploadValidationError as error:
-        return error_response("upload_validation_failed", str(error), 400)
+        return error_response(error.code, error.message, 400)
     except TranscriptionServiceError as error:
         log_transcription_error(error, settings)
         return error_response(error.code, error.message, error.status_code)

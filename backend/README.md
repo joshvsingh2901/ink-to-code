@@ -31,7 +31,70 @@ uvicorn app.main:app --reload --port 8000 --env-file .env
 - Health: [http://localhost:8000/health](http://localhost:8000/health)
 - API documentation: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-`FRONTEND_ORIGIN` defaults to `http://localhost:3000` and is the only browser origin allowed by CORS unless explicitly changed.
+`FRONTEND_ORIGINS` is a comma-separated allowlist and defaults to
+`http://localhost:3000` in development. Production startup requires an
+explicit `FRONTEND_ORIGINS` (or legacy `FRONTEND_ORIGIN`) value. Wildcards,
+paths, embedded credentials, and non-HTTP(S) origins are rejected. The
+anonymous API does not permit credentialed CORS.
+
+## Web and API security
+
+Every HTTP response receives a server-generated `X-Request-ID`. Safe
+structured error responses include the same ID where useful, and the frontend
+may show it as a support reference for unexpected failures. Incoming request
+IDs are ignored. Minimal lifecycle logs record only request ID, method, path,
+status, and duration; request bodies, source code, questions, uploads, cookies,
+authorization values, and provider messages are not included.
+
+Unexpected exceptions return a neutral structured `500` response. Product
+diagnostics such as compiler output, validation messages, unsupported-source
+reasons, and rate/resource errors remain available. API responses include
+nosniff, referrer, permissions, and frame protections. The Next.js frontend
+adds its own compatible CSP, including `blob:` workers for Monaco/PDF.js.
+
+Set `ENABLE_HSTS=true` only when the service is deployed as production HTTPS.
+It is ignored outside `ENVIRONMENT=production`; TLS termination should also
+enforce HSTS at the deployment edge. FastAPI debug mode is disabled. `/docs`
+and `/openapi.json` intentionally remain public for this portfolio API.
+See `../WEB_API_SECURITY_PLAN.md` for the exact policies and residual risks.
+
+## Resource protection
+
+Phase 2 admission controls protect expensive API paths without changing the
+isolated Docker execution boundary. Defaults are configurable in `.env`:
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `MAX_SOURCE_CHARS` | `100000` | Maximum C++ source length on compile, analysis, and test requests |
+| `MAX_TEST_VALUE_CHARS` | `2000` | Maximum individual nested argument/operand value |
+| `MAX_REQUEST_BYTES` | `12582912` | ASGI request-body limit, including streamed and multipart bodies |
+| `RATE_LIMIT_ENABLED` | `true` | Enables expensive-route fixed-window limiting |
+| `RATE_LIMIT_AI_PER_WINDOW` | `10` | AI-heavy requests per client window |
+| `RATE_LIMIT_AI_WINDOW_SECONDS` | `300` | AI per-client window duration |
+| `RATE_LIMIT_COMPILE_PER_MINUTE` | `60` | Compile, test, rerun, and analysis requests per client/minute |
+| `RATE_LIMIT_GLOBAL_AI_PER_MINUTE` | `30` | All-client AI backstop/minute |
+| `TRUSTED_PROXY_COUNT` | `0` | Trusted proxy hops used for client identity |
+| `CPP_MAX_CONCURRENT_JOBS` | `2` | Concurrent Docker/compiler request chains |
+| `AI_MAX_CONCURRENT_CALLS` | `2` | Concurrent Gemini request chains |
+| `CPP_ACQUIRE_TIMEOUT_SECONDS` | `10` | Maximum wait for compiler capacity |
+| `AI_ACQUIRE_TIMEOUT_SECONDS` | `20` | Maximum wait for AI capacity |
+
+With the safe default `TRUSTED_PROXY_COUNT=0`, client identity comes only from
+the direct connection and `X-Forwarded-For` is ignored. Behind a known proxy
+chain, set the exact trusted hop count; the limiter selects from the right side
+of the chain so attacker-prepended values cannot forge an identity. IPv6
+clients are grouped by `/64`. A wrong proxy count can weaken rate limiting.
+
+These rate and concurrency controls are process-local. Multiple Uvicorn
+workers or multiple replicas multiply effective limits by N. Before scaling
+beyond one API process, add shared rate-limit coordination and distributed
+work admission (for example, Redis or a dedicated job runner). No shared
+coordination dependency is used in the current single-process deployment.
+
+Rate limiting covers only expensive `POST /api/*` routes. Request bodies are
+bounded before parsing; compiler and AI capacity waits are bounded and return
+neutral `503` busy responses. The shared AnyIO threadpool limit is intentionally
+unchanged so cheap work is not throttled.
 
 ## Transcription request
 
@@ -44,7 +107,16 @@ uvicorn app.main:app --reload --port 8000 --env-file .env
 
 Each metadata object contains `file_id`, contiguous 1-based `order`, `category`, `source_type`, `original_filename`, and optional `original_pdf_page_number`. The uploaded multipart filename must equal `file_id`. PDF uploads are rendered in the browser and sent as ordered page images; original PDFs are never sent to this endpoint.
 
-Images are limited to 10 MB each and 50 MB per category. The API validates and explicitly sorts metadata order before calling Gemini. Each validated page is sent as an in-memory PNG or JPEG byte part in the exact selected order. Programming-question pages are appended as a clearly separated context section. Confidence values are model-estimated review aids, not calibrated probabilities.
+Images are limited to 10 MB each and 50 MB per category. In addition to the
+declared MIME check, the API checks PNG/JPEG signatures, fully decodes each
+image once with Pillow, and rejects malformed, multi-frame, decompression-bomb,
+or excessive-dimension content. Multipart identifiers and display filenames
+must be path-free; neither is used to create a filesystem path. The API
+validates and explicitly sorts metadata order before calling Gemini. Each
+validated page is sent as an in-memory PNG or JPEG byte part in the exact
+selected order. Programming-question pages are appended as a clearly separated
+context section. Confidence values are model-estimated review aids, not
+calibrated probabilities.
 
 ## Local C++ test execution
 
@@ -223,15 +295,14 @@ token sequences. Leading and trailing whitespace, repeated spaces, tabs, and
 line-break differences are ignored; token text, punctuation, capitalization,
 and order must still match exactly.
 
-This local subprocess isolation is for development only. It is not a
-production-grade sandbox; container or equivalent isolation is required before
-running arbitrary code for real users.
+All submitted C++ compilation and execution must use the isolated runner below.
+Do not add host compiler or user-binary subprocess calls to FastAPI services.
 
-### Isolated Linux memory runner
+### Required isolated Linux C++ runner
 
-Memory diagnostics prefer the dedicated Linux runner when
-`CPP_EXECUTION_PROVIDER=auto` and Docker is available. Install Docker Desktop,
-then build the fixed local image from the repository root:
+Normal Compile, manual tests, AI-generated tests, Rerun Same Tests, object
+scenarios, and memory diagnostics use the dedicated Linux runner. Install
+Docker Desktop, then build the fixed local image from the repository root:
 
 Runtime output is normalized into bounded, tool-independent findings before it
 is classified. The API retains the existing memory status fields and adds up
@@ -254,7 +325,7 @@ docker build -t inktocode-cpp-runner ./runner
 Configure `backend/.env`:
 
 ```dotenv
-CPP_EXECUTION_PROVIDER=auto
+CPP_EXECUTION_PROVIDER=docker
 CPP_RUNNER_IMAGE=inktocode-cpp-runner
 CPP_RUNNER_MEMORY=256m
 CPP_RUNNER_CPUS=1.0
@@ -299,11 +370,11 @@ After changing `runner/Dockerfile` or `runner/runner.py`, rebuild explicitly:
 docker build --no-cache -t inktocode-cpp-runner ./runner
 ```
 
-In `auto` mode, unavailable Docker falls back to the honest host capability
-result. In `docker` mode, an unavailable daemon or missing image produces an
-infrastructure-unavailable response and never falls back. Runner containers
-have no network, run as a non-root user, mount only one generated temporary
-directory, and use fixed CPU, memory, process, filesystem, and timeout limits.
+An unavailable Docker daemon or missing image produces an infrastructure error
+and never falls back to host execution. Runner containers have no network, run
+as a non-root user, mount only one generated temporary directory, and use fixed
+CPU, memory, process, filesystem, file-size, output, and timeout limits. See
+`../EXECUTION_SECURITY_PLAN.md` for the execution map and residual risks.
 
 This local Docker runner is a development-stage isolation improvement, not a
 complete production arbitrary-code execution platform. Public deployment

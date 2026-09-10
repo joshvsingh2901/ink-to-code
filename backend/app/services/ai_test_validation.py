@@ -86,9 +86,11 @@ def _validate_argument(
     if vt.kind == "iterator":
         return _validate_iterator_arg(param, raw, head_payloads)
     if vt.kind in {"vector", "array", "container"}:
-        return _container_literal(vt, raw, label)
+        _container_literal(vt, raw, label)  # raises on invalid input
+        return raw  # store raw; test_execution.py converts to C++ later
     if vt.scalar_type is not None:
-        return _safe_literal(vt.scalar_type, raw, label)
+        _safe_literal(vt.scalar_type, raw, label)  # raises on invalid input
+        return raw  # store raw; test_execution.py converts to C++ later
     raise ValueError(f"{label} has an unsupported value type.")
 
 

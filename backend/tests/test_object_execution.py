@@ -152,6 +152,99 @@ def test_test_mode_endpoint_exposes_object_target():
     )
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle-only capability (AI_CAPABILITY_REPAIR_PLAN.md Path B)
+# ---------------------------------------------------------------------------
+
+BUFFER_LIFECYCLE_ONLY_SOURCE = """
+#include <algorithm>
+class Buffer {
+    int* data;
+    int size;
+public:
+    Buffer(int n) : data(new int[n]{}), size(n) {}
+    ~Buffer() { delete[] data; }
+    Buffer(const Buffer& other) : data(new int[other.size]), size(other.size) {
+        std::copy(other.data, other.data + size, data);
+    }
+    Buffer& operator=(const Buffer& other) {
+        if (this != &other) {
+            int* replacement = new int[other.size];
+            std::copy(other.data, other.data + other.size, replacement);
+            delete[] data;
+            data = replacement;
+            size = other.size;
+        }
+        return *this;
+    }
+};
+"""
+
+BUFFER_WITH_OBSERVER_SOURCE = BUFFER_LIFECYCLE_ONLY_SOURCE.replace(
+    "    Buffer& operator=",
+    "    int getSize() const { return size; }\n    Buffer& operator=",
+)
+
+
+def test_counter_remains_fully_supported():
+    """Acceptance H: Counter is unaffected by the lifecycle-only capability change."""
+    analysis = analyze_object_scenarios(COUNTER_SOURCE)
+
+    assert len(analysis.classes) == 1
+    assert analysis.message is None
+    object_class = analysis.classes[0]
+    assert [m.id for m in object_class.methods] == [
+        "Counter::increment()->void",
+        "Counter::getValue() const->int",
+    ]
+
+
+def test_lifecycle_only_buffer_is_unsupported_with_specific_reason():
+    """Acceptance I: lifecycle-only Buffer is explicitly unsupported (Path B)."""
+    analysis = analyze_object_scenarios(BUFFER_LIFECYCLE_ONLY_SOURCE)
+
+    assert len(analysis.classes) == 0
+    assert analysis.message is not None
+    assert "Buffer" in analysis.message
+    assert "lifecycle" in analysis.message.lower()
+    assert "observer" in analysis.message.lower() or "instance method" in analysis.message.lower()
+    # Must not imply Big Five/memory diagnostics are unsupported in general.
+    assert "memory diagnostic" not in analysis.message.lower()
+    assert "big five" not in analysis.message.lower()
+
+
+def test_lifecycle_only_buffer_api_response_is_specific_not_generic():
+    response = asyncio.run(
+        api_request(
+            "/api/test-mode",
+            {"code": BUFFER_LIFECYCLE_ONLY_SOURCE, "language": "cpp"},
+        )
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "unsupported"
+    assert payload["classes"] == []
+    assert "No supported top-level function" not in (payload["message"] or "")
+    assert "Buffer" in (payload["message"] or "")
+
+
+def test_buffer_with_observer_becomes_supported_with_big_five_discoverable():
+    """Acceptance J: one ordinary method flips Buffer to fully supported, with
+    all three Big Five special members discovered."""
+    analysis = analyze_object_scenarios(BUFFER_WITH_OBSERVER_SOURCE)
+
+    assert len(analysis.classes) == 1
+    assert analysis.message is None
+    object_class = analysis.classes[0]
+    assert [m.id for m in object_class.methods] == ["Buffer::getSize() const->int"]
+    assert {sm.kind for sm in object_class.special_members} == {
+        "destructor",
+        "copy_constructor",
+        "copy_assignment",
+    }
+
+
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
 def test_ordered_stateful_scenario_passes():
     result = run_test_request(

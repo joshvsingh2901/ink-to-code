@@ -35,6 +35,7 @@ from app.schemas.test_execution import (
     ObjectScenarioRunTestsRequest,
     ObjectScenarioTestCase,
     ObjectScenarioTestResult,
+    RunTestsResponse,
 )
 from app.services.ai_test_capability import AiCapabilityResult, assess_ai_capability
 from app.services.ai_test_generation import (
@@ -219,6 +220,19 @@ def _unsupported_response(cap: AiCapabilityResult) -> AiTestRunResponse:
     )
 
 
+def _input_error_response(
+    exec_response: RunTestsResponse,
+    stored_tests: list[AiStoredTest],
+    skipped_topics: list[str] | None = None,
+) -> AiTestRunResponse:
+    return AiTestRunResponse(
+        status="no_useful_tests",
+        message=exec_response.input_error,
+        stored_tests=stored_tests,
+        skipped_topics=skipped_topics or [],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Repair policy helpers
 # ---------------------------------------------------------------------------
@@ -351,6 +365,8 @@ def _run_function_path(
             message=exec_response.compile_error,
             stored_tests=stored,
         )
+    if exec_response.input_error:
+        return _input_error_response(exec_response, stored, plan.skipped_topics)
 
     rows = _build_function_result_rows(accepted, exec_response.tests, test_ids)
     score = score_results(exec_response.tests)
@@ -461,6 +477,8 @@ def _run_object_path(
             message=exec_response.compile_error,
             stored_tests=stored,
         )
+    if exec_response.input_error:
+        return _input_error_response(exec_response, stored, plan.skipped_topics)
 
     rows = _build_object_result_rows(accepted, exec_response.tests, test_ids)
     score = score_results(exec_response.tests)
@@ -655,6 +673,8 @@ def rerun_ai_tests(
             status="compile_failed",
             message=exec_response.compile_error,
         )
+    if exec_response.input_error:
+        return _input_error_response(exec_response, list(request.tests))
 
     # 5. Build result rows.
     rows: list[AiTestResultRow] = []

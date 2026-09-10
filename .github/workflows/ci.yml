@@ -1,19 +1,119 @@
-name: CI
+name: CI and Security
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  backend:
-    name: Backend
+  backend-fast:
+    name: Backend Fast
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Compile Python sources
+        working-directory: backend
+        run: python -m compileall app
+
+      - name: Run deterministic non-Docker backend checks
+        working-directory: backend
+        run: >-
+          pytest -q
+          tests/test_ai_test_capability.py
+          tests/test_ai_test_generation.py
+          tests/test_ai_test_validation.py
+          tests/test_api.py
+          tests/test_big_five_diagnosis.py
+          tests/test_body_limit.py
+          tests/test_container_analysis.py
+          tests/test_input_file_security.py
+          tests/test_iterator_analysis.py
+          tests/test_memory_diagnostic_pipeline.py
+          tests/test_payload_limits.py
+          tests/test_question_transcription.py
+          tests/test_rate_limiting.py
+          tests/test_resource_limits.py
+          tests/test_transcription.py
+          tests/test_uploads.py
+          tests/test_web_security.py
+
+      - name: Check changed-file whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BASE_SHA^{commit}"; then
+            git diff --check "$BASE_SHA...$HEAD_SHA"
+          else
+            git diff --check
+          fi
+
+  frontend:
+    name: Frontend
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: backend
+        working-directory: frontend
+    env:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      ENABLE_HSTS: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
+
+  execution-security:
+    name: Execution Security
+    runs-on: ubuntu-latest
+    env:
+      INKTOCODE_REQUIRE_DOCKER_TESTS: "1"
+      RATE_LIMIT_ENABLED: "false"
 
     steps:
       - name: Check out repository
@@ -29,40 +129,100 @@ jobs:
             backend/requirements-dev.txt
 
       - name: Install backend dependencies
+        working-directory: backend
         run: python -m pip install -r requirements-dev.txt
 
-      - name: Compile Python sources
-        run: python -m compileall app
+      - name: Build isolated C++ runner
+        run: docker build --tag inktocode-cpp-runner ./runner
 
-      - name: Run backend tests
-        run: pytest
+      - name: Run provider and real isolation tests
+        working-directory: backend
+        run: >-
+          pytest -q -rs
+          tests/test_execution_providers.py
+          tests/test_execution_security.py
 
-  frontend:
-    name: Frontend
+  full-regression:
+    name: Full Regression
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs:
+      - backend-fast
+      - frontend
+      - execution-security
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
+    env:
+      INKTOCODE_REQUIRE_DOCKER_TESTS: "1"
+      RATE_LIMIT_ENABLED: "false"
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Build isolated C++ runner
+        run: docker build --tag inktocode-cpp-runner ./runner
+
+      - name: Run complete backend suite
+        working-directory: backend
+        run: pytest -q -rs
+
+  dependency-security:
+    name: Dependency Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install Python audit tool
+        run: python -m pip install pip-audit==2.10.1
+
+      - name: Audit Python dependencies
+        run: pip-audit -r backend/requirements.txt --progress-spinner=off
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install frontend dependencies
-        run: npm ci
+      - name: Audit npm dependencies at High or Critical severity
+        working-directory: frontend
+        run: npm audit --audit-level=high
 
-      - name: Run frontend tests
-        run: npm test
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
 
-      - name: Lint frontend
-        run: npm run lint
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Build frontend
-        run: npm run build
+      - name: Scan tracked history with Gitleaks
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/repo:ro"
+          ghcr.io/gitleaks/gitleaks:v8.27.0
+          git --config=/repo/.gitleaks.toml --redact --no-banner --no-color /repo

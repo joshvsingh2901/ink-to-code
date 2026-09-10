@@ -1,3 +1,5 @@
+import { apiErrorCode, apiErrorMessage } from "./apiErrors";
+
 export type FunctionParameter = {
   name: string;
   type: string;
@@ -17,6 +19,7 @@ export type FunctionTypeMetadata = {
     | "scalar_pointer"
     | "array_pointer";
   size_parameter_name: string | null;
+  element_const?: boolean;
   // Container-specific fields (null/undefined for non-container kinds)
   container_family?: "sequence" | "associative" | "unordered" | "adapter" | null;
   container_name?: string | null;
@@ -584,8 +587,6 @@ export type RunTestsRequest =
       run_memory_checks?: boolean;
       tests: ObjectScenarioTestInput[];
     };
-
-type ApiError = { error?: { code?: string; message?: string } };
 
 export class RunTestsRequestError extends Error {
   constructor(
@@ -1293,10 +1294,15 @@ async function postJson(path: string, payload: object, signal?: AbortSignal) {
   });
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    const apiError = body as ApiError | null;
     throw new RunTestsRequestError(
-      apiError?.error?.message ?? "The test runner request failed.",
-      apiError?.error?.code ?? null,
+      apiErrorMessage(
+        response.status,
+        body,
+        "The test runner request failed.",
+        "compiler",
+        response.headers.get("X-Request-ID"),
+      ),
+      apiErrorCode(body),
     );
   }
   return body;

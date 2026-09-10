@@ -3,19 +3,18 @@
 import Image from "next/image";
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
 import { useUploads } from "@/components/UploadProvider";
+import { renderPdfPages, type RenderedPdfPage } from "@/lib/pdf";
 import {
-  PdfPreviewError,
-  renderPdfPages,
-  type RenderedPdfPage,
-} from "@/lib/pdf";
-
-const MAX_PAGE_COUNT = 5;
-const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
-const MAX_SECTION_SIZE = 50 * 1024 * 1024;
-const MAX_PDF_SIZE = 50 * 1024 * 1024;
-const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/jpg"];
-const ACCEPTED_FILE_TYPES =
-  ".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,image/jpg,application/pdf";
+  MAX_PAGE_COUNT,
+  MAX_IMAGE_SIZE,
+  MAX_SECTION_SIZE,
+  MAX_PDF_SIZE,
+  ACCEPTED_IMAGE_TYPES,
+  ACCEPTED_FILE_TYPES,
+  isSameFile,
+  isPdfFile,
+  getPdfErrorMessage,
+} from "@/lib/questionUpload";
 
 export type ImagePage = {
   id: string;
@@ -36,25 +35,15 @@ export type UploadState =
 type ImageUploadCardProps = {
   id: string;
   sectionLabel: "code" | "question";
-  title: string;
-  description: string;
-  required?: boolean;
   upload: UploadState;
   onUploadChange: (upload: UploadState) => void;
 };
 
-function isSameFile(first: File, second: File) {
-  return (
-    first.name === second.name &&
-    first.size === second.size &&
-    first.lastModified === second.lastModified
-  );
-}
+const MONO = "var(--font-mono-code), 'JetBrains Mono', monospace";
 
-function isPdfFile(file: File) {
-  return (
-    file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")
-  );
+function formatBytes(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return `${mb >= 10 ? mb.toFixed(0) : mb.toFixed(1)} MB`;
 }
 
 function ReplaceIcon() {
@@ -85,31 +74,97 @@ function TrashIcon() {
   );
 }
 
-function getPdfErrorMessage(error: unknown) {
-  if (!(error instanceof PdfPreviewError)) {
-    return "The PDF cannot be read. Try a different file.";
-  }
+/** The small "scanned document" glyph shown in the empty dropzone. */
+function DocumentIcon({ dragging }: { dragging: boolean }) {
+  const border = dragging ? "#3d4a7a" : "#22262e";
+  const glyph = dragging ? "#8aa8ff" : "#5f6672";
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: 44,
+        height: 54,
+        border: `1px solid ${border}`,
+        borderRadius: 3,
+        background: "#0c0f13",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
+        gap: 5,
+        padding: "0 8px",
+      }}
+    >
+      <div style={{ height: 1, background: "#2a303a" }} />
+      <div style={{ height: 1, background: "#2a303a", width: "78%" }} />
+      <div style={{ height: 1, background: "#2a303a", width: "88%" }} />
+      <div style={{ height: 1, background: "#2a303a", width: "60%" }} />
+      <div
+        style={{
+          position: "absolute",
+          right: -9,
+          bottom: -8,
+          width: 22,
+          height: 22,
+          border: `1px solid ${border}`,
+          borderRadius: 3,
+          background: "#0a0c0f",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: MONO,
+          fontSize: 10,
+          color: glyph,
+        }}
+      >
+        {"{}"}
+      </div>
+    </div>
+  );
+}
 
-  switch (error.code) {
-    case "encrypted":
-      return "This PDF is password-protected or encrypted and cannot be opened safely.";
-    case "empty":
-      return "This PDF contains no pages. Choose a PDF with 1 to 5 pages.";
-    case "too-many-pages":
-      return "This PDF contains more than 5 pages. Choose a PDF with 1 to 5 pages.";
-    case "unsupported-environment":
-      return "PDF preview is not supported in this browser environment.";
-    default:
-      return "The PDF cannot be read. It may be damaged or unsupported.";
-  }
+function IconButton({
+  onClick,
+  disabled,
+  label,
+  tone = "default",
+  children,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  label: string;
+  tone?: "default" | "danger";
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className={tone === "danger" ? "itc-icon-btn itc-icon-btn-danger" : "itc-icon-btn"}
+      style={{
+        display: "inline-flex",
+        height: 30,
+        width: 30,
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: 5,
+        border: "1px solid #22262e",
+        background: "transparent",
+        color: "#8b929d",
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.4 : 1,
+      }}
+    >
+      {children}
+    </button>
+  );
 }
 
 export default function ImageUploadCard({
   id,
   sectionLabel,
-  title,
-  description,
-  required = false,
   upload,
   onUploadChange,
 }: ImageUploadCardProps) {
@@ -385,82 +440,76 @@ export default function ImageUploadCard({
 
   const errorId = `${id}-error`;
   const showAddArea = upload.mode !== "pdf" && pages.length < MAX_PAGE_COUNT;
+  const fileCount = upload.mode === "pdf" ? 1 : pages.length;
 
   return (
-    <section className="min-w-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-lg font-semibold text-slate-950">{title}</h2>
-          <p className="mt-1 text-sm leading-6 text-slate-600">{description}</p>
-        </div>
-        <span
-          className={`shrink-0 rounded-full px-2.5 py-1 text-xs font-semibold ${
-            required ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600"
-          }`}
-        >
-          {required ? "Required" : "Optional"}
-        </span>
-      </div>
-
+    <div className="min-w-0">
       {pages.length > 0 && (
-        <p className="mt-4 text-sm font-semibold text-slate-800">
-          {pages.length} of {MAX_PAGE_COUNT} pages
-        </p>
-      )}
-
-      {upload.mode === "pdf" && (
-        <div className="mt-5 flex min-w-0 items-center justify-between gap-3 rounded-xl bg-slate-50 p-3">
-          <div className="min-w-0">
-            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Source: one PDF
-            </p>
-            <p className="mt-1 truncate text-sm font-medium text-slate-800" title={upload.file.name}>
-              {upload.file.name}
-            </p>
+        <div style={{ border: "1px solid #1b1f26", borderRadius: 8, background: "#0a0c0f", overflow: "hidden" }}>
+          {/* Header */}
+          <div
+            style={{
+              height: 40,
+              borderBottom: "1px solid #16191f",
+              display: "flex",
+              alignItems: "center",
+              padding: "0 14px",
+              gap: 10,
+              fontFamily: MONO,
+              fontSize: 11.5,
+              color: "#8b929d",
+            }}
+          >
+            <span style={{ color: "#dfe3e9" }}>{pages.length > 1 ? "Pages queued" : "File queued"}</span>
+            <span style={{ color: "#2b3038" }}>·</span>
+            <span>
+              {fileCount} {fileCount === 1 ? "file" : "files"} · {pages.length}{" "}
+              {pages.length === 1 ? "page" : "pages"}
+            </span>
+            <div style={{ flex: 1 }} />
+            {pages.length > 1 && <span style={{ color: "#5f6672" }}>drag rows to reorder</span>}
           </div>
-          <div className="flex shrink-0 gap-1.5">
-            <button
-              type="button"
-              onClick={() => pdfReplaceInputRef.current?.click()}
-              disabled={isProcessingPdf}
-              aria-label={`Replace ${accessibleSection} PDF`}
-              title={`Replace ${accessibleSection} PDF`}
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:opacity-40"
-            >
-              <ReplaceIcon />
-            </button>
-            <input
-              ref={pdfReplaceInputRef}
-              type="file"
-              accept=".pdf,application/pdf"
-              onChange={handlePdfReplace}
-              aria-describedby={error ? errorId : undefined}
-              className="sr-only"
-              tabIndex={-1}
-            />
-            <button
-              type="button"
-              onClick={removePdf}
-              disabled={isProcessingPdf}
-              aria-label={`Remove ${accessibleSection} PDF`}
-              title={`Remove ${accessibleSection} PDF`}
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:border-red-200 hover:bg-red-50 hover:text-red-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:opacity-40"
-            >
-              <TrashIcon />
-            </button>
-          </div>
-        </div>
-      )}
 
-      {pages.length > 0 && (
-        <div className="mt-5">
-          <p className="text-sm leading-6 text-slate-600">
-            Pages will be processed in the order shown. Arrange the pages correctly
-            before continuing.
-          </p>
-          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+          {/* PDF source summary + Replace/Remove-whole-PDF */}
+          {upload.mode === "pdf" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderBottom: "1px solid #13161b" }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontFamily: MONO, fontSize: 10.5, letterSpacing: "0.06em", textTransform: "uppercase", color: "#5f6672" }}>
+                  Source · one PDF
+                </div>
+                <div className="truncate" style={{ marginTop: 3, fontSize: 13.5, fontWeight: 500, color: "#e6e8ec" }} title={upload.file.name}>
+                  {upload.file.name}
+                </div>
+              </div>
+              {isProcessingPdf && (
+                <span
+                  aria-hidden="true"
+                  className="animate-spin"
+                  style={{ width: 13, height: 13, flex: "none", border: "1.5px solid #262c35", borderTopColor: "#5b7cfa", borderRadius: "50%" }}
+                />
+              )}
+              <IconButton onClick={() => pdfReplaceInputRef.current?.click()} disabled={isProcessingPdf} label={`Replace ${accessibleSection} PDF`}>
+                <ReplaceIcon />
+              </IconButton>
+              <input
+                ref={pdfReplaceInputRef}
+                type="file"
+                accept=".pdf,application/pdf"
+                onChange={handlePdfReplace}
+                aria-describedby={error ? errorId : undefined}
+                className="sr-only"
+                tabIndex={-1}
+              />
+              <IconButton onClick={removePdf} disabled={isProcessingPdf} label={`Remove ${accessibleSection} PDF`} tone="danger">
+                <TrashIcon />
+              </IconButton>
+            </div>
+          )}
+
+          {/* Per-page rows */}
+          <div>
             {pages.map((page, index) => (
-              <article
+              <div
                 key={page.id}
                 draggable
                 onDragStart={() => setDraggedPageId(page.id)}
@@ -470,101 +519,171 @@ export default function ImageUploadCard({
                   event.dataTransfer.dropEffect = "move";
                 }}
                 onDrop={(event) => handlePageDrop(event, index)}
-                className={`min-w-0 rounded-xl border bg-white p-3 transition ${
-                  draggedPageId === page.id
-                    ? "border-slate-400 opacity-50"
-                    : "border-slate-200"
-                }`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 14,
+                  padding: "10px 14px",
+                  borderBottom: "1px solid #13161b",
+                  opacity: draggedPageId === page.id ? 0.5 : 1,
+                  cursor: "grab",
+                }}
               >
-                <div className="flex items-start justify-between gap-3">
-                  <p className="text-sm font-bold text-slate-900">Page {index + 1}</p>
-                  {page.kind === "image" && (
-                    <div className="flex shrink-0 gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => imageReplaceInputRefs.current[page.id]?.click()}
-                        aria-label={`Replace ${sectionLabel} page ${index + 1}`}
-                        title={`Replace ${sectionLabel} page ${index + 1}`}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
-                      >
-                        <ReplaceIcon />
-                      </button>
-                      <input
-                        ref={(element) => {
-                          imageReplaceInputRefs.current[page.id] = element;
-                        }}
-                        type="file"
-                        accept=".png,.jpg,.jpeg,image/png,image/jpeg"
-                        onChange={(event) => handleImageReplace(event, page.id)}
-                        aria-describedby={error ? errorId : undefined}
-                        className="sr-only"
-                        tabIndex={-1}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => removeImage(page.id)}
-                        aria-label={`Remove ${sectionLabel} page ${index + 1}`}
-                        title={`Remove ${sectionLabel} page ${index + 1}`}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-200 text-slate-500 hover:border-red-200 hover:bg-red-50 hover:text-red-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
-                      >
-                        <TrashIcon />
-                      </button>
-                    </div>
-                  )}
-                </div>
-                <span className="mt-1 block cursor-grab text-xs font-medium text-slate-400" aria-hidden="true">
-                  Drag to reorder
+                <span aria-hidden="true" style={{ fontFamily: MONO, fontSize: 12, color: "#4b525d", width: 14, flex: "none" }}>
+                  ⠿
                 </span>
-                <div className="relative mt-3 aspect-[4/3] overflow-hidden rounded-lg bg-slate-100">
+                <div style={{ position: "relative", width: 38, height: 48, flex: "none", overflow: "hidden", borderRadius: 3, border: "1px solid #22262e", background: "#0d1014" }}>
                   <Image
                     src={page.previewUrl}
                     alt={`${accessibleSection} page ${index + 1} preview`}
                     fill
                     unoptimized
-                    className="object-contain"
+                    className="object-cover"
                   />
                 </div>
-                <p className="mt-3 truncate text-sm font-medium text-slate-700" title={page.kind === "image" ? page.file.name : upload.mode === "pdf" ? upload.file.name : "PDF page"}>
-                  {page.kind === "image"
-                    ? page.file.name
-                    : upload.mode === "pdf"
-                      ? upload.file.name
-                      : "PDF page"}
-                </p>
-              </article>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="truncate" style={{ fontSize: 14, color: "#e6e8ec", fontWeight: 500 }} title={page.kind === "image" ? page.file.name : upload.mode === "pdf" ? upload.file.name : "PDF page"}>
+                    {page.kind === "image"
+                      ? page.file.name
+                      : `PDF page ${index + 1} of ${pages.length}`}
+                  </div>
+                  <div style={{ fontFamily: MONO, fontSize: 11.5, color: "#6f7784", marginTop: 3 }}>
+                    {page.kind === "image" ? formatBytes(page.file.size) : "from " + (upload.mode === "pdf" ? upload.file.name : "PDF")}
+                  </div>
+                </div>
+                {page.kind === "image" && (
+                  <div style={{ display: "flex", flex: "none", gap: 6 }}>
+                    <IconButton onClick={() => imageReplaceInputRefs.current[page.id]?.click()} label={`Replace ${sectionLabel} page ${index + 1}`}>
+                      <ReplaceIcon />
+                    </IconButton>
+                    <input
+                      ref={(element) => {
+                        imageReplaceInputRefs.current[page.id] = element;
+                      }}
+                      type="file"
+                      accept=".png,.jpg,.jpeg,image/png,image/jpeg"
+                      onChange={(event) => handleImageReplace(event, page.id)}
+                      aria-describedby={error ? errorId : undefined}
+                      className="sr-only"
+                      tabIndex={-1}
+                    />
+                    <IconButton onClick={() => removeImage(page.id)} label={`Remove ${sectionLabel} page ${index + 1}`} tone="danger">
+                      <TrashIcon />
+                    </IconButton>
+                  </div>
+                )}
+              </div>
             ))}
           </div>
+
+          {/* Footer: add-more / max-reached, also a drop target so drag/drop
+              still works once pages already exist (design shows this as a
+              plain pill; the whole row still accepts a drop to preserve
+              full drag-and-drop behavior). */}
+          {showAddArea ? (
+            <div
+              onDragOver={handleAddDragOver}
+              onDragLeave={handleAddDragLeave}
+              onDrop={handleAddDrop}
+              style={{
+                padding: "11px 14px",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                background: isAddingFiles ? "#0d1119" : "transparent",
+              }}
+            >
+              <label
+                htmlFor={id}
+                className="itc-add-more-pill"
+                style={{
+                  fontSize: 13.5,
+                  color: "#c3c9d2",
+                  border: "1px solid #22262e",
+                  borderRadius: 5,
+                  padding: "6px 12px",
+                  cursor: isProcessingPdf ? "not-allowed" : "pointer",
+                  opacity: isProcessingPdf ? 0.5 : 1,
+                }}
+              >
+                <span className="sr-only">Add more pages for {accessibleSection}</span>
+                + Add more
+                <input
+                  ref={addInputRef}
+                  id={id}
+                  type="file"
+                  multiple
+                  accept={ACCEPTED_FILE_TYPES}
+                  onChange={handleAddInputChange}
+                  aria-describedby={error ? errorId : undefined}
+                  disabled={isProcessingPdf}
+                  className="sr-only"
+                />
+              </label>
+              <span style={{ fontFamily: MONO, fontSize: 11.5, color: "#5f6672" }}>
+                {Math.max(0, MAX_PAGE_COUNT - pages.length)} of {MAX_PAGE_COUNT} pages remaining
+              </span>
+            </div>
+          ) : upload.mode === "images" ? (
+            <div style={{ padding: "11px 14px", fontFamily: MONO, fontSize: 11.5, color: "#5f6672" }}>
+              Maximum of {MAX_PAGE_COUNT} images reached
+            </div>
+          ) : null}
         </div>
       )}
 
-      {showAddArea ? (
+      {/* Empty / dragging dropzone */}
+      {pages.length === 0 && (
         <div
+          tabIndex={0}
           onDragOver={handleAddDragOver}
           onDragLeave={handleAddDragLeave}
           onDrop={handleAddDrop}
-          className={`relative mt-5 flex min-h-36 flex-col items-center justify-center rounded-xl border-2 border-dashed px-5 py-7 text-center transition-colors ${
-            isAddingFiles ? "border-slate-900 bg-slate-100" : "border-slate-300 bg-slate-50"
-          } ${isProcessingPdf ? "pointer-events-none opacity-60" : "hover:border-slate-400"}`}
+          className="itc-dropzone"
+          style={{
+            position: "relative",
+            border: `1px ${isAddingFiles ? "solid" : "dashed"} ${isAddingFiles ? "#5b7cfa" : "#1e222a"}`,
+            borderRadius: 8,
+            background: isAddingFiles ? "#0d1119" : "#0a0c0f",
+            padding: "52px 32px",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            textAlign: "center",
+            cursor: isProcessingPdf ? "default" : "pointer",
+            outline: "none",
+            opacity: isProcessingPdf ? 0.6 : 1,
+            pointerEvents: isProcessingPdf ? "none" : "auto",
+          }}
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" className="h-8 w-8 text-slate-400">
-            <path
-              d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"
-              stroke="currentColor"
-              strokeWidth="1.75"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          {isProcessingPdf ? (
+            <span
+              aria-hidden="true"
+              className="animate-spin"
+              style={{ width: 22, height: 22, border: "2px solid #262c35", borderTopColor: "#5b7cfa", borderRadius: "50%" }}
             />
-          </svg>
-          <p className="mt-3 font-semibold text-slate-900">
+          ) : (
+            <DocumentIcon dragging={isAddingFiles} />
+          )}
+          <div style={{ marginTop: 22, fontSize: 16, fontWeight: 500, color: "#e6e8ec" }}>
             {isProcessingPdf
               ? "Preparing PDF previews…"
-              : pages.length > 0
-                ? "Add More Images"
-                : "Drop files here, or click to browse"}
-          </p>
-          <p className="mt-1 text-sm text-slate-500">PNG, JPG, JPEG or PDF</p>
-          <label htmlFor={id} className="absolute inset-0 cursor-pointer">
-            <span className="sr-only">Choose images or one PDF for {title.toLowerCase()}</span>
+              : isAddingFiles
+                ? "Drop to add your files"
+                : "Drop your handwritten pages here"}
+          </div>
+          <div style={{ marginTop: 7, fontSize: 14, color: "#8f97a3" }}>
+            {isAddingFiles ? "Release anywhere in this area" : "or click to browse your files"}
+          </div>
+          <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 14, fontFamily: MONO, fontSize: 11.5, color: "#5f6672" }}>
+            <span>PNG · JPG · JPEG · PDF</span>
+            <span style={{ color: "#22262e" }}>|</span>
+            <span>up to {MAX_PAGE_COUNT} pages</span>
+            <span style={{ color: "#22262e" }}>|</span>
+            <span>10 MB per image</span>
+          </div>
+          <label htmlFor={id} style={{ position: "absolute", inset: 0, cursor: isProcessingPdf ? "default" : "pointer" }}>
+            <span className="sr-only">Choose images or one PDF for {accessibleSection}</span>
             <input
               ref={addInputRef}
               id={id}
@@ -578,17 +697,39 @@ export default function ImageUploadCard({
             />
           </label>
         </div>
-      ) : upload.mode === "images" ? (
-        <p className="mt-5 rounded-xl bg-slate-100 px-4 py-3 text-center text-sm font-semibold text-slate-700">
-          Maximum of 5 images reached
-        </p>
-      ) : null}
+      )}
 
       {error && (
-        <p id={errorId} role="alert" className="mt-3 text-sm font-medium text-red-700">
-          {error}
-        </p>
+        <div
+          role="alert"
+          style={{
+            marginTop: 12,
+            border: "1px solid #35242a",
+            borderRadius: 7,
+            background: "#120f11",
+            padding: "13px 14px",
+            display: "flex",
+            gap: 12,
+            alignItems: "flex-start",
+          }}
+        >
+          <span style={{ fontFamily: MONO, fontSize: 12, color: "#e0776b", lineHeight: 1.5 }}>✗</span>
+          <div>
+            <div id={errorId} style={{ fontSize: 13.5, color: "#f0d6d2", lineHeight: 1.55 }}>
+              {error}
+            </div>
+          </div>
+          <div style={{ flex: 1 }} />
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            className="itc-dismiss-btn"
+            style={{ fontSize: 13.5, color: "#c9a9a2", border: "1px solid #35242a", borderRadius: 5, padding: "4px 10px", cursor: "pointer", background: "transparent" }}
+          >
+            Dismiss
+          </button>
+        </div>
       )}
-    </section>
+    </div>
   );
 }

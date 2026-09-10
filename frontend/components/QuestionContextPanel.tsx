@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import type { UploadState } from "@/components/ImageUploadCard";
 import type { QuestionExtractionState } from "@/components/UploadProvider";
+import QuestionImageAttach from "@/components/QuestionImageAttach";
 import { buildQuestionFormData } from "@/lib/transcription";
 import { transcribeQuestion } from "@/lib/aiTests";
 import { questionUploadFingerprint } from "@/lib/aiTestState";
@@ -13,6 +14,7 @@ type Props = {
   questionText: string;
   onQuestionTextChange: (value: string) => void;
   questionUpload: UploadState;
+  onQuestionUploadChange: (next: UploadState) => void;
   questionExtraction: QuestionExtractionState;
   onQuestionExtractionChange: (next: QuestionExtractionState) => void;
   disabled?: boolean;
@@ -22,6 +24,7 @@ export default function QuestionContextPanel({
   questionText,
   onQuestionTextChange,
   questionUpload,
+  onQuestionUploadChange,
   questionExtraction,
   onQuestionExtractionChange,
   disabled = false,
@@ -117,15 +120,21 @@ export default function QuestionContextPanel({
 
   return (
     <section aria-label="Assignment question" className="mt-4">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs font-medium text-slate-700">Assignment Question</p>
-        {hasQuestionPages && isDone && (
-          <p className="text-[11px] text-slate-400">
-            Extracted from {questionUpload.pages.length} question page
-            {questionUpload.pages.length === 1 ? "" : "s"}
-          </p>
-        )}
+        <QuestionImageAttach
+          upload={questionUpload}
+          onUploadChange={onQuestionUploadChange}
+          disabled={disabled}
+        />
       </div>
+
+      {hasQuestionPages && isDone && (
+        <p className="mt-1 text-xs text-slate-400">
+          Extracted from {questionUpload.pages.length} question page
+          {questionUpload.pages.length === 1 ? "" : "s"}
+        </p>
+      )}
 
       {isLoading && (
         <p
@@ -154,7 +163,7 @@ export default function QuestionContextPanel({
 
       <div className="mt-1 flex items-center justify-between gap-2">
         <span
-          className={`text-[11px] tabular-nums ${
+          className={`text-xs tabular-nums ${
             questionText.length > MAX_QUESTION_CHARS * 0.9
               ? "text-amber-600"
               : "text-slate-400"
@@ -166,13 +175,13 @@ export default function QuestionContextPanel({
         <div className="flex gap-2">
           {isFailed && (
             <>
-              <p className="text-[11px] text-rose-600">
+              <p className="text-xs text-rose-600">
                 Could not read the question pages.
               </p>
               <button
                 type="button"
                 onClick={handleRetry}
-                className="text-[11px] font-medium text-slate-600 underline decoration-slate-300 underline-offset-4 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+                className="text-xs font-medium text-slate-600 underline decoration-slate-300 underline-offset-4 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
               >
                 Retry extraction
               </button>
@@ -183,7 +192,7 @@ export default function QuestionContextPanel({
             <button
               type="button"
               onClick={handleReplaceFromImage}
-              className="text-[11px] font-medium text-slate-500 underline decoration-slate-300 underline-offset-4 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
+              className="text-xs font-medium text-slate-500 underline decoration-slate-300 underline-offset-4 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900"
             >
               Replace from image
             </button>

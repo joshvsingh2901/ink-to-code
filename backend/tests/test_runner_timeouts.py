@@ -27,7 +27,7 @@ def test_runtime_reuses_compiled_program_and_uses_run_timeout(
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, b"", b""), False
+        return subprocess.CompletedProcess(command, 0, b"", b""), False, False
 
     monkeypatch.setattr(runner, "run", fake_run)
     monkeypatch.setattr(
@@ -64,6 +64,7 @@ def test_compile_timeout_has_dedicated_runner_result(
         lambda *_args, **_kwargs: (
             subprocess.CompletedProcess(["clang++"], -1, b"", b""),
             True,
+            False,
         ),
     )
     monkeypatch.setattr(runner, "write_result", payloads.append)

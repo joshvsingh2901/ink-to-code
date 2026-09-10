@@ -2,7 +2,7 @@
 call bounds, and error status mapping.
 
 All Gemini interactions use an injected fake client — zero real API calls.
-Execution uses the real run_test_request against real g++ on the host.
+Execution uses the real run_test_request through the isolated Docker runner.
 """
 import json
 from types import SimpleNamespace
@@ -12,13 +12,17 @@ import pytest
 from app.config import Settings
 from app.schemas.ai_tests import (
     AiModelFunctionTest,
+    AiModelScenarioObject,
+    AiModelScenarioStep,
+    AiModelScenarioTest,
     AiModelTestPlan,
+    AiModelScenarioPlan,
     AiStoredTest,
     AiTestRerunRequest,
     AiTestRunRequest,
     PRACTICE_DISCLAIMER,
 )
-from app.schemas.test_execution import FunctionTestCase
+from app.schemas.test_execution import FunctionTestCase, RunTestsResponse
 from app.services.ai_test_capability import assess_ai_capability
 from app.services.ai_test_orchestration import run_ai_tests, rerun_ai_tests, score_results
 from app.services.function_analysis import analyze_test_mode
@@ -29,6 +33,16 @@ from app.services.function_analysis import analyze_test_mode
 
 ADD_SOURCE = "int add(int a, int b) { return a + b; }"
 VOID_SOURCE = "void doNothing(int x) {}"
+COUNTER_SOURCE = (
+    "class Counter {\n"
+    "public:\n"
+    "    Counter(int start) : count_(start) {}\n"
+    "    void increment() { ++count_; }\n"
+    "    int get() const { return count_; }\n"
+    "private:\n"
+    "    int count_;\n"
+    "};\n"
+)
 
 
 def _settings(key: str | None = "test-key") -> Settings:
@@ -254,6 +268,364 @@ def test_valid_generation_executes_immediately_via_run_test_request():
     assert response.score is not None
     assert len(response.tests) == 1
     assert len(response.stored_tests) == 1
+
+
+# ---------------------------------------------------------------------------
+# Container/mutation argument round-trip (SIGNATURE regression lock)
+# All exercise the real end-to-end pipeline: fake Gemini -> real validation
+# -> real isolated C++ execution. No mocking below run_test_request.
+# ---------------------------------------------------------------------------
+
+MUTABLE_VECTOR_SOURCE = (
+    "#include <vector>\n"
+    "void removeNegatives(std::vector<int>& values) {\n"
+    "    std::vector<int> kept;\n"
+    "    for (int value : values) { if (value >= 0) kept.push_back(value); }\n"
+    "    values = kept;\n"
+    "}\n"
+)
+CLEAR_VECTOR_SOURCE = (
+    "#include <vector>\n"
+    "void clearValues(std::vector<int>& values) { values.clear(); }\n"
+)
+MUTATE_AND_RETURN_SOURCE = (
+    "#include <vector>\n"
+    "int mutateAndReturn(std::vector<int>& values) {\n"
+    "    int n = static_cast<int>(values.size());\n"
+    "    values.push_back(9);\n"
+    "    return n;\n"
+    "}\n"
+)
+CONST_VECTOR_SOURCE = (
+    "#include <vector>\n"
+    "int sumEven(const std::vector<int>& values) {\n"
+    "    int total = 0;\n"
+    "    for (int v : values) { if (v % 2 == 0) total += v; }\n"
+    "    return total;\n"
+    "}\n"
+)
+VECTOR_BY_VALUE_SOURCE = (
+    "#include <vector>\n"
+    "int total(std::vector<int> values) {\n"
+    "    int sum = 0;\n"
+    "    for (int v : values) sum += v;\n"
+    "    return sum;\n"
+    "}\n"
+)
+DEQUE_SOURCE = (
+    "#include <deque>\n"
+    "int sumDeque(const std::deque<int>& values) {\n"
+    "    int total = 0;\n"
+    "    for (int v : values) total += v;\n"
+    "    return total;\n"
+    "}\n"
+)
+
+
+def _run_request(source: str, fn_name: str, question: str) -> AiTestRunRequest:
+    return AiTestRunRequest(
+        code=source,
+        language="cpp",
+        question_text=question,
+        target_kind="function",
+        target_id=_fn_id(source, fn_name),
+    )
+
+
+def test_mutation_only_generation_produces_visible_passing_rows():
+    """Acceptance A: void removeNegatives(vector<int>&) — the reported bug."""
+    target_id = _fn_id(MUTABLE_VECTOR_SOURCE, "removeNegatives")
+    plan = AiModelTestPlan(
+        target_id=target_id,
+        tests=[
+            AiModelFunctionTest(
+                name="mixed_signs",
+                category="mutation",
+                reason="removes negatives, preserves order",
+                arguments=["[1, -2, 0, 4]"],
+                expected_outcome="return_void",
+                expected_mutations=[
+                    {"parameter_name": "values", "expected_final_value": "[1, 0, 4]"}
+                ],
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = _run_request(
+        MUTABLE_VECTOR_SOURCE,
+        "removeNegatives",
+        "Remove every negative value from the vector, preserving order.",
+    )
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status == "completed"
+    assert response.message != "This run completed but produced no test cases to show."
+    assert len(response.tests) == 1
+    assert response.tests[0].passed is True
+    assert response.score is not None and response.score.passed == 1
+    assert response.stored_tests[0].function_test.arguments == ["[1, -2, 0, 4]"]
+    assert "std::" not in response.stored_tests[0].function_test.arguments[0]
+
+
+def test_empty_final_vector_mutation_supported():
+    """Acceptance B: void clearValues(vector<int>&) -> []."""
+    target_id = _fn_id(CLEAR_VECTOR_SOURCE, "clearValues")
+    plan = AiModelTestPlan(
+        target_id=target_id,
+        tests=[
+            AiModelFunctionTest(
+                name="clears_all",
+                category="mutation",
+                reason="clears the vector",
+                arguments=["[1, 2, 3]"],
+                expected_outcome="return_void",
+                expected_mutations=[
+                    {"parameter_name": "values", "expected_final_value": "[]"}
+                ],
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = _run_request(CLEAR_VECTOR_SOURCE, "clearValues", "Clear the vector.")
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status == "completed"
+    assert len(response.tests) == 1
+    assert response.tests[0].passed is True
+
+
+def test_return_and_mutation_expectations_coexist():
+    """Acceptance C: int mutateAndReturn(vector<int>&) — both channels together."""
+    target_id = _fn_id(MUTATE_AND_RETURN_SOURCE, "mutateAndReturn")
+    plan = AiModelTestPlan(
+        target_id=target_id,
+        tests=[
+            AiModelFunctionTest(
+                name="returns_and_mutates",
+                category="mutation",
+                reason="returns original size, appends 9",
+                arguments=["[1, 2]"],
+                expected_outcome="return_value",
+                expected_return="2",
+                expected_mutations=[
+                    {"parameter_name": "values", "expected_final_value": "[1, 2, 9]"}
+                ],
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = _run_request(
+        MUTATE_AND_RETURN_SOURCE,
+        "mutateAndReturn",
+        "Return the original size, then append 9 to the vector.",
+    )
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status == "completed"
+    assert len(response.tests) == 1
+    assert response.tests[0].passed is True
+
+
+def test_const_reference_generates_no_mutation_expectation():
+    """Acceptance D: const vector<int>& — no mutation expectation generated."""
+    target_id = _fn_id(CONST_VECTOR_SOURCE, "sumEven")
+    plan = AiModelTestPlan(
+        target_id=target_id,
+        tests=[
+            AiModelFunctionTest(
+                name="sum_even",
+                category="normal",
+                reason="sums even values",
+                arguments=["[1, 2, 3, 4]"],
+                expected_outcome="return_value",
+                expected_return="6",
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = _run_request(CONST_VECTOR_SOURCE, "sumEven", "Sum the even values.")
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status == "completed"
+    assert len(response.tests) == 1
+    assert response.tests[0].passed is True
+    assert not response.stored_tests[0].function_test.expected_mutations
+
+
+def test_by_value_container_argument_round_trips_raw():
+    """Acceptance E: representative by-value container."""
+    target_id = _fn_id(VECTOR_BY_VALUE_SOURCE, "total")
+    plan = AiModelTestPlan(
+        target_id=target_id,
+        tests=[
+            AiModelFunctionTest(
+                name="sums_all",
+                category="normal",
+                reason="sums all values",
+                arguments=["[1, 2, 3]"],
+                expected_outcome="return_value",
+                expected_return="6",
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = _run_request(VECTOR_BY_VALUE_SOURCE, "total", "Sum all values.")
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status == "completed"
+    assert response.tests[0].passed is True
+    assert response.stored_tests[0].function_test.arguments == ["[1, 2, 3]"]
+
+
+def test_representative_other_container_no_double_conversion():
+    """Acceptance F: const std::deque<int>& — a non-vector container family."""
+    target_id = _fn_id(DEQUE_SOURCE, "sumDeque")
+    plan = AiModelTestPlan(
+        target_id=target_id,
+        tests=[
+            AiModelFunctionTest(
+                name="sums_deque",
+                category="normal",
+                reason="sums all values",
+                arguments=["[1, 2, 3]"],
+                expected_outcome="return_value",
+                expected_return="6",
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = _run_request(DEQUE_SOURCE, "sumDeque", "Sum all values in the deque.")
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status == "completed"
+    assert response.tests[0].passed is True
+    assert response.stored_tests[0].function_test.arguments == ["[1, 2, 3]"]
+
+
+# ---------------------------------------------------------------------------
+# input_error must not be reported as "completed" (masking-defect regression)
+# ---------------------------------------------------------------------------
+
+
+def test_function_path_surfaces_input_error_not_completed(monkeypatch):
+    import app.services.ai_test_orchestration as orch
+
+    target_id = _fn_id(ADD_SOURCE, "add")
+    plan = _good_plan(target_id)
+    client = _FakeClient(_gemini_ok(plan))
+
+    fake_response = RunTestsResponse(
+        mode="function",
+        success=False,
+        input_error="synthetic: argument must contain data values, not C++ expressions.",
+        tests=[],
+    )
+    monkeypatch.setattr(orch, "run_test_request", lambda *a, **k: fake_response)
+
+    response = run_ai_tests(_add_request(), _settings(), client=client)
+
+    assert response.status != "completed"
+    assert response.message == fake_response.input_error
+    assert response.tests == []
+    assert response.score is None
+    assert len(response.stored_tests) == 1  # definitions preserved, not fabricated rows
+
+
+def test_object_path_surfaces_input_error_not_completed(monkeypatch):
+    import app.services.ai_test_orchestration as orch
+
+    source = COUNTER_SOURCE
+    plan = AiModelScenarioPlan(
+        target_id="Counter",
+        tests=[
+            AiModelScenarioTest(
+                name="basic",
+                category="object_state",
+                reason="construct and increment",
+                objects=[
+                    AiModelScenarioObject(
+                        name="c", constructor_id="Counter::Counter(int)", arguments=["5"]
+                    )
+                ],
+                steps=[
+                    AiModelScenarioStep(
+                        step_type="observer",
+                        target_object_name="c",
+                        method_id="Counter::get() const->int",
+                        expected_outcome="return_value",
+                        expected_return="5",
+                    )
+                ],
+            )
+        ],
+        skipped_topics=[],
+    )
+    client = _FakeClient(_gemini_ok(plan))
+    request = AiTestRunRequest(
+        code=source,
+        language="cpp",
+        question_text="Construct a Counter and observe its value.",
+        target_kind="object",
+        target_id="Counter",
+    )
+
+    fake_response = RunTestsResponse(
+        mode="object",
+        success=False,
+        input_error="synthetic: argument must contain data values, not C++ expressions.",
+        tests=[],
+    )
+    monkeypatch.setattr(orch, "run_test_request", lambda *a, **k: fake_response)
+
+    response = run_ai_tests(request, _settings(), client=client)
+
+    assert response.status != "completed"
+    assert response.message == fake_response.input_error
+    assert response.tests == []
+    assert response.score is None
+
+
+def test_rerun_path_surfaces_input_error_not_completed(monkeypatch):
+    import app.services.ai_test_orchestration as orch
+
+    target_id = _fn_id(ADD_SOURCE, "add")
+    stored = _make_stored_test(target_id)
+
+    fake_response = RunTestsResponse(
+        mode="function",
+        success=False,
+        input_error="synthetic: argument must contain data values, not C++ expressions.",
+        tests=[],
+    )
+    monkeypatch.setattr(orch, "run_test_request", lambda *a, **k: fake_response)
+
+    response = rerun_ai_tests(
+        AiTestRerunRequest(
+            code=ADD_SOURCE,
+            language="cpp",
+            target_kind="function",
+            target_id=target_id,
+            tests=[stored],
+        ),
+        _settings(),
+    )
+
+    assert response.status != "completed"
+    assert response.message == fake_response.input_error
+    assert response.tests == []
+    assert response.score is None
 
 
 def test_rejected_test_is_never_executed():

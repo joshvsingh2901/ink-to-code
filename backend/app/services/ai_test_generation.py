@@ -487,19 +487,21 @@ def generate_function_tests(
     except AiTestServiceError:
         raise
     except errors.APIError as exc:
-        safe_msg = (exc.message or "unavailable").replace("\n", " ")[:300]
-        if settings.gemini_api_key:
-            safe_msg = safe_msg.replace(settings.gemini_api_key, "[redacted]")
         logger.error(
-            "AI test generation API error: type=%s code=%s status=%s model=%s message=%s",
+            "AI test generation API error: type=%s code=%s status=%s model=%s",
             type(exc).__name__, exc.code, exc.status,
-            settings.test_generation_model, safe_msg,
+            settings.test_generation_model,
         )
         raise _wrap_api_error(exc) from exc
     except Exception as exc:
+        logger.error(
+            "AI test generation failed: type=%s model=%s",
+            type(exc).__name__,
+            settings.test_generation_model,
+        )
         raise AiTestServiceError(
             "generation_failed",
-            f"AI test generation encountered an unexpected error: {exc}",
+            "AI tests could not be generated right now.",
             502,
         ) from exc
 
@@ -566,19 +568,21 @@ def generate_object_tests(
     except AiTestServiceError:
         raise
     except errors.APIError as exc:
-        safe_msg = (exc.message or "unavailable").replace("\n", " ")[:300]
-        if settings.gemini_api_key:
-            safe_msg = safe_msg.replace(settings.gemini_api_key, "[redacted]")
         logger.error(
-            "AI test generation API error: type=%s code=%s status=%s model=%s message=%s",
+            "AI test generation API error: type=%s code=%s status=%s model=%s",
             type(exc).__name__, exc.code, exc.status,
-            settings.test_generation_model, safe_msg,
+            settings.test_generation_model,
         )
         raise _wrap_api_error(exc) from exc
     except Exception as exc:
+        logger.error(
+            "AI test generation failed: type=%s model=%s",
+            type(exc).__name__,
+            settings.test_generation_model,
+        )
         raise AiTestServiceError(
             "generation_failed",
-            f"AI test generation encountered an unexpected error: {exc}",
+            "AI tests could not be generated right now.",
             502,
         ) from exc
 

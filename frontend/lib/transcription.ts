@@ -1,4 +1,5 @@
 import type { UploadState } from "@/components/ImageUploadCard";
+import { apiErrorMessage } from "./apiErrors";
 
 export type UncertainRegion = {
   id: string;
@@ -28,8 +29,6 @@ type PageMetadata = {
   original_filename: string;
   original_pdf_page_number: number | null;
 };
-
-type ApiError = { error?: { message?: string } };
 
 export class TranscriptionRequestError extends Error {
   constructor(message: string) {
@@ -142,9 +141,14 @@ export async function requestTranscription(formData: FormData) {
     const body: unknown = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const apiError = body as ApiError | null;
       throw new TranscriptionRequestError(
-        apiError?.error?.message ?? "Transcription failed. Please retry.",
+        apiErrorMessage(
+          response.status,
+          body,
+          "Transcription failed. Please retry.",
+          "ai",
+          response.headers.get("X-Request-ID"),
+        ),
       );
     }
     if (!isTranscriptionResult(body)) {

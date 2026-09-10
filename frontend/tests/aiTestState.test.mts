@@ -18,7 +18,11 @@ import {
   INITIAL_AI_PANEL_STATE,
   PRACTICE_DISCLAIMER,
   RERUN_PHASES,
+  classifyAiSetStaleness,
+  deriveAiPanelAffordances,
+  canRerunAiTests,
   type AiContext,
+  type AiGenerationContext,
   type ExtractionState,
   type AiTestResultRowRaw,
 } from "../lib/aiTestState.ts";
@@ -283,6 +287,40 @@ describe("runButtonGate", () => {
       targetMode: null,
     });
     assert.ok(!result.blocked);
+  });
+
+  it("is blocked with 'no_target' once analysis conclusively resolves to no target", () => {
+    // isAnalyzing: false = analysis has finished and there is structurally no target
+    // (e.g. a lifecycle-only class with no supported public instance method).
+    const result = runButtonGate({
+      questionText: "Sort an array.",
+      compileReady: true,
+      targetMode: null,
+      isAnalyzing: false,
+    });
+    assert.ok(result.blocked);
+    assert.equal((result as { blocked: true; reason: string }).reason, "no_target");
+  });
+
+  it("is NOT blocked for an 'unsupported' targetMode while analysis is still in flight", () => {
+    const result = runButtonGate({
+      questionText: "Sort an array.",
+      compileReady: true,
+      targetMode: "unsupported",
+      isAnalyzing: true,
+    });
+    assert.ok(!result.blocked);
+  });
+
+  it("is blocked with 'no_target' for a conclusively 'unsupported' targetMode", () => {
+    const result = runButtonGate({
+      questionText: "Sort an array.",
+      compileReady: true,
+      targetMode: "unsupported",
+      isAnalyzing: false,
+    });
+    assert.ok(result.blocked);
+    assert.equal((result as { blocked: true; reason: string }).reason, "no_target");
   });
 
   it("is NOT blocked for function mode (a proven-unsupported reason is advisory)", () => {
@@ -689,5 +727,128 @@ describe("friendlyStatusMessage", () => {
       !msg.toLowerCase().includes("transcription"),
       `Must not mention 'transcription', got: ${msg}`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyAiSetStaleness / deriveAiPanelAffordances / canRerunAiTests
+//
+// Covers the generated-set / run-result invalidation matrix from
+// AI_WORKFLOW_REFINEMENT_PLAN.md §3 and §8 (items 1-6).
+// ---------------------------------------------------------------------------
+
+function makeGenerationContext(
+  overrides: Partial<AiGenerationContext> = {},
+): AiGenerationContext {
+  return {
+    targetId: "fn_foo",
+    sigHash: "hash-a",
+    tmplKey: "",
+    questionTextHash: "qhash-1",
+    ...overrides,
+  };
+}
+
+describe("classifyAiSetStaleness", () => {
+  it("source-edit context (compileVersion differs, all else equal) -> results_stale", () => {
+    const generationContext = makeGenerationContext();
+    const current = makeAiContext({ compileVersion: 2 });
+    // The set was last executed at compileVersion 1.
+    const staleness = classifyAiSetStaleness(generationContext, 1, current);
+    assert.equal(staleness, "results_stale");
+
+    const affordances = deriveAiPanelAffordances(staleness);
+    assert.equal(affordances.generatedSetUsable, true);
+    assert.equal(affordances.runResultCurrent, false);
+    assert.equal(affordances.regenerationRecommended, false);
+  });
+
+  it("question-text change -> question_changed, keep set, clear run, recommend regeneration", () => {
+    const generationContext = makeGenerationContext({
+      questionTextHash: '"old question"',
+    });
+    const current = makeAiContext({
+      questionTextHash: '"new question"',
+      compileVersion: 1,
+    });
+    const staleness = classifyAiSetStaleness(generationContext, 1, current);
+    assert.equal(staleness, "question_changed");
+
+    const affordances = deriveAiPanelAffordances(staleness);
+    assert.equal(affordances.generatedSetUsable, true);
+    assert.equal(affordances.runResultCurrent, false);
+    assert.equal(affordances.regenerationRecommended, true);
+  });
+
+  it("signature change -> incompatible, discard the generated set", () => {
+    const generationContext = makeGenerationContext({ sigHash: "hash-a" });
+    const current = makeAiContext({ sigHash: "hash-b", compileVersion: 1 });
+    const staleness = classifyAiSetStaleness(generationContext, 1, current);
+    assert.equal(staleness, "incompatible");
+
+    const affordances = deriveAiPanelAffordances(staleness);
+    assert.equal(affordances.generatedSetUsable, false);
+    assert.equal(affordances.runResultCurrent, false);
+  });
+
+  it("target change -> different_target, discard the generated set", () => {
+    const generationContext = makeGenerationContext({ targetId: "fn_foo" });
+    const current = makeAiContext({ targetId: "fn_bar", compileVersion: 1 });
+    const staleness = classifyAiSetStaleness(generationContext, 1, current);
+    assert.equal(staleness, "different_target");
+
+    const affordances = deriveAiPanelAffordances(staleness);
+    assert.equal(affordances.generatedSetUsable, false);
+    assert.equal(affordances.runResultCurrent, false);
+  });
+
+  it("identical context -> current, no change", () => {
+    const generationContext = makeGenerationContext();
+    const current = makeAiContext({ compileVersion: 1 });
+    const staleness = classifyAiSetStaleness(generationContext, 1, current);
+    assert.equal(staleness, "current");
+
+    const affordances = deriveAiPanelAffordances(staleness);
+    assert.equal(affordances.generatedSetUsable, true);
+    assert.equal(affordances.runResultCurrent, true);
+    assert.equal(affordances.regenerationRecommended, false);
+  });
+
+  it("null executedAtCodeVersion (never run) is treated as matching current compileVersion", () => {
+    const generationContext = makeGenerationContext();
+    const current = makeAiContext({ compileVersion: 7 });
+    const staleness = classifyAiSetStaleness(generationContext, null, current);
+    assert.equal(staleness, "current");
+  });
+});
+
+describe("deriveAiPanelAffordances", () => {
+  it("with no prior staleness verdict (no generated set yet) reports first-run state", () => {
+    const affordances = deriveAiPanelAffordances(null);
+    assert.equal(affordances.generatedSetUsable, false);
+    assert.equal(affordances.runResultCurrent, false);
+    assert.equal(affordances.regenerationRecommended, false);
+  });
+});
+
+describe("canRerunAiTests", () => {
+  it("requires a usable generated set, at least one stored test, and a current compile", () => {
+    const usable = deriveAiPanelAffordances("current");
+    assert.equal(canRerunAiTests(usable, 3, true), true);
+  });
+
+  it("is false when the generated set is not usable, even with stored tests and compileReady", () => {
+    const discarded = deriveAiPanelAffordances("different_target");
+    assert.equal(canRerunAiTests(discarded, 3, true), false);
+  });
+
+  it("is false when there are no stored tests", () => {
+    const usable = deriveAiPanelAffordances("current");
+    assert.equal(canRerunAiTests(usable, 0, true), false);
+  });
+
+  it("is false when the code does not currently compile", () => {
+    const usable = deriveAiPanelAffordances("results_stale");
+    assert.equal(canRerunAiTests(usable, 3, false), false);
   });
 });

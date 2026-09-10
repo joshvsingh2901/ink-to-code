@@ -1,6 +1,4 @@
-import os
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,22 +10,14 @@ from app.schemas.test_execution import (
 )
 from app.services.object_analysis import analyze_object_scenarios
 from app.services import test_execution
+from app.services.execution_providers import DockerExecutionProvider
 from app.services.test_execution import (
     OUTPUT_LIMIT_MESSAGE,
-    SANITIZER_COMPILE_FLAGS,
-    SANITIZER_ENVIRONMENT,
     SanitizerCapabilities,
     TEST_OUTPUT_LIMIT_BYTES,
     _classify_memory_diagnostics,
-    _compile_executable,
-    _probe_sanitizer_capabilities,
-    _run_process,
     run_cpp_tests,
 )
-
-
-def _completed(returncode: int = 0, stderr: bytes = b""):
-    return subprocess.CompletedProcess([], returncode, b"", stderr)
 
 
 def test_memory_checks_default_to_false():
@@ -38,45 +28,6 @@ def test_memory_checks_default_to_false():
         tests=[ProgramTestCase(name="Test", expected_stdout="")],
     )
     assert request.run_memory_checks is False
-
-
-def test_normal_compile_flags_are_unchanged(tmp_path: Path, monkeypatch):
-    captured: list[str] = []
-
-    def fake_run(command, **kwargs):
-        captured.extend(command)
-        return _completed()
-
-    monkeypatch.setattr(test_execution.subprocess, "run", fake_run)
-    assert _compile_executable(
-        tmp_path, compiler="c++", timeout_seconds=1
-    ) == (None, False)
-    assert captured == ["c++", "-std=c++17", "main.cpp", "-o", "program"]
-
-
-def test_memory_compile_adds_sanitizer_flags(tmp_path: Path, monkeypatch):
-    captured: list[str] = []
-
-    def fake_run(command, **kwargs):
-        captured.extend(command)
-        return _completed()
-
-    monkeypatch.setattr(test_execution.subprocess, "run", fake_run)
-    assert _compile_executable(
-        tmp_path,
-        compiler="c++",
-        timeout_seconds=1,
-        run_memory_checks=True,
-        sanitizer_capabilities=SanitizerCapabilities(True, True, True),
-    ) == (None, False)
-    assert captured == [
-        "c++",
-        "-std=c++17",
-        *SANITIZER_COMPILE_FLAGS,
-        "main.cpp",
-        "-o",
-        "program",
-    ]
 
 
 @pytest.mark.parametrize(
@@ -120,26 +71,6 @@ def test_diagnostic_paths_are_removed_and_output_is_limited(tmp_path: Path):
     assert details.endswith(OUTPUT_LIMIT_MESSAGE)
 
 
-def test_sanitizer_unavailable_is_not_a_user_memory_failure(
-    tmp_path: Path, monkeypatch
-):
-    monkeypatch.setattr(
-        test_execution.subprocess,
-        "run",
-        lambda *args, **kwargs: _completed(
-            1, b"error: unsupported argument 'address' to option '-fsanitize='"
-        ),
-    )
-    error, unavailable = _compile_executable(
-        tmp_path,
-        compiler="c++",
-        timeout_seconds=1,
-        run_memory_checks=True,
-    )
-    assert error
-    assert unavailable is True
-
-
 @pytest.mark.skipif(
     shutil.which("g++") is None and shutil.which("clang++") is None,
     reason="No C++ compiler is installed",
@@ -162,40 +93,6 @@ def test_supported_sanitizer_run_reports_clean():
         assert result.tests[0].undefined_behavior_status == "clean"
         assert result.tests[0].leak_status == "unavailable"
     assert result.tests[0].memory_check_enabled is True
-
-
-def test_sanitizer_environment_constants_do_not_mutate_process_environment():
-    for key, value in SANITIZER_ENVIRONMENT.items():
-        assert os.environ.get(key) != value
-
-
-def test_sanitizer_environment_is_passed_only_to_checked_child(
-    tmp_path: Path, monkeypatch
-):
-    executable = Path(shutil.which("true") or "/usr/bin/true")
-    original_popen = test_execution.subprocess.Popen
-    environments: list[dict[str, str] | None] = []
-
-    def recording_popen(*args, **kwargs):
-        environments.append(kwargs.get("env"))
-        return original_popen(*args, **kwargs)
-
-    monkeypatch.setattr(test_execution.subprocess, "Popen", recording_popen)
-    _run_process(executable, tmp_path, "", timeout_seconds=1)
-    _run_process(
-        executable,
-        tmp_path,
-        "",
-        timeout_seconds=1,
-        run_memory_checks=True,
-    )
-
-    assert environments[0] is None
-    assert environments[1] is not None
-    assert environments[1]["UBSAN_OPTIONS"] == SANITIZER_ENVIRONMENT[
-        "UBSAN_OPTIONS"
-    ]
-    assert "UBSAN_OPTIONS" not in os.environ
 
 
 def test_asan_available_without_leaks_cannot_report_fully_clean(tmp_path: Path):
@@ -223,65 +120,6 @@ def test_asan_available_without_leaks_cannot_report_fully_clean(tmp_path: Path):
         ),
         True,
     ) is True
-
-
-def test_leak_probe_requires_an_actual_leak_report(monkeypatch):
-    _probe_sanitizer_capabilities.cache_clear()
-    results = iter(
-        [
-            _completed(),
-            _completed(),
-            _completed(returncode=0, stderr=b""),
-        ]
-    )
-    monkeypatch.setattr(
-        test_execution,
-        "_probe_compile_and_run",
-        lambda *args, **kwargs: next(results),
-    )
-    capabilities = _probe_sanitizer_capabilities("clean-leak-probe")
-    assert capabilities.address_sanitizer_available is True
-    assert capabilities.undefined_behavior_sanitizer_available is True
-    assert capabilities.leak_sanitizer_available is False
-
-
-def test_leak_probe_accepts_leaksanitizer_report(monkeypatch):
-    _probe_sanitizer_capabilities.cache_clear()
-    results = iter(
-        [
-            _completed(),
-            _completed(),
-            _completed(
-                returncode=-6,
-                stderr=b"ERROR: LeakSanitizer: detected memory leaks",
-            ),
-        ]
-    )
-    monkeypatch.setattr(
-        test_execution,
-        "_probe_compile_and_run",
-        lambda *args, **kwargs: next(results),
-    )
-    capabilities = _probe_sanitizer_capabilities("reporting-leak-probe")
-    assert capabilities.leak_sanitizer_available is True
-
-
-def test_sanitizer_capability_result_is_cached(monkeypatch):
-    _probe_sanitizer_capabilities.cache_clear()
-    calls = 0
-
-    def fake_probe(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return _completed()
-
-    monkeypatch.setattr(
-        test_execution, "_probe_compile_and_run", fake_probe
-    )
-    first = _probe_sanitizer_capabilities("cached-compiler")
-    second = _probe_sanitizer_capabilities("cached-compiler")
-    assert first is second
-    assert calls == 3
 
 
 @pytest.mark.skipif(
@@ -370,14 +208,6 @@ def test_destruction_time_sanitizer_error_fails_object_scenario(monkeypatch):
             }
         ],
     )
-    original_popen = test_execution.subprocess.Popen
-    child_environments: list[dict[str, str] | None] = []
-
-    def recording_popen(*args, **kwargs):
-        child_environments.append(kwargs.get("env"))
-        return original_popen(*args, **kwargs)
-
-    monkeypatch.setattr(test_execution.subprocess, "Popen", recording_popen)
     result = test_execution.run_test_request(request)
     if result.memory_status == "unavailable":
         pytest.skip("The installed compiler does not support sanitizers")
@@ -389,10 +219,7 @@ def test_destruction_time_sanitizer_error_fails_object_scenario(monkeypatch):
         "invalid_free",
         "use_after_free",
     }
-    assert any(
-        environment is not None and "ASAN_OPTIONS" in environment
-        for environment in child_environments
-    )
+    assert result.execution_provider == "docker"
 
 
 @pytest.mark.skipif(
@@ -400,9 +227,7 @@ def test_destruction_time_sanitizer_error_fails_object_scenario(monkeypatch):
     reason="No C++ compiler is installed",
 )
 def test_supported_leak_detection_classifies_allocation_leak():
-    capabilities = _probe_sanitizer_capabilities(
-        test_execution.COMPILER_EXECUTABLE
-    )
+    capabilities = DockerExecutionProvider().capabilities()
     if not capabilities.leak_sanitizer_available:
         pytest.skip("LeakSanitizer is unavailable")
     result = run_cpp_tests(

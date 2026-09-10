@@ -15,8 +15,8 @@ Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable
 - Manual tests and constrained AI-generated practice tests
 - Strict AI-test schemas, capability gating, value validation, deduplication, and bounded repair
 - Defined support for primitives, arrays, pointers, 15 STL containers, iterators, classes, operators, inheritance, polymorphism, and templates
-- Dockerized ASan, UBSan, and Valgrind memory-diagnostic path
-- 923 automated frontend/backend tests currently pass (758 backend + 165 frontend), with 3 environment-dependent backend tests skipped
+- Docker-isolated compilation, testing, ASan, UBSan, and Valgrind diagnostics
+- 1,104 automated frontend/backend tests currently pass (881 backend + 223 frontend) with the Docker runner available
 
 ## How It Works
 
@@ -58,7 +58,7 @@ flowchart TD
     Docker --> Tools["ASan / UBSan / Valgrind"]
 ```
 
-The frontend owns upload, review, editor, and result presentation. FastAPI separates routes, Pydantic contracts, external AI calls, source analysis, compiler operations, and execution services. Normal functional tests currently use controlled host-side temporary directories; Docker is used for the memory/diagnostic path.
+The frontend owns upload, review, editor, and result presentation. FastAPI separates routes, Pydantic contracts, external AI calls, source analysis, compiler operations, and execution services. All submitted C++ compilation and execution fails closed through the restricted Docker runner; the API host has no execution fallback.
 
 ## Multimodal Transcription Pipeline
 
@@ -124,7 +124,10 @@ Gemini is not involved in compiler diagnosis, explanation, or source repair.
 
 ## Execution Safety
 
-Normal compile and test execution uses fixed commands, `shell=False`, unique temporary working directories, strict timeouts, bounded output, and automatic cleanup. Student code runs only after an explicit **Run Tests** action; automatic compilation never executes it.
+Normal compile and test execution uses the required isolated Docker runner with
+fixed commands, no network, strict resource/time/output limits, and automatic
+cleanup. Student code runs only after an explicit **Run Tests** action;
+automatic compilation checks source without executing the resulting program.
 
 Current normal-execution limits include:
 
@@ -132,7 +135,7 @@ Current normal-execution limits include:
 - **64 KiB** limits for stdout and stderr
 - fixed compiler/executable paths and no user-controlled flags or shell commands
 
-The optional Docker diagnostic runner adds:
+The required Docker runner provides:
 
 - non-root execution
 - no network
@@ -142,7 +145,9 @@ The optional Docker diagnostic runner adds:
 - ASan/UBSan execution and deliberate capability probes
 - Valgrind capability and leak checks where available
 
-> Normal functional tests currently execute in controlled host-side temporary directories. Docker isolation is currently used for memory/diagnostic execution. This local development architecture is not presented as a production-secure arbitrary-code sandbox.
+The runner is a hardened isolation boundary for the current application;
+public deployment still requires deployment-specific configuration,
+monitoring, and production smoke testing.
 
 ## Tech Stack
 
@@ -159,14 +164,27 @@ Current local audit results:
 
 | Check | Result |
 | --- | --- |
-| Backend tests | 758 passed, 3 environment-dependent skipped |
+| Backend tests | 881 passed with the Docker runner available |
 | Backend Python compilation | `python -m compileall app` passed |
-| Frontend tests | 165 / 165 passed |
+| Frontend tests | 223 / 223 passed |
 | Frontend lint | passed |
 | Frontend production build | passed |
 | Docker runner integration | passed |
 
 Backend tests mock external Gemini requests and do not consume API quota. No coverage percentage, transcription-accuracy figure, or AI test-quality benchmark is claimed.
+
+## Continuous Integration
+
+GitHub Actions now separates fast backend checks, frontend verification,
+Docker-backed execution-security tests, main-branch full regression,
+dependency auditing, and secret scanning. Pull requests run every gate except
+the four-to-five-minute full backend regression; pushes to `main` and manual
+workflow dispatches run the complete set.
+
+Workflows use read-only repository permissions and never receive Gemini or
+deployment credentials. See
+[`CI_SECURITY_PLAN.md`](CI_SECURITY_PLAN.md) for the enforced test map,
+scanner policies, expected runtime, and the exact pre-deployment procedure.
 
 ## Local Setup
 
@@ -176,7 +194,7 @@ Backend tests mock external Gemini requests and do not consume API quota. No cov
 - Node.js 20+
 - a C++17 compiler available as `g++` or a compatible local toolchain
 - a Gemini API key for real transcription and AI-test generation
-- Docker only if you want the isolated memory-diagnostic path
+- Docker for all C++ compilation, tests, and memory diagnostics
 
 ### Backend
 
@@ -209,7 +227,7 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-### Optional Docker diagnostic runner
+### Required isolated C++ runner
 
 From the repository root:
 
@@ -217,7 +235,12 @@ From the repository root:
 docker build -t inktocode-cpp-runner ./runner
 ```
 
-Keep `CPP_EXECUTION_PROVIDER=auto` in `backend/.env` to prefer Docker for memory diagnostics when the runner is available.
+Set `CPP_EXECUTION_PROVIDER=docker` in `backend/.env`. Normal compilation,
+manual tests, AI tests, object scenarios, and memory diagnostics all fail
+closed through this runner. The API host must never directly compile or
+execute submitted C++; there is no host fallback. See
+[`EXECUTION_SECURITY_PLAN.md`](EXECUTION_SECURITY_PLAN.md) for the complete
+boundary and resource policy.
 
 ### Run verification locally
 
@@ -254,14 +277,14 @@ Component-specific details are available in [`frontend/README.md`](frontend/READ
 - The current language target is C++17.
 - Function and object analysis intentionally supports a defined signature/syntax subset rather than arbitrary C++.
 - Real Gemini transcription and AI-test generation require network access and a user-supplied API key.
-- Normal functional tests are host-side and are not a production-grade sandbox.
-- Docker isolation currently focuses on memory/diagnostic execution.
+- Production scaling still requires shared resource admission controls and a
+  dedicated deployment security review.
 - The local MVP has no production authentication, database, or permanent file storage.
 - Transcription accuracy and AI-test fault-detection quality do not yet have measured benchmark results.
 
 ## Future Work
 
-- production-grade isolation for every execution path
+- production deployment hardening, orchestration, and monitoring
 - a hosted, safely isolated demo
 - broader C++ syntax and signature coverage
 - operational observability and reproducible performance measurements

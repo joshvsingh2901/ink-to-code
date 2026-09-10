@@ -11,7 +11,7 @@ from typing import Literal, Protocol
 from app.config import Settings, get_settings
 
 
-ProviderName = Literal["host", "docker"]
+ProviderName = Literal["docker"]
 MemoryTool = Literal[
     "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
 ]
@@ -62,30 +62,10 @@ class ExecutionProvider(Protocol):
     def capabilities(self) -> ProviderCapabilities: ...
 
 
-def host_capabilities() -> ProviderCapabilities:
-    return ProviderCapabilities(
-        provider="host",
-        runtime_available=True,
-        image_available=False,
-        compiler_available=True,
-        address_sanitizer_available=False,
-        undefined_behavior_sanitizer_available=False,
-        leak_sanitizer_available=False,
-        valgrind_available=False,
-    )
-
-
-class HostExecutionProvider:
-    name: ProviderName = "host"
-
-    def capabilities(self) -> ProviderCapabilities:
-        return host_capabilities()
-
-
 def _validated_settings(settings: Settings) -> Settings:
-    if settings.cpp_execution_provider not in {"auto", "host", "docker"}:
+    if settings.cpp_execution_provider not in {"auto", "docker"}:
         raise ValueError(
-            "CPP_EXECUTION_PROVIDER must be auto, host, or docker."
+            "CPP_EXECUTION_PROVIDER must be docker. Host execution is disabled."
         )
     if not _SAFE_IMAGE.fullmatch(settings.cpp_runner_image):
         raise ValueError("CPP_RUNNER_IMAGE is invalid.")
@@ -127,13 +107,23 @@ def _docker_base_command(
         "--network",
         "none",
         "--read-only",
+        "--ipc",
+        "none",
         "--cap-drop",
         "ALL",
         "--security-opt",
         "no-new-privileges",
         "--pids-limit",
         str(settings.cpp_runner_pids),
+        "--ulimit",
+        "core=0:0",
+        "--ulimit",
+        "fsize=67108864:67108864",
+        "--ulimit",
+        "nofile=64:64",
         "--memory",
+        settings.cpp_runner_memory,
+        "--memory-swap",
         settings.cpp_runner_memory,
         "--cpus",
         settings.cpp_runner_cpus,
@@ -141,10 +131,27 @@ def _docker_base_command(
         settings.cpp_runner_user,
         "--workdir",
         "/work",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
         "--mount",
-        f"type=bind,source={resolved},target=/work",
+        (
+            f"type=bind,source={resolved},target=/work,"
+            "bind-propagation=rprivate"
+        ),
         settings.cpp_runner_image,
     ]
+
+
+def _is_regular_result_file(path: Path) -> bool:
+    """True only for an ordinary file, never a symlink.
+
+    The per-request work directory is chmod 0o777 on the host so the
+    container's non-root user can write results back to it (see
+    EXECUTION_SECURITY_PLAN.md's residual risks). A symlink planted at the
+    expected result path — whether by the sandboxed process or a local
+    host actor — must never be followed when reading results back.
+    """
+    return path.is_file() and not path.is_symlink()
 
 
 def _run_docker_command(
@@ -161,14 +168,17 @@ def _run_docker_command(
             check=False,
             shell=False,
         )
-    except subprocess.TimeoutExpired:
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            capture_output=True,
-            timeout=5,
-            check=False,
-            shell=False,
-        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                timeout=5,
+                check=False,
+                shell=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            pass
         return None
 
 
@@ -194,13 +204,22 @@ class DockerExecutionProvider:
         *,
         timeout_seconds: float,
         compile_only: bool = False,
+        run_memory_checks: bool = False,
     ) -> DockerExecutionResult:
-        run_timeout = self.settings.cpp_docker_run_timeout_seconds
+        run_timeout = min(
+            max(timeout_seconds, 0.05),
+            self.settings.cpp_docker_run_timeout_seconds,
+        )
+        compile_timeout = min(
+            max(timeout_seconds, 1),
+            self.settings.cpp_docker_compile_timeout_seconds,
+        ) if compile_only else self.settings.cpp_docker_compile_timeout_seconds
+        capabilities = self.capabilities() if run_memory_checks else None
         manifest = {
-            "mode": "compile_and_run_sanitized",
+            "mode": "compile_and_run",
             "stdin": stdin,
             "compile_timeout_seconds": (
-                self.settings.cpp_docker_compile_timeout_seconds
+                compile_timeout
             ),
             "run_timeout_seconds": run_timeout,
             "valgrind_timeout_seconds": (
@@ -208,10 +227,17 @@ class DockerExecutionProvider:
             ),
             "output_limit_bytes": _OUTPUT_LIMIT,
             "compile_only": compile_only,
+            "run_memory_checks": run_memory_checks,
             "leak_sanitizer_available": (
-                self.capabilities().leak_sanitizer_available
+                capabilities.leak_sanitizer_available
+                if capabilities is not None
+                else False
             ),
-            "valgrind_available": self.capabilities().valgrind_available,
+            "valgrind_available": (
+                capabilities.valgrind_available
+                if capabilities is not None
+                else False
+            ),
         }
         manifest_path = work_directory / "runner-request.json"
         result_path = work_directory / "runner-result.json"
@@ -228,7 +254,7 @@ class DockerExecutionProvider:
             command,
             container_name,
             timeout_seconds=(
-                self.settings.cpp_docker_compile_timeout_seconds
+                compile_timeout + 5
                 if compile_only
                 else run_timeout + 5
             ),
@@ -236,23 +262,30 @@ class DockerExecutionProvider:
         if completed is None:
             return DockerExecutionResult(
                 infrastructure_error=(
-                    "The isolated runner could not finish compiling the test "
-                    "program in time."
+                    "The isolated runner could not finish compiling in time."
                     if compile_only
-                    else "The isolated memory-checking environment timed out."
+                    else "The isolated runner did not complete the request."
                 ),
                 timed_out=not compile_only,
                 compile_timed_out=compile_only,
             )
-        if not result_path.is_file():
+        if not _is_regular_result_file(result_path):
+            if completed.returncode in {137, -9} and not compile_only:
+                return DockerExecutionResult(
+                    stderr=(
+                        "Execution was terminated after reaching an "
+                        "isolation resource limit."
+                    ),
+                    exit_code=completed.returncode,
+                )
             message = completed.stderr[:_OUTPUT_LIMIT].decode(
                 "utf-8", errors="replace"
             )
             return DockerExecutionResult(
                 infrastructure_error=(
-                    "The isolated memory-checking environment could not start."
+                    "The isolated runner could not start."
                     if not message
-                    else "The isolated memory-checking environment failed."
+                    else "The isolated runner failed."
                 )
             )
         try:
@@ -260,15 +293,13 @@ class DockerExecutionProvider:
         except (json.JSONDecodeError, OSError):
             return DockerExecutionResult(
                 infrastructure_error=(
-                    "The isolated memory-checking environment returned an "
-                    "invalid result."
+                    "The isolated runner returned an invalid result."
                 )
             )
         if not isinstance(payload, dict):
             return DockerExecutionResult(
                 infrastructure_error=(
-                    "The isolated memory-checking environment returned an "
-                    "invalid result."
+                    "The isolated runner returned an invalid result."
                 )
             )
         return DockerExecutionResult(
@@ -325,6 +356,74 @@ class DockerExecutionProvider:
             ),
             leak_kind=_optional_string(payload.get("leak_kind")),
             compile_timed_out=bool(payload.get("compile_timed_out")),
+        )
+
+    def compile_source(
+        self,
+        work_directory: Path,
+        *,
+        timeout_seconds: float,
+    ) -> DockerExecutionResult:
+        manifest_path = work_directory / "runner-request.json"
+        result_path = work_directory / "runner-result.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "mode": "compile_source",
+                    "compile_timeout_seconds": timeout_seconds,
+                    "output_limit_bytes": _OUTPUT_LIMIT,
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest_path.chmod(0o644)
+        (work_directory / "main.cpp").chmod(0o644)
+        work_directory.chmod(0o777)
+        result_path.unlink(missing_ok=True)
+        container_name = f"inktocode-{uuid.uuid4().hex}"
+        completed = _run_docker_command(
+            _docker_base_command(work_directory, container_name, self.settings),
+            container_name,
+            timeout_seconds=timeout_seconds + 5,
+        )
+        if completed is None:
+            return DockerExecutionResult(
+                infrastructure_error=(
+                    "The isolated runner did not complete the compile request."
+                ),
+                compile_timed_out=True,
+            )
+        if not _is_regular_result_file(result_path):
+            return DockerExecutionResult(
+                infrastructure_error="The isolated runner could not start."
+            )
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return DockerExecutionResult(
+                infrastructure_error=(
+                    "The isolated runner returned an invalid result."
+                )
+            )
+        if not isinstance(payload, dict):
+            return DockerExecutionResult(
+                infrastructure_error=(
+                    "The isolated runner returned an invalid result."
+                )
+            )
+        return DockerExecutionResult(
+            stdout=_string(payload.get("stdout")),
+            stderr=_string(payload.get("stderr")),
+            exit_code=(
+                payload.get("exit_code")
+                if isinstance(payload.get("exit_code"), int)
+                else None
+            ),
+            output_limited=bool(payload.get("output_limited")),
+            compile_timed_out=bool(payload.get("compile_timed_out")),
+            infrastructure_error=_optional_string(
+                payload.get("infrastructure_error")
+            ),
         )
 
 
@@ -439,13 +538,18 @@ def docker_capabilities(
     )
 
 
+def select_execution_provider(
+    settings: Settings | None = None,
+) -> DockerExecutionProvider:
+    selected = _validated_settings(settings or get_settings())
+    return DockerExecutionProvider(selected)
+
+
 def select_memory_provider(
     settings: Settings | None = None,
 ) -> tuple[ProviderName, ExecutionProvider | None, str | None]:
-    selected = _validated_settings(settings or get_settings())
-    if selected.cpp_execution_provider == "host":
-        return "host", HostExecutionProvider(), None
-    docker = DockerExecutionProvider(selected)
+    """Compatibility wrapper that never falls back to host execution."""
+    docker = select_execution_provider(settings)
     capabilities = docker.capabilities()
     if (
         capabilities.runtime_available
@@ -453,13 +557,7 @@ def select_memory_provider(
         and capabilities.compiler_available
     ):
         return "docker", docker, None
-    if selected.cpp_execution_provider == "docker":
-        return "docker", None, (
-            capabilities.unavailable_reason
-            or "The isolated memory-checking environment is unavailable."
-        )
-    return (
-        "host",
-        HostExecutionProvider(),
-        capabilities.unavailable_reason,
+    return "docker", None, (
+        capabilities.unavailable_reason
+        or "The isolated runner is unavailable."
     )

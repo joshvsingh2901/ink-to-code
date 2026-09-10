@@ -1,14 +1,10 @@
 import ctypes
 import json
 import math
-import os
 import re
-import subprocess
 import tempfile
-import time
 from collections import Counter
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 from app.schemas.test_execution import (
@@ -42,6 +38,7 @@ from app.services.execution_providers import (
     DockerExecutionResult,
     DockerExecutionProvider,
     ProviderCapabilities,
+    select_execution_provider,
     select_memory_provider,
 )
 from app.services.function_analysis import (
@@ -69,15 +66,6 @@ from app.services.object_analysis import (
 TEST_TIMEOUT_SECONDS = 2
 TEST_OUTPUT_LIMIT_BYTES = 64 * 1024
 OUTPUT_LIMIT_MESSAGE = "\n[Output limited to 64 KiB.]"
-SANITIZER_COMPILE_FLAGS = (
-    "-fsanitize=address,undefined",
-    "-fno-omit-frame-pointer",
-    "-g",
-)
-SANITIZER_ENVIRONMENT = {
-    "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1:abort_on_error=1",
-    "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
-}
 DOUBLE_OUTPUT_PRECISION = 17
 _INTEGER_VALUE = re.compile(r"[+-]?\d+")
 _DOUBLE_VALUE = re.compile(
@@ -107,7 +95,7 @@ class ProcessOutput:
     memory_access_status: str = "not_run"
     undefined_behavior_status: str = "not_run"
     leak_status: str = "not_run"
-    execution_provider: str = "host"
+    execution_provider: str = "docker"
     memory_tool: str = "none"
     container_runtime_available: bool | None = None
     leaked_bytes: int | None = None
@@ -182,28 +170,6 @@ def _limit_bytes(output: bytes) -> tuple[str, bool]:
     )
 
 
-def _file_exceeds_limit(path: Path) -> bool:
-    try:
-        return path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
-    except FileNotFoundError:
-        return False
-
-
-def _completed_exception_result(path: Path) -> bool:
-    if not path.exists() or _file_exceeds_limit(path):
-        return False
-    try:
-        metadata = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(metadata, dict)
-        and metadata.get("process_completed") is True
-        and metadata.get("outcome")
-        in {"threw_standard", "threw_non_standard"}
-    )
-
-
 def _classify_output_match(expected: str, actual: str) -> str:
     if expected == actual:
         return "exact"
@@ -256,6 +222,7 @@ def _function_response(signature: FunctionSignature) -> FunctionResponse:
             vector_depth=value_type.vector_depth,
             passing=value_type.passing,
             size_parameter_name=value_type.size_parameter_name,
+            element_const=getattr(value_type, "element_const", False),
             container_family=value_type.container_family,
             container_name=value_type.container_name,
             key_type=value_type.key_type,
@@ -346,248 +313,34 @@ def _run_process(
     run_memory_checks: bool = False,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
     docker_provider: DockerExecutionProvider | None = None,
+    docker_capabilities: ProviderCapabilities | None = None,
 ) -> ProcessOutput:
-    stdin_path = working_directory / "test-input.txt"
-    stdout_path = working_directory / "test-stdout.txt"
-    stderr_path = working_directory / "test-stderr.txt"
-    function_stdout_path = working_directory / "function-stdout.txt"
-    result_path = working_directory / "function-result.json"
-    result_temp_path = working_directory / "function-result.json.tmp"
-    object_progress_path = working_directory / "object-progress.txt"
-    object_constructor_stdout_path = (
-        working_directory / "object-constructor-stdout.txt"
+    if docker_provider is None:
+        raise CompilerServiceError(
+            "runner_unavailable",
+            "The isolated C++ runner is unavailable.",
+            503,
+        )
+    docker_result = docker_provider.compile_and_run(
+        working_directory,
+        stdin,
+        timeout_seconds=timeout_seconds,
+        run_memory_checks=run_memory_checks,
     )
-    object_constructor_result_path = (
-        working_directory / "object-constructor-result.json"
+    if docker_result.infrastructure_error and not run_memory_checks:
+        raise CompilerServiceError(
+            "runner_unavailable",
+            "The isolated C++ runner is unavailable.",
+            503,
+        )
+    capabilities = docker_capabilities or ProviderCapabilities(
+        "docker", True, True, True, False, False, False, False
     )
-    object_step_stdout_paths = tuple(
-        working_directory / f"object-step-{index}-stdout.txt"
-        for index in range(20)
-    )
-    object_step_result_paths = tuple(
-        working_directory / f"object-step-{index}-result.json"
-        for index in range(20)
-    )
-    result_path.unlink(missing_ok=True)
-    function_stdout_path.unlink(missing_ok=True)
-    object_progress_path.unlink(missing_ok=True)
-    object_constructor_stdout_path.unlink(missing_ok=True)
-    object_constructor_result_path.unlink(missing_ok=True)
-    for path in (*object_step_stdout_paths, *object_step_result_paths):
-        path.unlink(missing_ok=True)
-    if docker_provider is not None:
-        docker_result = docker_provider.compile_and_run(
-            working_directory,
-            stdin,
-            timeout_seconds=timeout_seconds,
-        )
-        return _docker_process_output(
-            docker_result,
-            docker_provider.capabilities(),
-            working_directory,
-        )
-    stdin_path.write_bytes(stdin.encode("utf-8"))
-    timed_out = False
-    output_limited = False
-
-    with (
-        stdin_path.open("rb") as stdin_file,
-        stdout_path.open("w+b") as stdout_file,
-        stderr_path.open("w+b") as stderr_file,
-    ):
-        child_environment = None
-        if run_memory_checks:
-            child_environment = os.environ.copy()
-            child_environment.update(
-                _sanitizer_environment(
-                    leak_detection_enabled=bool(
-                        sanitizer_capabilities
-                        and sanitizer_capabilities.leak_sanitizer_available
-                    )
-                )
-            )
-        process = subprocess.Popen(
-            [str(executable)],
-            cwd=working_directory,
-            stdin=stdin_file,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            shell=False,
-            env=child_environment,
-        )
-        deadline = time.monotonic() + timeout_seconds
-
-        while process.poll() is None:
-            if time.monotonic() >= deadline:
-                timed_out = True
-                process.kill()
-                break
-            if (
-                stdout_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
-                or stderr_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
-                or (
-                    _file_exceeds_limit(function_stdout_path)
-                )
-                or (
-                    _file_exceeds_limit(result_temp_path)
-                )
-                or (
-                    _file_exceeds_limit(result_path)
-                )
-                or _file_exceeds_limit(object_constructor_stdout_path)
-                or _file_exceeds_limit(object_constructor_result_path)
-                or any(
-                    _file_exceeds_limit(path)
-                    for path in (
-                        *object_step_stdout_paths,
-                        *object_step_result_paths,
-                    )
-                )
-            ):
-                output_limited = True
-                process.kill()
-                break
-            time.sleep(0.01)
-
-        exit_code = process.wait()
-        if (
-            timed_out
-            and not run_memory_checks
-            and _completed_exception_result(result_path)
-        ):
-            # The action committed a complete exception outcome before later
-            # process teardown exceeded the host deadline. The process has
-            # still been killed and reaped, but teardown must not replace the
-            # completed action with a timeout.
-            timed_out = False
-            exit_code = 0
-        stdout_file.flush()
-        stderr_file.flush()
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        stdout, stdout_limited = _limit_bytes(
-            stdout_file.read(TEST_OUTPUT_LIMIT_BYTES + 1)
-        )
-        stderr, stderr_limited = _limit_bytes(
-            stderr_file.read(TEST_OUTPUT_LIMIT_BYTES + 1)
-        )
-
-    function_stdout = ""
-    if function_stdout_path.exists():
-        function_stdout, function_limited = _limit_bytes(
-            function_stdout_path.read_bytes()[: TEST_OUTPUT_LIMIT_BYTES + 1]
-        )
-        output_limited = output_limited or function_limited
-    metadata_limited = (
-        (result_path.exists() and result_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES)
-        or (
-            result_temp_path.exists()
-            and result_temp_path.stat().st_size > TEST_OUTPUT_LIMIT_BYTES
-        )
-    )
-    output_limited = output_limited or metadata_limited
-    step_stdout = tuple(
-        (
-            _limit_bytes(
-                path.read_bytes()[: TEST_OUTPUT_LIMIT_BYTES + 1]
-            )[0]
-            if path.exists()
-            else ""
-        )
-        for path in object_step_stdout_paths
-    )
-    step_metadata = tuple(
-        (
-            path.read_text(encoding="utf-8", errors="replace")
-            if path.exists() and not _file_exceeds_limit(path)
-            else None
-        )
-        for path in object_step_result_paths
-    )
-    progress_index = None
-    if object_progress_path.exists():
-        try:
-            progress_index = int(
-                object_progress_path.read_text(encoding="utf-8").strip()
-            )
-        except ValueError:
-            progress_index = None
-    memory_status, memory_summary, memory_diagnostics = (
-        _classify_memory_diagnostics(
-            stderr,
-            working_directory,
-            exit_code=None if timed_out else exit_code,
-            timed_out=timed_out,
-        )
-        if run_memory_checks
-        else ("not_run", None, None)
-    )
-    (
-        memory_access_status,
-        undefined_behavior_status,
-        leak_status,
-    ) = _sanitizer_channel_statuses(
-        memory_status,
-        sanitizer_capabilities,
-        run_memory_checks,
-    )
-    if (
-        run_memory_checks
-        and memory_status == "clean"
-        and leak_status == "unavailable"
-    ):
-        memory_status = "partial"
-        memory_summary = (
-            "Memory access and undefined-behaviour checks passed, but "
-            "leaks could not be checked with the current compiler runtime."
-        )
-    return ProcessOutput(
-        stdout=stdout,
-        stderr=stderr,
-        exit_code=None if timed_out else exit_code,
-        timed_out=timed_out,
-        output_limited=output_limited or stdout_limited or stderr_limited,
-        function_stdout=function_stdout,
-        result_metadata=(
-            result_path.read_text(encoding="utf-8", errors="replace")
-            if result_path.exists() and not metadata_limited
-            else None
-        ),
-        step_stdout=step_stdout,
-        step_metadata=step_metadata,
-        progress_index=progress_index,
-        constructor_metadata=(
-            object_constructor_result_path.read_text(
-                encoding="utf-8", errors="replace"
-            )
-            if object_constructor_result_path.exists()
-            and not _file_exceeds_limit(object_constructor_result_path)
-            else None
-        ),
-        memory_status=memory_status,
-        memory_summary=memory_summary,
-        memory_diagnostics=memory_diagnostics,
-        address_sanitizer_available=(
-            sanitizer_capabilities.address_sanitizer_available
-            if sanitizer_capabilities
-            else None
-        ),
-        undefined_behavior_sanitizer_available=(
-            sanitizer_capabilities.undefined_behavior_sanitizer_available
-            if sanitizer_capabilities
-            else None
-        ),
-        leak_sanitizer_available=(
-            sanitizer_capabilities.leak_sanitizer_available
-            if sanitizer_capabilities
-            else None
-        ),
-        memory_access_status=memory_access_status,
-        undefined_behavior_status=undefined_behavior_status,
-        leak_status=leak_status,
-        execution_provider="host",
-        memory_tool="sanitizer" if run_memory_checks else "none",
-        container_runtime_available=False if run_memory_checks else None,
+    return _docker_process_output(
+        docker_result,
+        capabilities,
+        working_directory,
+        run_memory_checks=run_memory_checks,
     )
 
 
@@ -595,6 +348,8 @@ def _docker_process_output(
     result: DockerExecutionResult,
     capabilities: ProviderCapabilities,
     working_directory: Path,
+    *,
+    run_memory_checks: bool = True,
 ) -> ProcessOutput:
     if result.infrastructure_error:
         return ProcessOutput(
@@ -622,18 +377,22 @@ def _docker_process_output(
             container_runtime_available=True,
             infrastructure_error=result.infrastructure_error,
         )
-    sanitizer_status, summary, diagnostics = _classify_memory_diagnostics(
-        result.stderr,
-        working_directory,
-        exit_code=result.exit_code,
-        timed_out=result.timed_out,
+    sanitizer_status, summary, diagnostics = (
+        _classify_memory_diagnostics(
+            result.stderr,
+            working_directory,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+        )
+        if run_memory_checks
+        else ("not_run", None, None)
     )
     leak_status = (
         "clean"
         if capabilities.leak_sanitizer_available
         or capabilities.valgrind_available
         else "unavailable"
-    )
+    ) if run_memory_checks else "not_run"
     if result.leak_kind in {"definite", "indirect"}:
         sanitizer_status = "leak"
         leak_status = "failed"
@@ -668,7 +427,7 @@ def _docker_process_output(
                 capabilities.leak_sanitizer_available
                 or capabilities.valgrind_available,
             ),
-            True,
+            run_memory_checks,
         )
     )
     if result.leak_kind is not None:
@@ -700,14 +459,18 @@ def _docker_process_output(
         ),
         address_sanitizer_available=(
             capabilities.address_sanitizer_available
+            if run_memory_checks
+            else None
         ),
         undefined_behavior_sanitizer_available=(
             capabilities.undefined_behavior_sanitizer_available
+            if run_memory_checks
+            else None
         ),
         leak_sanitizer_available=(
             capabilities.leak_sanitizer_available
             or capabilities.valgrind_available
-        ),
+        ) if run_memory_checks else None,
         memory_access_status=access_status,
         undefined_behavior_status=undefined_status,
         leak_status=classified_leak_status,
@@ -881,18 +644,6 @@ def _sanitizer_channel_statuses(
     return access_status, undefined_status, leak_status
 
 
-def _sanitizer_environment(
-    *,
-    leak_detection_enabled: bool,
-) -> dict[str, str]:
-    environment = dict(SANITIZER_ENVIRONMENT)
-    if not leak_detection_enabled:
-        environment["ASAN_OPTIONS"] = (
-            "detect_leaks=0:halt_on_error=1:abort_on_error=1"
-        )
-    return environment
-
-
 def _memory_result_fields(
     output: ProcessOutput,
     enabled: bool,
@@ -1022,155 +773,6 @@ def _memory_infrastructure_failure(
     )
 
 
-def _sanitizer_unavailable(compiler_output: str) -> bool:
-    lowered = compiler_output.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "unrecognized command-line option",
-            "unsupported option",
-            "unsupported argument",
-            "invalid argument '-fsanitize",
-            "cannot find -lasan",
-            "cannot find -lubsan",
-            "library not found for -lasan",
-            "library not found for -lubsan",
-        )
-    )
-
-
-def _probe_compile_and_run(
-    compiler: str,
-    source: str,
-    sanitizer_flag: str,
-    *,
-    environment: dict[str, str],
-) -> subprocess.CompletedProcess[bytes] | None:
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix="inktocode-sanitizer-probe-"
-        ) as directory:
-            working_directory = Path(directory)
-            (working_directory / "probe.cpp").write_text(
-                source, encoding="utf-8"
-            )
-            compile_result = subprocess.run(
-                [
-                    compiler,
-                    "-std=c++17",
-                    sanitizer_flag,
-                    "-fno-omit-frame-pointer",
-                    "-g",
-                    "probe.cpp",
-                    "-o",
-                    "probe",
-                ],
-                cwd=working_directory,
-                capture_output=True,
-                timeout=COMPILE_TIMEOUT_SECONDS,
-                check=False,
-                shell=False,
-            )
-            if compile_result.returncode != 0:
-                return None
-            return subprocess.run(
-                [str(working_directory / "probe")],
-                cwd=working_directory,
-                capture_output=True,
-                timeout=TEST_TIMEOUT_SECONDS,
-                check=False,
-                shell=False,
-                env=environment,
-            )
-    except (
-        FileNotFoundError,
-        OSError,
-        subprocess.SubprocessError,
-        subprocess.TimeoutExpired,
-    ):
-        return None
-
-
-@lru_cache(maxsize=8)
-def _probe_sanitizer_capabilities(
-    compiler: str,
-) -> SanitizerCapabilities:
-    base_environment = os.environ.copy()
-    base_environment.update(
-        _sanitizer_environment(leak_detection_enabled=False)
-    )
-    clean_source = "int main() { return 0; }\n"
-    address_result = _probe_compile_and_run(
-        compiler,
-        clean_source,
-        "-fsanitize=address",
-        environment=base_environment,
-    )
-    undefined_result = _probe_compile_and_run(
-        compiler,
-        clean_source,
-        "-fsanitize=undefined",
-        environment=base_environment,
-    )
-    address_available = bool(
-        address_result is not None and address_result.returncode == 0
-    )
-    undefined_available = bool(
-        undefined_result is not None and undefined_result.returncode == 0
-    )
-
-    leak_available = False
-    if address_available:
-        leak_environment = os.environ.copy()
-        leak_environment.update(
-            _sanitizer_environment(leak_detection_enabled=True)
-        )
-        leak_result = _probe_compile_and_run(
-            compiler,
-            (
-                "int main() { "
-                "volatile int* leaked = new int(7); "
-                "(void)leaked; return 0; }\n"
-            ),
-            (
-                "-fsanitize=address,undefined"
-                if undefined_available
-                else "-fsanitize=address"
-            ),
-            environment=leak_environment,
-        )
-        if leak_result is not None:
-            leak_output = (
-                leak_result.stderr + b"\n" + leak_result.stdout
-            ).decode("utf-8", errors="replace").lower()
-            leak_available = (
-                "leaksanitizer" in leak_output
-                or "detected memory leaks" in leak_output
-            )
-    return SanitizerCapabilities(
-        address_sanitizer_available=address_available,
-        undefined_behavior_sanitizer_available=undefined_available,
-        leak_sanitizer_available=leak_available,
-    )
-
-
-def _sanitizer_compile_flags(
-    capabilities: SanitizerCapabilities,
-) -> tuple[str, ...]:
-    sanitizers = []
-    if capabilities.address_sanitizer_available:
-        sanitizers.append("address")
-    if capabilities.undefined_behavior_sanitizer_available:
-        sanitizers.append("undefined")
-    if not sanitizers:
-        return ()
-    return (
-        f"-fsanitize={','.join(sanitizers)}",
-        "-fno-omit-frame-pointer",
-        "-g",
-    )
-
-
 def _compile_executable(
     working_directory: Path,
     *,
@@ -1180,52 +782,35 @@ def _compile_executable(
     sanitizer_capabilities: SanitizerCapabilities | None = None,
     docker_provider: DockerExecutionProvider | None = None,
 ) -> tuple[str | None, bool]:
-    if docker_provider is not None:
-        result = docker_provider.compile_and_run(
-            working_directory,
-            "",
-            timeout_seconds=timeout_seconds,
-            compile_only=True,
+    del compiler, sanitizer_capabilities
+    if docker_provider is None:
+        raise CompilerServiceError(
+            "runner_unavailable",
+            "The isolated C++ runner is unavailable.",
+            503,
         )
-        if result.compile_timed_out:
-            raise CompilerServiceError(
-                "memory_compile_timeout",
-                "The isolated runner could not finish compiling the test "
-                "program in time.",
-                504,
-            )
-        if result.infrastructure_error:
+    result = docker_provider.compile_and_run(
+        working_directory,
+        "",
+        timeout_seconds=timeout_seconds,
+        compile_only=True,
+        run_memory_checks=run_memory_checks,
+    )
+    if result.compile_timed_out:
+        raise CompilerServiceError(
+            "compiler_timeout",
+            "Compiling the runnable test program exceeded the time limit.",
+            504,
+        )
+    if result.infrastructure_error:
+        if run_memory_checks:
             return result.infrastructure_error, True
-        return result.compile_error, False
-    command = [compiler, "-std=c++17", "main.cpp", "-o", "program"]
-    if run_memory_checks:
-        capabilities = (
-            sanitizer_capabilities
-            or _probe_sanitizer_capabilities(compiler)
+        raise CompilerServiceError(
+            "runner_unavailable",
+            "The isolated C++ runner is unavailable.",
+            503,
         )
-        flags = _sanitizer_compile_flags(capabilities)
-        if not flags:
-            return (
-                "Memory diagnostics are unavailable with the current compiler.",
-                True,
-            )
-        command[2:2] = flags
-    completed = subprocess.run(
-        command,
-        cwd=working_directory,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
-        shell=False,
-    )
-    stdout, _ = _limit_bytes(completed.stdout)
-    stderr, _ = _limit_bytes(completed.stderr)
-    if completed.returncode == 0:
-        return None, False
-    diagnostic = (
-        stderr or stdout or "The compiler failed without diagnostic output."
-    )
-    return diagnostic, run_memory_checks and _sanitizer_unavailable(diagnostic)
+    return result.compile_error, False
 
 
 def _integer_bounds(c_type: type[ctypes._SimpleCData]) -> tuple[int, int]:
@@ -2922,6 +2507,7 @@ def _program_results(
     timeout_seconds: float,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
     docker_provider: DockerExecutionProvider | None = None,
+    docker_capabilities: ProviderCapabilities | None = None,
 ) -> list[ProgramTestResult]:
     results: list[ProgramTestResult] = []
     for test in request.tests:
@@ -2933,6 +2519,7 @@ def _program_results(
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
             docker_provider=docker_provider,
+            docker_capabilities=docker_capabilities,
         )
         match_type = _classify_program_output_match(
             test.expected_stdout,
@@ -3152,6 +2739,7 @@ def _function_results(
     timeout_seconds: float,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
     docker_provider: DockerExecutionProvider | None = None,
+    docker_capabilities: ProviderCapabilities | None = None,
 ) -> list[
     FunctionTestResult
     | FunctionOutputTestResult
@@ -3178,6 +2766,7 @@ def _function_results(
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
             docker_provider=docker_provider,
+            docker_capabilities=docker_capabilities,
         )
         metadata: dict[str, object] | None = None
         if output.result_metadata is not None:
@@ -3572,6 +3161,7 @@ def _object_results(
     timeout_seconds: float,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
     docker_provider: DockerExecutionProvider | None = None,
+    docker_capabilities: ProviderCapabilities | None = None,
 ) -> list[ObjectScenarioTestResult]:
     results: list[ObjectScenarioTestResult] = []
     for scenario_index, (test, prepared) in enumerate(
@@ -3585,6 +3175,7 @@ def _object_results(
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
             docker_provider=docker_provider,
+            docker_capabilities=docker_capabilities,
         )
         constructor_metadata: dict[str, object] | None = None
         if output.constructor_metadata is not None:
@@ -5183,8 +4774,11 @@ def run_test_request(
         mutation_capable_parameters = [
             parameter
             for parameter in function.parameters
-            if parameter.value_type.passing
-            in {"mutable_reference", "scalar_pointer", "array_pointer"}
+            if parameter.value_type.passing in {"mutable_reference", "scalar_pointer"}
+            or (
+                parameter.value_type.passing == "array_pointer"
+                and not parameter.value_type.element_const
+            )
             or (
                 parameter.value_type.kind == "iterator"
                 and parameter.value_type.iterator_const is False
@@ -5447,9 +5041,17 @@ def run_test_request(
                 )
             arguments_by_test.append(prepared_arguments)
 
-    docker_provider: DockerExecutionProvider | None = None
-    provider_name = "host"
+    try:
+        docker_provider = select_execution_provider()
+    except ValueError as error:
+        raise CompilerServiceError(
+            "runner_unavailable",
+            "The isolated C++ runner is unavailable.",
+            503,
+        ) from error
+    provider_name = "docker"
     provider_unavailable: str | None = None
+    docker_capabilities: ProviderCapabilities | None = None
     if request.run_memory_checks:
         provider_name, selected_provider, provider_unavailable = (
             select_memory_provider()
@@ -5478,6 +5080,7 @@ def run_test_request(
                 ),
                 tests=[],
             )
+        docker_capabilities = docker_provider.capabilities()
 
     try:
         with tempfile.TemporaryDirectory(prefix="inktocode-tests-") as directory:
@@ -5497,11 +5100,6 @@ def run_test_request(
                 else request.code
             )
             (working_directory / "main.cpp").write_bytes(source.encode("utf-8"))
-            docker_capabilities = (
-                docker_provider.capabilities()
-                if docker_provider is not None
-                else None
-            )
             sanitizer_capabilities = (
                 SanitizerCapabilities(
                     docker_capabilities.address_sanitizer_available,
@@ -5510,8 +5108,6 @@ def run_test_request(
                     or docker_capabilities.valgrind_available,
                 )
                 if docker_capabilities is not None
-                else _probe_sanitizer_capabilities(compiler)
-                if request.run_memory_checks
                 else None
             )
             compile_error, sanitizer_unavailable = _compile_executable(
@@ -5612,6 +5208,7 @@ def run_test_request(
                     timeout_seconds=test_timeout_seconds,
                     sanitizer_capabilities=sanitizer_capabilities,
                     docker_provider=docker_provider,
+                    docker_capabilities=docker_capabilities,
                 )
                 infrastructure_failure = _memory_infrastructure_failure(
                     results
@@ -5670,6 +5267,7 @@ def run_test_request(
                     timeout_seconds=test_timeout_seconds,
                     sanitizer_capabilities=sanitizer_capabilities,
                     docker_provider=docker_provider,
+                    docker_capabilities=docker_capabilities,
                 )
                 infrastructure_failure = _memory_infrastructure_failure(
                     object_results
@@ -5730,6 +5328,7 @@ def run_test_request(
                 timeout_seconds=test_timeout_seconds,
                 sanitizer_capabilities=sanitizer_capabilities,
                 docker_provider=docker_provider,
+                docker_capabilities=docker_capabilities,
             )
             infrastructure_failure = _memory_infrastructure_failure(
                 function_results
@@ -5782,23 +5381,13 @@ def run_test_request(
                 function=_function_response(function),
                 tests=function_results,
             )
-    except FileNotFoundError as error:
-        raise CompilerServiceError(
-            "compiler_unavailable",
-            "The C++ compiler is unavailable on the backend.",
-            503,
-        ) from error
-    except subprocess.TimeoutExpired as error:
-        raise CompilerServiceError(
-            "compiler_timeout",
-            "Compiling the runnable test program exceeded the time limit.",
-            504,
-        ) from error
-    except (OSError, subprocess.SubprocessError) as error:
+    except CompilerServiceError:
+        raise
+    except (OSError, ValueError) as error:
         raise CompilerServiceError(
             "test_execution_failed",
-            "The backend could not compile or run the tests.",
-            500,
+            "The isolated C++ runner could not compile or run the tests.",
+            503,
         ) from error
 
 

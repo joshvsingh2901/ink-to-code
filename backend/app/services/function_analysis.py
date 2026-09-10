@@ -116,6 +116,7 @@ class ValueType:
         "array_pointer",
     ] = "value"
     size_parameter_name: str | None = None
+    element_const: bool = False
     container_family: ContainerFamily | None = None
     container_name: ContainerName | None = None
     key_type: str | None = None
@@ -291,7 +292,9 @@ _SCALAR_POINTER_TYPE = re.compile(
     r"(?P<suffix_const>const\s*)?(?P<modifier>\*+)"
 )
 _ARRAY_PARAMETER = re.compile(
+    r"(?P<prefix_const>const\s+)?"
     r"(?P<element>long\s+long|long|int|double|bool|char)\s*"
+    r"(?P<suffix_const>const\s*)?"
     r"(?:"
     r"(?P<pointers>\*+)\s*(?P<pointer_name>[A-Za-z_]\w*)"
     r"|(?P<array_name>[A-Za-z_]\w*)\s*"
@@ -989,7 +992,14 @@ def _parse_parameters(
             return None, "References to arrays are unsupported."
 
         array_match = _ARRAY_PARAMETER.fullmatch(parameter)
-        if array_match is not None:
+        array_match_is_const_char = array_match is not None and (
+            " ".join(array_match.group("element").split()) == "char"
+            and (
+                array_match.group("prefix_const")
+                or array_match.group("suffix_const")
+            )
+        )
+        if array_match is not None and not array_match_is_const_char:
             element_type = " ".join(array_match.group("element").split())
             if element_type == "char":
                 return None, "Character arrays and pointers are unsupported."
@@ -1003,12 +1013,17 @@ def _parse_parameters(
                 array_match.group("pointer_name")
                 or array_match.group("array_name")
             )
+            is_const = bool(
+                array_match.group("prefix_const")
+                or array_match.group("suffix_const")
+            )
             value_type = (
                 ValueType(
                     kind="scalar",
                     display_type=f"{element_type}*",
                     scalar_type=element_type,
                     passing="scalar_pointer",
+                    element_const=is_const,
                 )
                 if pointers
                 else ValueType(
@@ -1016,6 +1031,7 @@ def _parse_parameters(
                         display_type=f"{element_type}[]",
                         element_type=element_type,
                         passing="array_pointer",
+                        element_const=is_const,
                 )
             )
             parsed.append(
@@ -1075,6 +1091,11 @@ def _parse_parameters(
         ]
         if not candidates:
             if is_numeric_pointer:
+                if parameter.value_type.element_const:
+                    return (
+                        None,
+                        "Const scalar pointer parameters are unsupported.",
+                    )
                 continue
             return (
                 None,
@@ -1102,6 +1123,7 @@ def _parse_parameters(
                 ),
                 passing="array_pointer",
                 size_parameter_name=size_parameter.name,
+                element_const=parameter.value_type.element_const,
             ),
         )
     grouped, error = _assign_iterator_groups(linked)

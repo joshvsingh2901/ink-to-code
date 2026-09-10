@@ -1129,6 +1129,7 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
             )
             for object_class in classes
         ]
+    candidate_classes = classes
     classes = [
         object_class
         for object_class in classes
@@ -1141,14 +1142,37 @@ def analyze_object_scenarios(source: str) -> ObjectAnalysis:
         )
     ]
     if not classes:
+        lifecycle_only = next(
+            (
+                object_class
+                for object_class in candidate_classes
+                if object_class.inheritance_supported
+                and not (
+                    object_class.methods
+                    or object_class.operators
+                    or object_class.base_class_id
+                    or object_class.derived_class_ids
+                )
+                and object_class.special_members
+            ),
+            None,
+        )
         message = (
             "Inheritance is unsupported in object scenarios."
             if rejected_inheritance
             else "This advanced class-template form is unsupported."
             if rejected_template
             else (
-                "No class or struct with a usable public constructor "
-                "and public instance method was found."
+                f"'{lifecycle_only.name}' defines lifecycle operations "
+                "(constructor, destructor, copy/move) but has no supported "
+                "public instance method to exercise through an object "
+                "scenario. Add a public observer or instance method to "
+                "make it directly testable."
+                if lifecycle_only is not None
+                else (
+                    "No class or struct with a usable public constructor "
+                    "and public instance method was found."
+                )
             )
         )
     return ObjectAnalysis(classes=tuple(classes), message=message)

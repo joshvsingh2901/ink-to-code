@@ -197,3 +197,48 @@ def test_legacy_vector_vector_int():
     assert vt is not None
     assert vt.kind == "vector"
     assert vt.vector_depth == 2
+
+
+# ---------------------------------------------------------------------------
+# const-reference containers — read-only inputs (SIGNATURE_PARSER_REPAIR_PLAN.md)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("declaration", "container_name"),
+    [
+        ("const std::deque<int>&", "deque"),
+        ("const std::set<int>&", "set"),
+        ("const std::map<std::string, int>&", "map"),
+    ],
+)
+def test_const_reference_containers_are_read_only(
+    declaration: str,
+    container_name: str,
+):
+    vt, err = _parse_param(declaration)
+    assert err is None
+    assert vt is not None
+    assert vt.kind == "container"
+    assert vt.container_name == container_name
+    assert vt.passing == "const_reference"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "container_name"),
+    [
+        ("std::deque<int>&", "deque"),
+        ("std::set<int>&", "set"),
+        ("std::map<std::string, int>&", "map"),
+    ],
+)
+def test_mutable_reference_containers_stay_mutable(
+    declaration: str,
+    container_name: str,
+):
+    vt, err = _parse_param(declaration)
+    assert err is None
+    assert vt is not None
+    assert vt.kind == "container"
+    assert vt.container_name == container_name
+    assert vt.passing == "mutable_reference"

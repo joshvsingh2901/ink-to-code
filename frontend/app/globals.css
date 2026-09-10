@@ -1,14 +1,190 @@
 @import "tailwindcss";
 
+/*
+ * Design foundation (Phase 1 of FRONTEND_REDESIGN_PLAN.md).
+ *
+ * Two kinds of variables live in this file:
+ *
+ * 1. Inside `@theme` — Tailwind v4's own recognized scale namespaces
+ *    (--font-*, --text-*, --radius-*). Overriding these here reshapes
+ *    every existing `font-sans`, `font-mono`, `text-sm`, `rounded-lg`,
+ *    etc. utility class already used across the app, with zero edits
+ *    to any component file.
+ *
+ * 2. Plain custom properties on `:root` — the new semantic design
+ *    tokens (surface / border / ink / status / accent). These are
+ *    intentionally kept OUTSIDE `@theme`: several of the plan's token
+ *    names (e.g. `--text-primary`) collide with Tailwind's reserved
+ *    `--text-*` font-size namespace, and `--color-text-primary` would
+ *    only generate an awkward doubled utility (`text-text-primary`).
+ *    Declaring them as ordinary CSS variables avoids both problems
+ *    while still making every token available via `var(--token-name)`
+ *    wherever a later phase wires a component to it.
+ *
+ * PRODUCT.md locks a dark-first Operate register (Linear / Cursor /
+ * Vercel dashboard: calm, technical, restrained). Dark values are the
+ * unconditional default on bare `:root` and do NOT change based on
+ * OS/browser colour-scheme preference — a user on a light-mode system
+ * still gets the dark-first design. A light alternate — close to this
+ * app's pre-redesign appearance — exists only as an explicit opt-in
+ * under `:root[data-theme="light"]`. Nothing in the app sets
+ * `data-theme` today, so this is scaffolding for a later, deliberate
+ * toggle, not a currently-reachable state and not a fallback.
+ */
+
 :root {
-  --background: #f8fafc;
-  --foreground: #0f172a;
+  color-scheme: dark;
+
+  /* Surface ramp — four levels, no more. --surface-code is the single
+     answer to "what colour is code" for Monaco, the review
+     transcription box, and any inline code block (wired in Phase 2A/5). */
+  --surface-base: #0a0d12;
+  --surface-raised: #12161f;
+  --surface-sunken: #05070a;
+  --surface-code: #0d1117;
+
+  /* Border ramp */
+  --border-subtle: #1b202b;
+  --border-default: #262c3a;
+  --border-strong: #39414f;
+
+  /* Text (ink) ramp. Named --ink-* rather than --text-* to avoid
+     colliding with Tailwind's reserved --text-* font-size namespace
+     defined below. */
+  --ink-primary: #f1f4f8;
+  --ink-secondary: #aab2c0;
+  --ink-tertiary: #6b7280;
+  --ink-code: #d7dde5;
+
+  /* Status — fg / bg / border per channel, so status is never
+     encoded in text colour alone (Phase 3 consumes these). */
+  --status-ok-fg: #4ade80;
+  --status-ok-bg: rgb(34 197 94 / 0.14);
+  --status-ok-border: #22c55e;
+
+  --status-fail-fg: #f87171;
+  --status-fail-bg: rgb(248 113 113 / 0.14);
+  --status-fail-border: #ef4444;
+
+  /* Desaturated, low-alert variant of status-fail for manual-test input
+     validation — a border/rule, not the saturated status-fail-border. */
+  --invalid-fg: #e8a3a3;
+  --invalid-bg: rgb(190 90 90 / 0.1);
+  --invalid-border: rgb(214 120 120 / 0.45);
+
+  --status-warn-fg: #fbbf24;
+  --status-warn-bg: rgb(251 191 36 / 0.14);
+  --status-warn-border: #f59e0b;
+
+  --status-info-fg: #60a5fa;
+  --status-info-bg: rgb(96 165 250 / 0.14);
+  --status-info-border: #3b82f6;
+
+  /* Accent — exactly one, restrained. Used for focus rings, the
+     active tab underline, and primary actions once later phases
+     wire it in. */
+  --accent: #6366f1;
+  --accent-emphasis: #818cf8;
+  --accent-foreground: #f8fafc;
+
+  /* Spacing rhythm — Tailwind's default --spacing (4px base) already
+     matches the plan's rhythm and is deliberately left untouched:
+     overriding it would rescale every padding, gap, and margin
+     utility in the app, which is a layout change, not a materials
+     change. This is the one named addition Phase 1 owns: a compact
+     line-height for the dense results rail, for Phase 3/4 to apply
+     where needed. */
+  --density-compact-line-height: 1.35;
+
+  /* Back-compat aliases consumed by `body` below. Not referenced by
+     any component file. */
+  --background: var(--surface-base);
+  --foreground: var(--ink-primary);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: Arial, Helvetica, sans-serif;
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --surface-base: #f8fafc;
+  --surface-raised: #ffffff;
+  --surface-sunken: #f1f5f9;
+  --surface-code: #0f172a;
+
+  --border-subtle: #e2e8f0;
+  --border-default: #cbd5e1;
+  --border-strong: #94a3b8;
+
+  --ink-primary: #0f172a;
+  --ink-secondary: #475569;
+  --ink-tertiary: #64748b;
+  --ink-code: #e2e8f0;
+
+  --status-ok-fg: #15803d;
+  --status-ok-bg: rgb(34 197 94 / 0.1);
+  --status-ok-border: #16a34a;
+
+  --status-fail-fg: #be123c;
+  --status-fail-bg: rgb(244 63 94 / 0.1);
+  --status-fail-border: #e11d48;
+
+  --invalid-fg: #9f5b5b;
+  --invalid-bg: rgb(190 60 60 / 0.08);
+  --invalid-border: rgb(180 90 90 / 0.35);
+
+  --status-warn-fg: #b45309;
+  --status-warn-bg: rgb(245 158 11 / 0.1);
+  --status-warn-border: #d97706;
+
+  --status-info-fg: #1d4ed8;
+  --status-info-bg: rgb(59 130 246 / 0.1);
+  --status-info-border: #2563eb;
+
+  --accent: #4f46e5;
+  --accent-emphasis: #4338ca;
+  --accent-foreground: #f8fafc;
+}
+
+@theme {
+  /* Fonts. --font-ui / --font-mono-code are generated by next/font in
+     layout.tsx (self-hosted at build time — no external runtime
+     dependency, no new package). Overriding --font-sans / --font-mono
+     here is sufficient to replace Arial everywhere: Tailwind's
+     Preflight already reads --font-sans as the base font for html/body,
+     and every existing `font-mono` utility class already resolves
+     through --font-mono, so no component file needs to change. */
+  --font-sans: var(--font-ui), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: var(--font-mono-code), ui-monospace, "SFMono-Regular", Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  /* Radius scale — three values, ceiling of 10px, plus Tailwind's
+     untouched rounded-full (9999px) for pills/avatars and Monaco's
+     own 0px (square, unmanaged by Tailwind). rounded-sm/md already
+     matched the plan's numbers; rounded-lg/xl/2xl are compressed down
+     to the 10px ceiling so every existing card/panel in the app
+     collapses onto the token set without a single component edit. */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 10px;
+  --radius-2xl: 10px;
+
+  /* Type scale — four UI sizes, plus a dedicated code size. Existing
+     text-xs/sm/base/lg utility classes throughout the app resolve to
+     these automatically. Arbitrary-value classes (text-[10px],
+     text-[11px] in AITestPanel.tsx / editor/page.tsx) are untouched by
+     this — they're out of Phase 1's file scope and are mapped onto
+     this scale in Phase 3/4, per the plan. */
+  --text-xs: 0.75rem; /* 12px */
+  --text-xs--line-height: 1rem; /* 16px */
+  --text-sm: 0.8125rem; /* 13px */
+  --text-sm--line-height: 1.125rem; /* 18px */
+  --text-base: 0.875rem; /* 14px */
+  --text-base--line-height: 1.375rem; /* 22px */
+  --text-lg: 1rem; /* 16px */
+  --text-lg--line-height: 1.5rem; /* 24px */
+  --text-code: 0.8125rem; /* 13px, mono */
+  --text-code--line-height: 1.25rem; /* 20px */
 }
 
 body {
@@ -18,4 +194,199 @@ body {
 
 .monaco-editor .compiler-issue-line-highlight {
   background: rgb(148 163 184 / 14%);
+}
+
+/*
+ * Phase 2A right-pane dark wiring.
+ *
+ * The compiler/tests pane's own chrome (background, border, tab strip)
+ * is wired directly to Phase 1 tokens in editor/page.tsx. Its deep
+ * content — compiler diagnostic cards, the manual test builder, result
+ * rows, the AI test panel and its sub-components — is explicitly out
+ * of scope for a redesign right now: only its *colours* need to stop
+ * assuming a white parent. Editing every text/background/border class
+ * across that content (which spans editor/page.tsx and several
+ * component files) would be exactly the "broad component changes" and
+ * "result card redesign" that are out of scope.
+ *
+ * Unlayered CSS beats Tailwind's own `@layer utilities` regardless of
+ * selector order, so these rules reliably override the plain utility
+ * classes already in that markup — no component file is touched, and
+ * no card's structure, spacing, or behaviour changes, only the colour
+ * each existing class resolves to inside `.pane-dark`. `[class~="…"]`
+ * matches a class token as-is (including `hover:`/opacity-suffixed
+ * variants) without needing to hand-escape Tailwind's generated
+ * selectors.
+ */
+.pane-dark [class~="text-slate-500"] {
+  color: var(--ink-tertiary);
+}
+.pane-dark [class~="text-slate-600"],
+.pane-dark [class~="text-slate-700"] {
+  color: var(--ink-secondary);
+}
+.pane-dark [class~="text-slate-800"],
+.pane-dark [class~="text-slate-900"],
+.pane-dark [class~="text-slate-950"] {
+  color: var(--ink-primary);
+}
+.pane-dark [class~="hover:text-slate-800"]:hover,
+.pane-dark [class~="hover:text-slate-900"]:hover {
+  color: var(--ink-primary);
+}
+
+.pane-dark [class~="bg-white"],
+.pane-dark [class~="bg-slate-50"],
+.pane-dark [class~="bg-slate-100"],
+.pane-dark [class~="bg-slate-50/50"] {
+  /* --surface-code, not --surface-sunken: sunken is darker than
+     Monaco, which would put embedded value/code wells below the
+     hierarchy's stated floor. --surface-code keeps them level with
+     the editor itself. */
+  background-color: var(--surface-code);
+}
+.pane-dark [class~="hover:bg-slate-50"]:hover {
+  background-color: var(--surface-code);
+}
+.pane-dark [class~="bg-slate-700"] {
+  background-color: var(--border-strong);
+}
+
+.pane-dark [class~="border-slate-200"] {
+  border-color: var(--border-subtle);
+}
+.pane-dark [class~="border-slate-300"],
+.pane-dark [class~="border-slate-500"] {
+  border-color: var(--border-default);
+}
+.pane-dark [class~="border-slate-900"] {
+  border-color: var(--accent);
+}
+
+.pane-dark [class~="focus-visible:outline-slate-900"]:focus-visible {
+  outline-color: var(--accent);
+}
+
+.pane-dark [class~="text-rose-600"],
+.pane-dark [class~="text-rose-700"],
+.pane-dark [class~="text-rose-800"],
+.pane-dark [class~="text-red-600"] {
+  color: var(--status-fail-fg);
+}
+.pane-dark [class~="hover:text-rose-700"]:hover {
+  color: var(--status-fail-fg);
+}
+.pane-dark [class~="text-emerald-700"] {
+  color: var(--status-ok-fg);
+}
+.pane-dark [class~="text-amber-600"],
+.pane-dark [class~="text-amber-700"],
+.pane-dark [class~="text-amber-800"] {
+  color: var(--status-warn-fg);
+}
+
+.pane-dark [class~="bg-rose-50"],
+.pane-dark [class~="bg-rose-50/30"] {
+  background-color: var(--status-fail-bg);
+}
+.pane-dark [class~="hover:bg-rose-50"]:hover {
+  background-color: var(--status-fail-bg);
+}
+.pane-dark [class~="bg-amber-50"],
+.pane-dark [class~="bg-amber-50/30"] {
+  background-color: var(--status-warn-bg);
+}
+
+.pane-dark [class~="border-rose-100"],
+.pane-dark [class~="border-rose-200"],
+.pane-dark [class~="border-rose-300"],
+.pane-dark [class~="border-red-400"] {
+  border-color: var(--status-fail-border);
+}
+.pane-dark [class~="border-amber-200"] {
+  border-color: var(--status-warn-border);
+}
+.pane-dark [class~="border-emerald-100"],
+.pane-dark [class~="border-emerald-200"] {
+  border-color: var(--status-ok-border);
+}
+
+/*
+ * Landing page (app/page.tsx) — hover states.
+ *
+ * The landing page uses its own inline-styled visual identity (matching
+ * the Claude Design source exactly, distinct from the app's design-token
+ * system used everywhere else). Scoped under .itc-landing so none of
+ * this touches editor/review/upload styling.
+ */
+.itc-landing a {
+  color: #93a6ff;
+  text-decoration: none;
+}
+.itc-landing a:hover {
+  color: #b9c4ff;
+}
+.itc-landing ::selection {
+  background: #26356e;
+  color: #fff;
+}
+.itc-landing .itc-link-github:hover {
+  color: #fff;
+}
+.itc-landing .itc-btn-primary:hover {
+  background: #6b8aff;
+}
+.itc-landing .itc-btn-secondary:hover {
+  border-color: #343a45;
+  color: #fff;
+}
+.itc-landing .itc-footer-link:hover {
+  color: #c3c9d2;
+}
+
+/* Upload page (app/upload/page.tsx) — hover states, same .itc-landing scope. */
+.itc-landing .itc-back-link:hover {
+  color: #e6e8ec;
+}
+.itc-landing .itc-dismiss-btn:hover {
+  color: #fff;
+  border-color: #4a3138;
+}
+.itc-landing .itc-continue-btn:not(:disabled):hover {
+  background: #6b8aff;
+}
+
+/* ImageUploadCard.tsx (rendered on /upload, inside .itc-landing). */
+.itc-landing .itc-dropzone:hover {
+  border-color: #2d323c;
+}
+.itc-landing .itc-dropzone:focus-visible {
+  border-color: #5b7cfa;
+}
+.itc-landing .itc-icon-btn:not(:disabled):hover {
+  color: #e6e8ec;
+  background: #14171d;
+}
+.itc-landing .itc-icon-btn-danger:not(:disabled):hover {
+  color: #e0776b;
+  border-color: #35242a;
+  background: #16100f;
+}
+.itc-landing .itc-add-more-pill:hover {
+  border-color: #343a45;
+  color: #fff;
+}
+
+/* Review page (app/review/page.tsx), same .itc-landing scope. */
+.itc-landing .itc-page-thumb:hover {
+  border-color: #343a45;
+}
+.itc-landing .itc-jump-label {
+  color: #8f97a3;
+}
+.itc-landing .itc-jump-btn:hover .itc-jump-label {
+  color: #fff;
+}
+.itc-landing .itc-review-editor:focus {
+  border-color: #5b7cfa;
 }

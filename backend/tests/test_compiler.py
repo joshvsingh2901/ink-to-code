@@ -1,6 +1,5 @@
 import asyncio
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -10,6 +9,7 @@ from app.main import app
 from app.services import compiler as compiler_service
 from app.services.compiler import CompilerServiceError, compile_cpp
 from app.services.compiler_diagnostics import parse_compiler_diagnostics
+from app.services.execution_providers import DockerExecutionResult
 
 
 async def api_request(payload: dict[str, str]):
@@ -118,12 +118,12 @@ def test_missing_compiler_is_an_infrastructure_error():
 
 
 def test_compiler_timeout_is_handled(monkeypatch):
-    def timeout_runner(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd="g++", timeout=10)
+    class TimeoutProvider:
+        def compile_source(self, *_args, **_kwargs):
+            return DockerExecutionResult(compile_timed_out=True)
 
-    monkeypatch.setattr(compiler_service.subprocess, "run", timeout_runner)
     with pytest.raises(CompilerServiceError) as caught:
-        compile_cpp("int main() {}")
+        compile_cpp("int main() {}", execution_provider=TimeoutProvider())
     assert caught.value.code == "compiler_timeout"
     assert caught.value.status_code == 504
 
@@ -144,25 +144,16 @@ def test_compiler_uses_safe_argument_list_and_exact_source(monkeypatch):
     submitted = "int main() {\n\treturn 0;  \n}\n"
     invocation = {}
 
-    def recording_runner(command, **kwargs):
-        invocation["command"] = command
-        invocation["kwargs"] = kwargs
-        invocation["source"] = (Path(kwargs["cwd"]) / "main.cpp").read_bytes()
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+    class RecordingProvider:
+        def compile_source(self, work_directory, *, timeout_seconds):
+            invocation["source"] = (work_directory / "main.cpp").read_bytes()
+            invocation["timeout"] = timeout_seconds
+            return DockerExecutionResult(exit_code=0)
 
-    monkeypatch.setattr(compiler_service.subprocess, "run", recording_runner)
-    result = compile_cpp(submitted)
+    result = compile_cpp(submitted, execution_provider=RecordingProvider())
 
     assert result.success is True
-    assert invocation["command"] == [
-        "g++",
-        "-std=c++17",
-        "-D_LIBCPP_REMOVE_TRANSITIVE_INCLUDES",
-        "-fsyntax-only",
-        "main.cpp",
-    ]
-    assert invocation["kwargs"]["shell"] is False
-    assert submitted not in invocation["command"]
+    assert invocation["timeout"] == 10
     assert invocation["source"] == submitted.encode("utf-8")
     assert result.diagnostics == []
 
@@ -337,16 +328,13 @@ def test_unrecognized_compiler_output_remains_available_as_raw_fallback(
 ):
     raw_stderr = "The compiler stopped without a source location."
 
-    def raw_output_runner(command, **_kwargs):
-        return subprocess.CompletedProcess(
-            command,
-            1,
-            stdout="",
-            stderr=raw_stderr,
-        )
+    class RawOutputProvider:
+        def compile_source(self, *_args, **_kwargs):
+            return DockerExecutionResult(exit_code=1, stderr=raw_stderr)
 
-    monkeypatch.setattr(compiler_service.subprocess, "run", raw_output_runner)
-    result = compile_cpp("int main() {}")
+    result = compile_cpp(
+        "int main() {}", execution_provider=RawOutputProvider()
+    )
 
     assert result.success is False
     assert result.stderr == raw_stderr
@@ -361,16 +349,13 @@ def test_explanations_do_not_change_raw_compiler_stderr(monkeypatch):
         ]
     )
 
-    def diagnostic_runner(command, **_kwargs):
-        return subprocess.CompletedProcess(
-            command,
-            1,
-            stdout="",
-            stderr=raw_stderr,
-        )
+    class DiagnosticProvider:
+        def compile_source(self, *_args, **_kwargs):
+            return DockerExecutionResult(exit_code=1, stderr=raw_stderr)
 
-    monkeypatch.setattr(compiler_service.subprocess, "run", diagnostic_runner)
-    result = compile_cpp("int main() {")
+    result = compile_cpp(
+        "int main() {", execution_provider=DiagnosticProvider()
+    )
 
     assert result.stderr == raw_stderr
     assert len(result.diagnostics) == 2

@@ -1,20 +1,27 @@
 import asyncio
 import json
 from io import BytesIO
+import tempfile
 
 import pytest
 from fastapi import UploadFile
+from PIL import Image
 from starlette.datastructures import Headers
 
 from app.services.uploads import (
-    JPEG_SIGNATURE,
-    PNG_SIGNATURE,
     UploadValidationError,
     validate_and_normalize_pages,
 )
 
-PNG_BYTES = PNG_SIGNATURE + b"synthetic-png"
-JPEG_BYTES = JPEG_SIGNATURE + b"synthetic-jpeg\xff\xd9"
+
+def image_bytes(image_format: str, size: tuple[int, int] = (8, 8)) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", size, color=(18, 52, 86)).save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
+PNG_BYTES = image_bytes("PNG")
+JPEG_BYTES = image_bytes("JPEG")
 
 
 def upload(file_id: str, content: bytes = PNG_BYTES, mime: str = "image/png"):
@@ -59,6 +66,18 @@ def test_accepts_one_and_five_code_pages():
     assert len(validate(files, metadata([1, 2, 3, 4, 5]))) == 5
 
 
+@pytest.mark.parametrize(
+    ("content", "mime", "expected_type"),
+    [
+        (PNG_BYTES, "image/png", "image/png"),
+        (JPEG_BYTES, "image/jpeg", "image/jpeg"),
+    ],
+)
+def test_accepts_fully_parsed_png_and_jpeg(content, mime, expected_type):
+    pages = validate([upload("page-1.png", content, mime)], metadata([1]))
+    assert pages[0].content_type == expected_type
+
+
 def test_accepts_optional_question_pages():
     files = [
         upload("page-1.png"),
@@ -85,13 +104,27 @@ def test_normalizes_image_jpg_alias_to_image_jpeg():
     assert pages[0].signature_type == "image/jpeg"
 
 
-def test_rejects_malformed_and_mismatched_image_bytes():
-    with pytest.raises(UploadValidationError, match="not a valid PNG or JPEG"):
-        validate([upload("page-1.png", b"not-an-image")], metadata([1]))
-    with pytest.raises(UploadValidationError, match="do not match"):
+def test_rejects_fake_jpeg_and_mismatched_image_bytes():
+    with pytest.raises(UploadValidationError) as fake_error:
+        validate(
+            [upload("page-1.png", b"arbitrary text", "image/jpeg")],
+            metadata([1]),
+        )
+    assert fake_error.value.code == "upload_content_mismatch"
+
+    with pytest.raises(UploadValidationError) as mismatch_error:
         validate(
             [upload("page-1.png", JPEG_BYTES, mime="image/png")], metadata([1])
         )
+    assert mismatch_error.value.code == "upload_content_mismatch"
+
+
+@pytest.mark.parametrize("content", [PNG_BYTES[:32], JPEG_BYTES[:24]])
+def test_rejects_truncated_images_after_magic_byte_check(content):
+    mime = "image/png" if content.startswith(b"\x89PNG") else "image/jpeg"
+    with pytest.raises(UploadValidationError) as error:
+        validate([upload("page-1.png", content, mime)], metadata([1]))
+    assert error.value.code == "malformed_image"
 
 
 def test_reads_upload_once_into_reusable_immutable_bytes():
@@ -118,6 +151,15 @@ def test_accepts_pdf_derived_png_page():
     pages = validate([upload("page-1.png", PNG_BYTES)], raw_metadata)
     assert pages[0].metadata.source_type == "pdf"
     assert pages[0].content_type == "image/png"
+
+
+def test_rejects_original_pdf_bytes_at_backend_boundary():
+    with pytest.raises(UploadValidationError) as error:
+        validate(
+            [upload("page-1.png", b"%PDF-1.7\n%%EOF", "application/pdf")],
+            metadata([1]),
+        )
+    assert error.value.code == "unsupported_file_type"
 
 
 @pytest.mark.parametrize(
@@ -151,3 +193,66 @@ def test_rejects_category_over_fifty_mb(monkeypatch):
     files = [upload("page-1.png"), upload("page-2.png")]
     with pytest.raises(UploadValidationError, match="50 MB"):
         validate(files, metadata([1, 2]))
+
+
+def test_rejects_excessive_decoded_pixel_count(monkeypatch):
+    monkeypatch.setattr("app.services.uploads.MAX_IMAGE_PIXELS", 100)
+    content = image_bytes("PNG", (11, 10))
+    with pytest.raises(UploadValidationError) as error:
+        validate([upload("page-1.png", content)], metadata([1]))
+    assert error.value.code == "image_dimensions_too_large"
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    ["../../secret.png", "../foo.png", "/absolute/path.png", "..\\foo.png"],
+)
+def test_rejects_path_like_multipart_filenames(unsafe_name):
+    with pytest.raises(UploadValidationError) as error:
+        validate([upload(unsafe_name)], metadata([1]))
+    assert error.value.code == "unsafe_filename"
+
+
+def test_rejects_path_like_original_display_filename():
+    raw_metadata = json.dumps(
+        [
+            {
+                "file_id": "page-1.png",
+                "order": 1,
+                "category": "handwritten_code",
+                "source_type": "image",
+                "original_filename": "foo/../../bar.png",
+                "original_pdf_page_number": None,
+            }
+        ]
+    )
+    with pytest.raises(UploadValidationError) as error:
+        validate([upload("page-1.png")], raw_metadata)
+    assert error.value.code == "invalid_upload_metadata"
+
+
+def test_upload_filename_is_never_used_as_a_temp_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    pages = validate(
+        [upload("client-page-id.png")],
+        metadata([1]).replace("page-1.png", "client-page-id.png"),
+    )
+    assert len(pages) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+class FailingReadFile(BytesIO):
+    def read(self, *_args, **_kwargs):
+        raise OSError("simulated read failure")
+
+
+def test_read_failure_returns_corrupt_upload_without_parser_details():
+    uploaded = UploadFile(
+        FailingReadFile(PNG_BYTES),
+        filename="page-1.png",
+        headers=Headers({"content-type": "image/png"}),
+    )
+    with pytest.raises(UploadValidationError) as error:
+        validate([uploaded], metadata([1]))
+    assert error.value.code == "corrupt_upload"
+    assert "simulated" not in error.value.message

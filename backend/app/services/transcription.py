@@ -394,19 +394,13 @@ def transcribe_pages(
         raise
     except errors.APIError as error:
         if settings.environment == "development":
-            safe_message = (error.message or "unavailable").replace("\n", " ")[:300]
-            if settings.gemini_api_key:
-                safe_message = safe_message.replace(
-                    settings.gemini_api_key, "[redacted]"
-                )
             logger.error(
-                "Gemini %s failed: model=%s type=%s code=%s status=%s message=%s",
+                "Gemini %s failed: model=%s type=%s code=%s status=%s",
                 active_pass,
                 settings.transcription_model,
                 type(error).__name__,
                 error.code,
                 error.status,
-                safe_message,
             )
         raise _classify_api_error(error) from error
     except httpx.TimeoutException as error:

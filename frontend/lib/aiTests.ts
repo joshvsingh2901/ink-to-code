@@ -1,3 +1,5 @@
+import { apiErrorMessage } from "./apiErrors";
+
 /**
  * API helpers for the AI test generation endpoints.
  * Wire-type mirrors of the backend schemas (ai_tests.py).
@@ -116,8 +118,6 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 }
 
-type ApiError = { error?: { message?: string } };
-
 // ---------------------------------------------------------------------------
 // Run AI tests
 // ---------------------------------------------------------------------------
@@ -134,9 +134,14 @@ export async function runAiTests(
     const body: unknown = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const apiError = body as ApiError | null;
       throw new AiTestsRequestError(
-        apiError?.error?.message ?? "AI test generation failed. Please retry.",
+        apiErrorMessage(
+          response.status,
+          body,
+          "AI test generation failed. Please retry.",
+          "ai",
+          response.headers.get("X-Request-ID"),
+        ),
         null,
       );
     }
@@ -166,9 +171,14 @@ export async function rerunAiTests(
     const body: unknown = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const apiError = body as ApiError | null;
       throw new AiTestsRequestError(
-        apiError?.error?.message ?? "AI test rerun failed. Please retry.",
+        apiErrorMessage(
+          response.status,
+          body,
+          "AI test rerun failed. Please retry.",
+          "compiler",
+          response.headers.get("X-Request-ID"),
+        ),
         null,
       );
     }
@@ -197,9 +207,14 @@ export async function transcribeQuestion(
     const body: unknown = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const apiError = body as ApiError | null;
       throw new AiTestsRequestError(
-        apiError?.error?.message ?? "Question extraction failed. Please retry.",
+        apiErrorMessage(
+          response.status,
+          body,
+          "Question extraction failed. Please retry.",
+          "ai",
+          response.headers.get("X-Request-ID"),
+        ),
         null,
       );
     }

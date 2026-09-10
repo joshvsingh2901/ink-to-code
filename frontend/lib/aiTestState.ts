@@ -97,6 +97,91 @@ export function classifyStaleness(
 }
 
 // ---------------------------------------------------------------------------
+// Generated-set / run-result staleness selector
+//
+// A generated AI test set (the definitions) and its last run result (the
+// pass/fail outcome) are invalidated independently — see the invalidation
+// matrix in AI_WORKFLOW_REFINEMENT_PLAN.md §3. This synthesizes a prior
+// AiContext from the set's generation context plus its last execution's
+// code version, and reuses classifyStaleness verbatim so there is exactly
+// one place that encodes the five-way verdict.
+// ---------------------------------------------------------------------------
+
+export type AiGenerationContext = Omit<AiContext, "compileVersion">;
+
+export function classifyAiSetStaleness(
+  generationContext: AiGenerationContext,
+  executedAtCodeVersion: number | null,
+  current: AiContext,
+): StalenessKind {
+  return classifyStaleness(
+    {
+      ...generationContext,
+      compileVersion: executedAtCodeVersion ?? current.compileVersion,
+    },
+    current,
+  );
+}
+
+export type AiPanelAffordances = {
+  staleness: StalenessKind;
+  /** The generated test definitions are still valid — can be rerun or kept on screen. */
+  generatedSetUsable: boolean;
+  /** The last execution's rows/score/status still reflect the current code. */
+  runResultCurrent: boolean;
+  /** Surface "Generate Fresh AI Tests" as the recommended action over Rerun. */
+  regenerationRecommended: boolean;
+};
+
+/**
+ * Derives panel affordances from a staleness verdict, or from `null` when
+ * there is no generated set at all (first-run state).
+ */
+export function deriveAiPanelAffordances(
+  staleness: StalenessKind | null,
+): AiPanelAffordances {
+  if (staleness === null || staleness === "different_target" || staleness === "incompatible") {
+    return {
+      staleness: staleness ?? "different_target",
+      generatedSetUsable: false,
+      runResultCurrent: false,
+      regenerationRecommended: false,
+    };
+  }
+  if (staleness === "question_changed") {
+    return {
+      staleness,
+      generatedSetUsable: true,
+      runResultCurrent: false,
+      regenerationRecommended: true,
+    };
+  }
+  if (staleness === "results_stale") {
+    return {
+      staleness,
+      generatedSetUsable: true,
+      runResultCurrent: false,
+      regenerationRecommended: false,
+    };
+  }
+  return {
+    staleness,
+    generatedSetUsable: true,
+    runResultCurrent: true,
+    regenerationRecommended: false,
+  };
+}
+
+/** Rerun requires a usable generated set with at least one stored test, and a current compile. */
+export function canRerunAiTests(
+  affordances: AiPanelAffordances,
+  storedTestCount: number,
+  compileReady: boolean,
+): boolean {
+  return affordances.generatedSetUsable && storedTestCount > 0 && compileReady;
+}
+
+// ---------------------------------------------------------------------------
 // Question upload fingerprint
 // ---------------------------------------------------------------------------
 
@@ -228,20 +313,34 @@ export type RunGateInput = {
   questionText: string;
   compileReady: boolean;
   targetMode: "function" | "object" | "program" | "unsupported" | null;
+  /** Explicitly false once target analysis has conclusively resolved. Omitted/true = still
+   * loading or unknown, in which case a null targetMode is inconclusive, not a hard block. */
+  isAnalyzing?: boolean;
 };
 
 export type RunGateResult =
-  | { blocked: true; reason: "missing_question" | "compile_not_ready" | "program_mode" }
+  | {
+      blocked: true;
+      reason:
+        | "missing_question"
+        | "compile_not_ready"
+        | "program_mode"
+        | "no_target";
+    }
   | { blocked: false; advisoryReason?: string };
 
 /**
- * Exactly three hard blocks:
+ * Exactly four hard blocks:
  * 1. Empty question text
  * 2. Compile not current (still compiling, failed, or source changed)
  * 3. Program-mode target
+ * 4. No supported target once analysis has conclusively resolved (structurally
+ *    unsupported source) — a null/unsupported targetMode while analysis is
+ *    still in flight (isAnalyzing !== false) is inconclusive and does NOT block.
  *
- * An inconclusive support judgement does NOT block the button.
- * A proven-unsupported reason is advisory only — the button stays enabled.
+ * A specific target that capability analysis later proves unsupported (e.g. an
+ * unsupported function signature) is advisory only — the button stays enabled;
+ * see AdvisoryUnsupported in AITestPanel.
  */
 export function runButtonGate(input: RunGateInput): RunGateResult {
   if (!input.questionText.trim()) {
@@ -252,6 +351,12 @@ export function runButtonGate(input: RunGateInput): RunGateResult {
   }
   if (input.targetMode === "program") {
     return { blocked: true, reason: "program_mode" };
+  }
+  if (
+    (input.targetMode === null || input.targetMode === "unsupported") &&
+    input.isAnalyzing === false
+  ) {
+    return { blocked: true, reason: "no_target" };
   }
   return { blocked: false };
 }

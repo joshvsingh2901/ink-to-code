@@ -1,6 +1,5 @@
 import asyncio
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from app.main import app
 from app.schemas.test_execution import ProgramTestCase
 from app.services import test_execution
+from app.services import execution_providers
 from app.services.test_execution import (
     TEST_OUTPUT_LIMIT_BYTES,
     _classify_output_match,
@@ -143,26 +143,21 @@ def test_temporary_files_are_cleaned(tmp_path: Path, monkeypatch):
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
 def test_compiler_and_program_never_use_shell_true(monkeypatch):
-    original_run = test_execution.subprocess.run
-    original_popen = test_execution.subprocess.Popen
-    invocations: list[bool | None] = []
+    original_run = execution_providers.subprocess.run
+    invocations: list[tuple[list[str], bool | None]] = []
 
-    def recording_run(*args, **kwargs):
-        invocations.append(kwargs.get("shell"))
-        return original_run(*args, **kwargs)
+    def recording_run(command, **kwargs):
+        invocations.append((command, kwargs.get("shell")))
+        return original_run(command, **kwargs)
 
-    def recording_popen(*args, **kwargs):
-        invocations.append(kwargs.get("shell"))
-        return original_popen(*args, **kwargs)
-
-    monkeypatch.setattr(test_execution.subprocess, "run", recording_run)
-    monkeypatch.setattr(test_execution.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(execution_providers.subprocess, "run", recording_run)
 
     result = run_cpp_tests(RUNNABLE_PROGRAM, [make_test_case()])
 
     assert result.tests
     assert len(invocations) >= 2
-    assert all(shell is False for shell in invocations)
+    assert all(command[0] == "docker" for command, _ in invocations)
+    assert all(shell is False for _, shell in invocations)
 
 
 @pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
@@ -340,54 +335,6 @@ def test_invalid_comparison_mode_is_rejected():
     assert response.json()["error"]["code"] == "request_validation_error"
 
 
-def test_compile_command_is_fixed_and_source_is_not_interpolated(monkeypatch):
-    source = "int main() { return 0; }"
-    invocation: dict[str, object] = {}
-
-    def recording_run(command, **kwargs):
-        invocation["command"] = command
-        invocation["shell"] = kwargs["shell"]
-        invocation["source"] = (Path(kwargs["cwd"]) / "main.cpp").read_text()
-        (Path(kwargs["cwd"]) / "program").touch()
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=b"",
-            stderr=b"",
-        )
-
-    class CompletedProgram:
-        returncode = 0
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self):
-            return self.returncode
-
-    def recording_popen(command, **kwargs):
-        invocation["program_command"] = command
-        invocation["program_shell"] = kwargs["shell"]
-        return CompletedProgram()
-
-    monkeypatch.setattr(test_execution.subprocess, "run", recording_run)
-    monkeypatch.setattr(test_execution.subprocess, "Popen", recording_popen)
-
-    result = run_cpp_tests(source, [make_test_case()])
-
-    assert result.tests
-    assert invocation["command"] == [
-        "g++",
-        "-std=c++17",
-        "main.cpp",
-        "-o",
-        "program",
-    ]
-    program_command = invocation["program_command"]
-    assert isinstance(program_command, list)
-    assert len(program_command) == 1
-    assert Path(program_command[0]).name == "program"
-    assert invocation["shell"] is False
-    assert invocation["program_shell"] is False
-    assert invocation["source"] == source
-    assert source not in invocation["command"]
+def test_test_service_has_no_host_process_launcher():
+    assert not hasattr(test_execution, "subprocess")
+    assert not hasattr(test_execution, "os")

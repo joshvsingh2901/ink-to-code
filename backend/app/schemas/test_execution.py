@@ -1,6 +1,17 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
+
+from app.config import get_settings
+
+# Evaluated once at import time (Field constraints are static).
+_settings = get_settings()
+_MAX_SOURCE_CHARS = _settings.max_source_chars
+_MAX_TEST_VALUE_CHARS = _settings.max_test_value_chars
+BoundedTestValue = Annotated[
+    str,
+    StringConstraints(max_length=_MAX_TEST_VALUE_CHARS),
+]
 
 
 class FunctionTypeResponse(BaseModel):
@@ -17,6 +28,7 @@ class FunctionTypeResponse(BaseModel):
         "array_pointer",
     ]
     size_parameter_name: str | None = None
+    element_const: bool = False
     container_family: Literal["sequence", "associative", "unordered", "adapter"] | None = None
     container_name: Literal[
         "vector",
@@ -204,7 +216,7 @@ class ObjectClassResponse(BaseModel):
 
 
 class SourceModeRequest(BaseModel):
-    code: str = Field(min_length=1, max_length=1_000_000)
+    code: str = Field(min_length=1, max_length=_MAX_SOURCE_CHARS)
     language: Literal["cpp"]
 
 
@@ -251,7 +263,7 @@ ExceptionType = Literal[
 
 class FunctionTestCase(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    arguments: list[str] = Field(max_length=20)
+    arguments: list[BoundedTestValue] = Field(max_length=20)
     expected_return: str | None = Field(default=None, max_length=1_000)
     expected_stdout: str | None = Field(default=None, max_length=64 * 1024)
     check_stdout: bool | None = None
@@ -354,7 +366,7 @@ class TemplateArgumentInput(BaseModel):
 
 class ProgramRunTestsRequest(BaseModel):
     mode: Literal["program"]
-    code: str = Field(min_length=1, max_length=1_000_000)
+    code: str = Field(min_length=1, max_length=_MAX_SOURCE_CHARS)
     language: Literal["cpp"]
     comparison_mode: Literal["whitespace_tolerant", "exact"] = (
         "whitespace_tolerant"
@@ -365,7 +377,7 @@ class ProgramRunTestsRequest(BaseModel):
 
 class FunctionRunTestsRequest(BaseModel):
     mode: Literal["function"]
-    code: str = Field(min_length=1, max_length=1_000_000)
+    code: str = Field(min_length=1, max_length=_MAX_SOURCE_CHARS)
     language: Literal["cpp"]
     target_function: str = Field(min_length=1, max_length=300)
     template_argument_mode: Literal["deduced", "explicit"] | None = None
@@ -406,8 +418,8 @@ class ObjectScenarioStep(BaseModel):
     )
     operator_id: str | None = Field(default=None, max_length=700)
     target_object_id: str | None = Field(default=None, max_length=100)
-    arguments: list[str] = Field(default_factory=list, max_length=20)
-    operands: list[str] = Field(default_factory=list, max_length=20)
+    arguments: list[BoundedTestValue] = Field(default_factory=list, max_length=20)
+    operands: list[BoundedTestValue] = Field(default_factory=list, max_length=20)
     result_object_id: str | None = Field(default=None, max_length=100)
     result_name: str | None = Field(default=None, max_length=100)
     special_member_id: str | None = Field(default=None, max_length=700)
@@ -550,7 +562,7 @@ class ObjectScenarioObject(BaseModel):
     template_arguments: list[TemplateArgumentInput] = Field(
         default_factory=list, max_length=10
     )
-    arguments: list[str] = Field(max_length=20)
+    arguments: list[BoundedTestValue] = Field(max_length=20)
     expected_outcome: Literal["return_void", "throws"] = "return_void"
     expected_exception_type: ExceptionType | None = None
     exception_message_rule: ExceptionMessageRule = "ignore"
@@ -588,7 +600,7 @@ class ObjectScenarioTestCase(BaseModel):
     )
     class_id: str | None = Field(default=None, max_length=200)
     constructor_id: str | None = Field(default=None, max_length=500)
-    constructor_arguments: list[str] | None = Field(
+    constructor_arguments: list[BoundedTestValue] | None = Field(
         default=None, max_length=20
     )
     steps: list[ObjectScenarioStep] = Field(max_length=20)
@@ -612,7 +624,7 @@ class ObjectScenarioTestCase(BaseModel):
 
 class ObjectScenarioRunTestsRequest(BaseModel):
     mode: Literal["object"]
-    code: str = Field(min_length=1, max_length=1_000_000)
+    code: str = Field(min_length=1, max_length=_MAX_SOURCE_CHARS)
     language: Literal["cpp"]
     comparison_mode: Literal["whitespace_tolerant", "exact"] = (
         "whitespace_tolerant"
@@ -712,7 +724,7 @@ class MemoryDiagnosticResult(BaseModel):
     memory_access_status: SanitizerCheckStatus = "not_run"
     undefined_behavior_status: SanitizerCheckStatus = "not_run"
     leak_status: SanitizerCheckStatus = "not_run"
-    execution_provider: Literal["host", "docker"] = "host"
+    execution_provider: Literal["docker"] = "docker"
     memory_tool: Literal[
         "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
     ] = "none"
@@ -973,7 +985,7 @@ class RunTestsResponse(BaseModel):
     address_sanitizer_available: bool | None = None
     undefined_behavior_sanitizer_available: bool | None = None
     leak_sanitizer_available: bool | None = None
-    execution_provider: Literal["host", "docker"] = "host"
+    execution_provider: Literal["docker"] = "docker"
     memory_tool: Literal[
         "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
     ] = "none"

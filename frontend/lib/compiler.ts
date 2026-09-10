@@ -1,3 +1,5 @@
+import { apiErrorMessage } from "./apiErrors";
+
 export type CompileDiagnostic = {
   line: number;
   column: number;
@@ -13,8 +15,6 @@ export type CompileResult = {
   exit_code: number;
   diagnostics: CompileDiagnostic[];
 };
-
-type ApiError = { error?: { message?: string } };
 
 export class CompileRequestError extends Error {
   constructor(message: string) {
@@ -62,9 +62,14 @@ export async function compileCpp(code: string): Promise<CompileResult> {
     const body: unknown = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const apiError = body as ApiError | null;
       throw new CompileRequestError(
-        apiError?.error?.message ?? "The backend could not compile the code.",
+        apiErrorMessage(
+          response.status,
+          body,
+          "The backend could not compile the code.",
+          "compiler",
+          response.headers.get("X-Request-ID"),
+        ),
       );
     }
     if (!isCompileResult(body)) {

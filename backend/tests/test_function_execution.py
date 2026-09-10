@@ -2960,6 +2960,191 @@ def test_numeric_pointer_with_size_remains_array_backed():
     assert value_type.size_parameter_name == "size"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "int sumArray(const int* arr, int size) { int total = 0; "
+        "for (int i = 0; i < size; i++) total += arr[i]; return total; }",
+        "int sumArray(const int arr[], int size) { int total = 0; "
+        "for (int i = 0; i < size; i++) total += arr[i]; return total; }",
+        "int sumArray(int const* arr, int size) { int total = 0; "
+        "for (int i = 0; i < size; i++) total += arr[i]; return total; }",
+    ],
+)
+def test_const_array_parameter_spellings_classify_as_function_mode(source: str):
+    analysis = analyze_test_mode(source)
+
+    assert analysis.mode == "function"
+    assert len(analysis.functions) == 1
+
+
+def test_const_array_parameter_is_flagged_read_only():
+    analysis = analyze_test_mode(
+        "int sumArray(const int* arr, int size) { int total = 0; "
+        "for (int i = 0; i < size; i++) total += arr[i]; return total; }"
+    )
+
+    assert analysis.mode == "function"
+    value_type = analysis.functions[0].parameters[0].value_type
+    assert value_type.kind == "array"
+    assert value_type.passing == "array_pointer"
+    assert value_type.element_const is True
+
+
+@pytest.mark.parametrize(
+    ("element_type", "value"),
+    [
+        ("long", "5"),
+        ("long long", "5"),
+        ("double", "5.0"),
+        ("bool", "true"),
+    ],
+)
+def test_const_array_element_type_matrix_classifies_as_function_mode(
+    element_type: str,
+    value: str,
+):
+    analysis = analyze_test_mode(
+        f"{element_type} first(const {element_type}* values, int n) "
+        f"{{ return values[0]; }}"
+    )
+
+    assert analysis.mode == "function"
+    value_type = analysis.functions[0].parameters[0].value_type
+    assert value_type.kind == "array"
+    assert value_type.element_const is True
+
+
+@pytest.mark.skipif(shutil.which("g++") is None, reason="g++ is not installed")
+def test_const_array_function_executes_and_returns_correct_value():
+    result = run_test_request(
+        function_request(
+            "int sumArray(const int* arr, int size) { int total = 0; "
+            "for (int i = 0; i < size; i++) total += arr[i]; return total; }",
+            arguments=["[1, 2, 3, 4]", "4"],
+            expected_return="10",
+        )
+    )
+
+    assert result.success is True
+
+
+def test_const_array_parameter_rejects_mutation_expectations():
+    source = (
+        "int sumArray(const int* arr, int size) { int total = 0; "
+        "for (int i = 0; i < size; i++) total += arr[i]; return total; }"
+    )
+    analysis = analyze_test_mode(source)
+    assert len(analysis.functions) == 1
+    request = FunctionRunTestsRequest(
+        mode="function",
+        code=source,
+        language="cpp",
+        target_function=analysis.functions[0].id,
+        tests=[
+            FunctionTestCase(
+                name="Test 1",
+                arguments=["[1, 2, 3, 4]", "4"],
+                expected_mutations=[
+                    FunctionMutationExpectation(
+                        parameter_id="arr",
+                        expected_final_value="[1, 2, 3, 4]",
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = run_test_request(request)
+
+    assert result.success is False
+    assert result.input_error
+    assert "Immutable parameters cannot have mutation" in result.input_error
+
+
+def test_unsupported_function_message_wins_over_generic_object_message():
+    response = asyncio.run(
+        api_request(
+            "/api/test-mode",
+            {
+                "code": (
+                    "int sumArray(const int* arr) { return arr[0]; }"
+                ),
+                "language": "cpp",
+            },
+        )
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "unsupported"
+    assert "Const scalar pointer" in (body["message"] or "")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "int sumEven(const std::vector<int>& values) { return 0; }",
+        "int sumEven(std::vector<int> values) { return 0; }",
+        "int sumArray(const int arr[], int size) { return 0; }",
+    ],
+)
+def test_successful_function_mode_does_not_carry_object_message(source: str):
+    response = asyncio.run(
+        api_request(
+            "/api/test-mode",
+            {"code": f"#include <vector>\n{source}", "language": "cpp"},
+        )
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "function"
+    assert body["available_modes"] == ["function"]
+    assert body["message"] is None
+
+
+def test_object_mode_message_still_surfaces_when_relevant():
+    code = (
+        "class A { public: A() {} int a(){return 1;} };\n"
+        "class B { public: B() {} int b(){return 2;} };\n"
+        "class C : public A, public B { public: C() {} int c(){return 3;} };\n"
+        "class Standalone { public: Standalone() {} int val(){return 42;} };\n"
+    )
+    response = asyncio.run(
+        api_request("/api/test-mode", {"code": code, "language": "cpp"})
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "object"
+    assert "Inheritance is unsupported" in (body["message"] or "")
+
+
+@pytest.mark.parametrize(
+    ("declaration", "passing"),
+    [
+        ("std::vector<int> values", "value"),
+        ("std::vector<int>& values", "mutable_reference"),
+        ("const std::vector<int>& values", "const_reference"),
+        ("const std::vector<int> values", "value"),
+    ],
+)
+def test_vector_four_form_matrix_classifies_correctly(
+    declaration: str,
+    passing: str,
+):
+    analysis = analyze_test_mode(
+        f"#include <vector>\nint sumEven({declaration}) "
+        "{ return static_cast<int>(values.size()); }"
+    )
+
+    assert analysis.mode == "function"
+    value_type = analysis.functions[0].parameters[0].value_type
+    assert value_type.kind == "vector"
+    assert value_type.passing == passing
+
+
 def test_nested_vector_metadata_distinguishes_two_dimensions():
     analysis = analyze_test_mode(
         "#include <vector>\n"

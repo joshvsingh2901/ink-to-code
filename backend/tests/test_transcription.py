@@ -339,7 +339,7 @@ def test_classifies_invalid_api_key():
     assert caught.value.code == "gemini_authentication_failed"
 
 
-def test_development_client_error_log_includes_safe_diagnostics(caplog):
+def test_development_client_error_log_excludes_provider_message_and_secret(caplog):
     secret = "test-secret-key"
     api_error = errors.ClientError(
         400,
@@ -366,6 +366,5 @@ def test_development_client_error_log_includes_safe_diagnostics(caplog):
     log_output = caplog.text
     assert "code=400" in log_output
     assert "status=INVALID_ARGUMENT" in log_output
-    assert "Unsupported parameter: temperature" in log_output
+    assert "Unsupported parameter: temperature" not in log_output
     assert secret not in log_output
-    assert "[redacted]" in log_output

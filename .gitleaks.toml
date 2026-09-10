@@ -1,0 +1,12 @@
+title = "InkToCode secret scanning"
+minVersion = "8.27.0"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic credential used to prove request logs redact secrets"
+condition = "AND"
+paths = ['''^backend/tests/test_web_security\.py$''']
+regexTarget = "line"
+regexes = ['''sk-supersecret-that-must-not-be-logged''']

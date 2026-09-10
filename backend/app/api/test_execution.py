@@ -21,9 +21,14 @@ from app.schemas.test_execution import (
 from app.services.compiler import CompilerServiceError
 from app.services.function_analysis import analyze_test_mode
 from app.services.object_analysis import analyze_object_scenarios
+from app.services.resource_limits import ResourceBusyError, container_slot
 from app.services.test_execution import run_test_request
 
 router = APIRouter(prefix="/api", tags=["test execution"])
+
+# The generic fallback function_analysis.py emits when no function-specific
+# reason exists — never let it outrank a more specific object-analysis reason.
+_NO_FUNCTION_MESSAGE = "No supported top-level function could be identified."
 
 
 @router.post(
@@ -48,6 +53,7 @@ async def analyze_source_mode(
             vector_depth=value_type.vector_depth,
             passing=value_type.passing,
             size_parameter_name=value_type.size_parameter_name,
+            element_const=getattr(value_type, "element_const", False),
             container_family=value_type.container_family,
             container_name=value_type.container_name,
             key_type=value_type.key_type,
@@ -289,11 +295,16 @@ async def analyze_source_mode(
             (
                 analysis.message
                 if "template" in request.code
-                else object_analysis.message or analysis.message
+                else (
+                    object_analysis.message
+                    if analysis.message == _NO_FUNCTION_MESSAGE
+                    and object_analysis.message
+                    else analysis.message or object_analysis.message
+                )
             )
             if not available_modes
             else object_analysis.message
-            if object_analysis.message
+            if object_analysis.message and response_mode == "object"
             else None
         ),
     )
@@ -314,9 +325,14 @@ async def run_tests(
         )
 
     try:
-        return await run_in_threadpool(
-            run_test_request,
-            request,
-        )
+        async with container_slot():
+            return await run_in_threadpool(
+                run_test_request,
+                request,
+            )
+    except ResourceBusyError as error:
+        response = error_response(error.code, error.message, 503)
+        response.headers["Retry-After"] = str(error.retry_after)
+        return response
     except CompilerServiceError as error:
         return error_response(error.code, error.message, error.status_code)

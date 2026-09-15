@@ -15,7 +15,7 @@ Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable
 - Manual tests and constrained AI-generated practice tests
 - Strict AI-test schemas, capability gating, value validation, deduplication, and bounded repair
 - Defined support for primitives, arrays, pointers, 15 STL containers, iterators, classes, operators, inheritance, polymorphism, and templates
-- Docker-isolated compilation, testing, ASan, UBSan, and Valgrind diagnostics
+- Isolated compilation, testing, ASan, UBSan, and Valgrind diagnostics through a pluggable execution provider — Docker locally by default, or Modal cloud sandboxes for deployment (see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md))
 - 1,104 automated frontend/backend tests currently pass (881 backend + 223 frontend) with the Docker runner available
 
 ## How It Works
@@ -54,11 +54,11 @@ flowchart TD
     Validation --> Harness
 
     Harness --> Memory["Optional memory diagnostics"]
-    Memory --> Docker["Restricted Docker runner"]
-    Docker --> Tools["ASan / UBSan / Valgrind"]
+    Memory --> Provider["Execution provider: Docker or Modal"]
+    Provider --> Tools["ASan / UBSan / Valgrind"]
 ```
 
-The frontend owns upload, review, editor, and result presentation. FastAPI separates routes, Pydantic contracts, external AI calls, source analysis, compiler operations, and execution services. All submitted C++ compilation and execution fails closed through the restricted Docker runner; the API host has no execution fallback.
+The frontend owns upload, review, editor, and result presentation. FastAPI separates routes, Pydantic contracts, external AI calls, source analysis, compiler operations, and execution services. All submitted C++ compilation and execution fails closed through the configured execution provider — Docker locally by default, or Modal isolated cloud sandboxes when deployed; the API host has no execution fallback on either path.
 
 ## Multimodal Transcription Pipeline
 
@@ -124,10 +124,15 @@ Gemini is not involved in compiler diagnosis, explanation, or source repair.
 
 ## Execution Safety
 
-Normal compile and test execution uses the required isolated Docker runner with
-fixed commands, no network, strict resource/time/output limits, and automatic
-cleanup. Student code runs only after an explicit **Run Tests** action;
-automatic compilation checks source without executing the resulting program.
+Normal compile and test execution uses a required, isolated execution
+provider — selected by `CPP_EXECUTION_PROVIDER` (`docker` by default, or
+`modal`) — with fixed commands, no network, strict resource/time/output
+limits, and automatic cleanup. Student code runs only after an explicit
+**Run Tests** action; automatic compilation checks source without
+executing the resulting program. There is no host fallback on either
+provider: if the configured provider's runtime or runner image is
+unavailable, requests report an infrastructure error instead of silently
+degrading.
 
 Current normal-execution limits include:
 
@@ -135,19 +140,28 @@ Current normal-execution limits include:
 - **64 KiB** limits for stdout and stderr
 - fixed compiler/executable paths and no user-controlled flags or shell commands
 
-The required Docker runner provides:
+Both providers are hardened isolation boundaries, but they are not
+identical on every control. The honest comparison (see
+[`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md)
+and `AGENTS.md` for the complete, per-control rationale):
 
-- non-root execution
-- no network
-- read-only container filesystem
-- all Linux capabilities dropped and `no-new-privileges`
-- default limits of **256 MB memory**, **1 CPU**, and **32 PIDs**
-- ASan/UBSan execution and deliberate capability probes
-- Valgrind capability and leak checks where available
+| Control | Docker | Modal |
+| --- | --- | --- |
+| Non-root execution | native (`--user`, uid 10001) | compensating control (`setpriv` inside the sandbox, which itself runs as root) |
+| Network disabled | native | native |
+| Read-only root filesystem | native | **not available** — compensated only by every sandbox being single-use and ephemeral |
+| Capability dropping | native (`--cap-drop ALL`) | not an equivalent control (gVisor userspace kernel + non-root instead) |
+| Memory limit | hard cap | hard cap, OOM-kills |
+| CPU limit | hard CFS quota | soft throttle (wall-clock timeout is the real control on both) |
+| PID limit | native (`--pids-limit`) | `ulimit`, unverified under gVisor pending a live test |
+| Secret isolation | no `-e` flags passed at all | hermetic `env -i` launch; no Modal/Gemini credential ever reaches user code |
+| Isolated workspace | one bind-mounted temp directory | no host mounts at all (stronger) |
 
-The runner is a hardened isolation boundary for the current application;
-public deployment still requires deployment-specific configuration,
-monitoring, and production smoke testing.
+Public deployment still requires deployment-specific configuration,
+monitoring, and production smoke testing — see
+[`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md)
+for the Modal token/image setup and the required live security tests
+before relying on the compensating controls above in production.
 
 ## Tech Stack
 
@@ -155,7 +169,7 @@ monitoring, and production smoke testing.
 | --- | --- |
 | Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4, Monaco Editor, PDF.js |
 | Backend | Python, FastAPI, Pydantic, Google Gen AI Python SDK, Uvicorn |
-| Execution | C++17, g++/compatible compiler tooling, Docker, AddressSanitizer, UndefinedBehaviorSanitizer, Valgrind |
+| Execution | C++17, g++/compatible compiler tooling, Docker (default) or Modal cloud sandboxes, AddressSanitizer, UndefinedBehaviorSanitizer, Valgrind |
 | Verification | pytest, Node.js built-in test runner, ESLint, TypeScript/Next.js production build |
 
 ## Verification
@@ -235,12 +249,19 @@ From the repository root:
 docker build -t inktocode-cpp-runner ./runner
 ```
 
-Set `CPP_EXECUTION_PROVIDER=docker` in `backend/.env`. Normal compilation,
-manual tests, AI tests, object scenarios, and memory diagnostics all fail
-closed through this runner. The API host must never directly compile or
-execute submitted C++; there is no host fallback. See
+Set `CPP_EXECUTION_PROVIDER=docker` in `backend/.env` (the local default).
+Normal compilation, manual tests, AI tests, object scenarios, and memory
+diagnostics all fail closed through this runner. The API host must never
+directly compile or execute submitted C++; there is no host fallback. See
 [`EXECUTION_SECURITY_PLAN.md`](EXECUTION_SECURITY_PLAN.md) for the complete
 boundary and resource policy.
+
+For cloud deployment, set `CPP_EXECUTION_PROVIDER=modal` instead and
+configure `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`/`MODAL_RUNNER_IMAGE` — see
+[`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md)
+for token creation, publishing the runner image to GHCR, rollback by
+digest, and the required live security-test procedure before trusting the
+compensating controls it relies on.
 
 ### Run verification locally
 

@@ -14,7 +14,7 @@ from app.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-ProviderName = Literal["docker"]
+ProviderName = Literal["docker", "modal"]
 MemoryTool = Literal[
     "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
 ]
@@ -46,7 +46,7 @@ class ProviderCapabilities:
 
 
 @dataclass(frozen=True)
-class DockerExecutionResult:
+class ExecutionResult:
     compile_error: str | None = None
     infrastructure_error: str | None = None
     stdout: str = ""
@@ -68,33 +68,68 @@ class DockerExecutionResult:
     compile_timed_out: bool = False
 
 
+# Back-compat alias: earlier code (and imports outside this module) referred
+# to this dataclass as DockerExecutionResult before the provider surface
+# became provider-neutral. Keep the old name usable without duplicating the
+# definition.
+DockerExecutionResult = ExecutionResult
+
+
 class ExecutionProvider(Protocol):
     name: ProviderName
 
     def capabilities(self) -> ProviderCapabilities: ...
 
+    def compile_source(
+        self,
+        work_directory: Path,
+        *,
+        timeout_seconds: float,
+    ) -> ExecutionResult: ...
+
+    def compile_and_run(
+        self,
+        work_directory: Path,
+        stdin: str,
+        *,
+        timeout_seconds: float,
+        compile_only: bool = False,
+        run_memory_checks: bool = False,
+    ) -> ExecutionResult: ...
+
+    def close(self) -> None: ...
+
 
 def _validated_settings(settings: Settings) -> Settings:
-    if settings.cpp_execution_provider not in {"auto", "docker"}:
+    if settings.cpp_execution_provider not in {"auto", "docker", "modal"}:
         raise ValueError(
-            "CPP_EXECUTION_PROVIDER must be docker. Host execution is disabled."
+            "CPP_EXECUTION_PROVIDER must be docker or modal. Host execution "
+            "is disabled."
         )
-    if not _SAFE_IMAGE.fullmatch(settings.cpp_runner_image):
-        raise ValueError("CPP_RUNNER_IMAGE is invalid.")
-    if not _SAFE_RESOURCE.fullmatch(settings.cpp_runner_memory):
-        raise ValueError("CPP_RUNNER_MEMORY is invalid.")
-    if not _SAFE_RESOURCE.fullmatch(settings.cpp_runner_cpus):
-        raise ValueError("CPP_RUNNER_CPUS is invalid.")
-    if not 1 <= settings.cpp_runner_pids <= 256:
-        raise ValueError("CPP_RUNNER_PIDS must be between 1 and 256.")
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", settings.cpp_runner_user):
-        raise ValueError("CPP_RUNNER_USER is invalid.")
-    if not 1 <= settings.cpp_docker_compile_timeout_seconds <= 120:
-        raise ValueError("CPP_DOCKER_COMPILE_TIMEOUT_SECONDS is invalid.")
-    if not 0.05 <= settings.cpp_docker_run_timeout_seconds <= 30:
-        raise ValueError("CPP_DOCKER_RUN_TIMEOUT_SECONDS is invalid.")
-    if not 1 <= settings.cpp_docker_valgrind_timeout_seconds <= 60:
-        raise ValueError("CPP_DOCKER_VALGRIND_TIMEOUT_SECONDS is invalid.")
+    is_modal = settings.cpp_execution_provider == "modal"
+    if is_modal:
+        if not settings.modal_runner_image:
+            raise ValueError("MODAL_RUNNER_IMAGE is required when "
+                              "CPP_EXECUTION_PROVIDER is modal.")
+    else:
+        if not _SAFE_IMAGE.fullmatch(settings.cpp_runner_image):
+            raise ValueError("CPP_RUNNER_IMAGE is invalid.")
+        if not _SAFE_RESOURCE.fullmatch(settings.cpp_runner_memory):
+            raise ValueError("CPP_RUNNER_MEMORY is invalid.")
+        if not _SAFE_RESOURCE.fullmatch(settings.cpp_runner_cpus):
+            raise ValueError("CPP_RUNNER_CPUS is invalid.")
+        if not 1 <= settings.cpp_runner_pids <= 256:
+            raise ValueError("CPP_RUNNER_PIDS must be between 1 and 256.")
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_-]{0,31}", settings.cpp_runner_user
+        ):
+            raise ValueError("CPP_RUNNER_USER is invalid.")
+        if not 1 <= settings.cpp_docker_compile_timeout_seconds <= 120:
+            raise ValueError("CPP_DOCKER_COMPILE_TIMEOUT_SECONDS is invalid.")
+        if not 0.05 <= settings.cpp_docker_run_timeout_seconds <= 30:
+            raise ValueError("CPP_DOCKER_RUN_TIMEOUT_SECONDS is invalid.")
+        if not 1 <= settings.cpp_docker_valgrind_timeout_seconds <= 60:
+            raise ValueError("CPP_DOCKER_VALGRIND_TIMEOUT_SECONDS is invalid.")
     return settings
 
 
@@ -194,6 +229,202 @@ def _run_docker_command(
         return None
 
 
+def build_run_manifest(
+    *,
+    stdin: str,
+    compile_timeout_seconds: float,
+    run_timeout_seconds: float,
+    valgrind_timeout_seconds: float,
+    compile_only: bool,
+    run_memory_checks: bool,
+    leak_sanitizer_available: bool,
+    valgrind_available: bool,
+) -> dict:
+    """Build the exact runner-request.json payload for compile_and_run."""
+    return {
+        "mode": "compile_and_run",
+        "stdin": stdin,
+        "compile_timeout_seconds": compile_timeout_seconds,
+        "run_timeout_seconds": run_timeout_seconds,
+        "valgrind_timeout_seconds": valgrind_timeout_seconds,
+        "output_limit_bytes": _OUTPUT_LIMIT,
+        "compile_only": compile_only,
+        "run_memory_checks": run_memory_checks,
+        "leak_sanitizer_available": leak_sanitizer_available,
+        "valgrind_available": valgrind_available,
+    }
+
+
+def build_compile_manifest(*, compile_timeout_seconds: float) -> dict:
+    """Build the exact runner-request.json payload for compile_source."""
+    return {
+        "mode": "compile_source",
+        "compile_timeout_seconds": compile_timeout_seconds,
+        "output_limit_bytes": _OUTPUT_LIMIT,
+    }
+
+
+def clamped_timeouts(
+    settings: Settings,
+    timeout_seconds: float,
+    *,
+    compile_only: bool,
+) -> tuple[float, float]:
+    """Return (run_timeout, compile_timeout) clamped to configured bounds."""
+    run_timeout = min(
+        max(timeout_seconds, 0.05),
+        settings.cpp_docker_run_timeout_seconds,
+    )
+    compile_timeout = (
+        min(
+            max(timeout_seconds, 1),
+            settings.cpp_docker_compile_timeout_seconds,
+        )
+        if compile_only
+        else settings.cpp_docker_compile_timeout_seconds
+    )
+    return run_timeout, compile_timeout
+
+
+def execution_result_from_payload(payload: dict) -> ExecutionResult:
+    """Convert a compile_and_run runner-result.json payload to a result."""
+    if not isinstance(payload, dict):
+        return ExecutionResult(
+            infrastructure_error=(
+                "The isolated runner returned an invalid result."
+            )
+        )
+    return ExecutionResult(
+        compile_error=_optional_string(payload.get("compile_error")),
+        infrastructure_error=_optional_string(
+            payload.get("infrastructure_error")
+        ),
+        stdout=_string(payload.get("stdout")),
+        stderr=_string(payload.get("stderr")),
+        exit_code=(
+            payload.get("exit_code")
+            if isinstance(payload.get("exit_code"), int)
+            else None
+        ),
+        timed_out=bool(payload.get("timed_out")),
+        output_limited=bool(payload.get("output_limited")),
+        function_stdout=_string(payload.get("function_stdout")),
+        result_metadata=_optional_string(
+            payload.get("result_metadata")
+        ),
+        step_stdout=tuple(
+            item if isinstance(item, str) else ""
+            for item in payload.get("step_stdout", [])
+        ),
+        step_metadata=tuple(
+            item if isinstance(item, str) else None
+            for item in payload.get("step_metadata", [])
+        ),
+        progress_index=(
+            payload.get("progress_index")
+            if isinstance(payload.get("progress_index"), int)
+            else None
+        ),
+        constructor_metadata=_optional_string(
+            payload.get("constructor_metadata")
+        ),
+        memory_tool=(
+            payload.get("memory_tool")
+            if payload.get("memory_tool")
+            in {
+                "none",
+                "sanitizer",
+                "valgrind",
+                "sanitizer_and_valgrind",
+            }
+            else "none"
+        ),
+        valgrind_diagnostics=_optional_string(
+            payload.get("valgrind_diagnostics")
+        ),
+        leaked_bytes=_optional_int(payload.get("leaked_bytes")),
+        leaked_allocations=_optional_int(
+            payload.get("leaked_allocations")
+        ),
+        leak_kind=_optional_string(payload.get("leak_kind")),
+        compile_timed_out=bool(payload.get("compile_timed_out")),
+    )
+
+
+def compile_result_from_payload(payload: dict) -> ExecutionResult:
+    """Convert a compile_source runner-result.json payload to a result."""
+    if not isinstance(payload, dict):
+        return ExecutionResult(
+            infrastructure_error=(
+                "The isolated runner returned an invalid result."
+            )
+        )
+    return ExecutionResult(
+        stdout=_string(payload.get("stdout")),
+        stderr=_string(payload.get("stderr")),
+        exit_code=(
+            payload.get("exit_code")
+            if isinstance(payload.get("exit_code"), int)
+            else None
+        ),
+        output_limited=bool(payload.get("output_limited")),
+        compile_timed_out=bool(payload.get("compile_timed_out")),
+        infrastructure_error=_optional_string(
+            payload.get("infrastructure_error")
+        ),
+    )
+
+
+def capabilities_from_probe_payload(
+    provider: ProviderName, payload: dict
+) -> ProviderCapabilities:
+    """Convert a capability_probe runner-result.json payload to
+    ProviderCapabilities for a runtime+image that are already known to be
+    available (both are hardcoded True: getting here means the probe
+    container/sandbox itself started and produced a result)."""
+    return ProviderCapabilities(
+        provider=provider,
+        runtime_available=True,
+        image_available=True,
+        compiler_available=bool(payload.get("compiler_available")),
+        address_sanitizer_available=bool(
+            payload.get("address_sanitizer_available")
+        ),
+        undefined_behavior_sanitizer_available=bool(
+            payload.get("undefined_behavior_sanitizer_available")
+        ),
+        leak_sanitizer_available=bool(
+            payload.get("leak_sanitizer_available")
+        ),
+        valgrind_available=bool(payload.get("valgrind_available")),
+        unavailable_reason=_optional_string(
+            payload.get("unavailable_reason")
+        ),
+    )
+
+
+def unavailable_capabilities(
+    provider: ProviderName,
+    *,
+    runtime: bool,
+    image: bool,
+    reason: str,
+) -> ProviderCapabilities:
+    """Build a ProviderCapabilities for a provider that failed before, or
+    without, being able to run any tool-detection probe."""
+    return ProviderCapabilities(
+        provider,
+        runtime,
+        image,
+        False,
+        False,
+        False,
+        False,
+        False,
+        reason,
+    )
+
+
 class DockerExecutionProvider:
     name: ProviderName = "docker"
 
@@ -209,6 +440,12 @@ class DockerExecutionProvider:
             self.settings.cpp_runner_user,
         )
 
+    def close(self) -> None:
+        """No-op: each Docker invocation is already a standalone `docker
+        run --rm`, so there is no persistent per-instance resource to
+        release. Present only to satisfy the ExecutionProvider protocol."""
+        return None
+
     def compile_and_run(
         self,
         work_directory: Path,
@@ -217,40 +454,31 @@ class DockerExecutionProvider:
         timeout_seconds: float,
         compile_only: bool = False,
         run_memory_checks: bool = False,
-    ) -> DockerExecutionResult:
-        run_timeout = min(
-            max(timeout_seconds, 0.05),
-            self.settings.cpp_docker_run_timeout_seconds,
+    ) -> ExecutionResult:
+        run_timeout, compile_timeout = clamped_timeouts(
+            self.settings, timeout_seconds, compile_only=compile_only
         )
-        compile_timeout = min(
-            max(timeout_seconds, 1),
-            self.settings.cpp_docker_compile_timeout_seconds,
-        ) if compile_only else self.settings.cpp_docker_compile_timeout_seconds
         capabilities = self.capabilities() if run_memory_checks else None
-        manifest = {
-            "mode": "compile_and_run",
-            "stdin": stdin,
-            "compile_timeout_seconds": (
-                compile_timeout
-            ),
-            "run_timeout_seconds": run_timeout,
-            "valgrind_timeout_seconds": (
+        manifest = build_run_manifest(
+            stdin=stdin,
+            compile_timeout_seconds=compile_timeout,
+            run_timeout_seconds=run_timeout,
+            valgrind_timeout_seconds=(
                 self.settings.cpp_docker_valgrind_timeout_seconds
             ),
-            "output_limit_bytes": _OUTPUT_LIMIT,
-            "compile_only": compile_only,
-            "run_memory_checks": run_memory_checks,
-            "leak_sanitizer_available": (
+            compile_only=compile_only,
+            run_memory_checks=run_memory_checks,
+            leak_sanitizer_available=(
                 capabilities.leak_sanitizer_available
                 if capabilities is not None
                 else False
             ),
-            "valgrind_available": (
+            valgrind_available=(
                 capabilities.valgrind_available
                 if capabilities is not None
                 else False
             ),
-        }
+        )
         manifest_path = work_directory / "runner-request.json"
         result_path = work_directory / "runner-result.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -272,7 +500,7 @@ class DockerExecutionProvider:
             ),
         )
         if completed is None:
-            return DockerExecutionResult(
+            return ExecutionResult(
                 infrastructure_error=(
                     "The isolated runner could not finish compiling in time."
                     if compile_only
@@ -283,7 +511,7 @@ class DockerExecutionProvider:
             )
         if not _is_regular_result_file(result_path):
             if completed.returncode in {137, -9} and not compile_only:
-                return DockerExecutionResult(
+                return ExecutionResult(
                     stderr=(
                         "Execution was terminated after reaching an "
                         "isolation resource limit."
@@ -293,7 +521,7 @@ class DockerExecutionProvider:
             message = completed.stderr[:_OUTPUT_LIMIT].decode(
                 "utf-8", errors="replace"
             )
-            return DockerExecutionResult(
+            return ExecutionResult(
                 infrastructure_error=(
                     "The isolated runner could not start."
                     if not message
@@ -303,88 +531,24 @@ class DockerExecutionProvider:
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return DockerExecutionResult(
+            return ExecutionResult(
                 infrastructure_error=(
                     "The isolated runner returned an invalid result."
                 )
             )
-        if not isinstance(payload, dict):
-            return DockerExecutionResult(
-                infrastructure_error=(
-                    "The isolated runner returned an invalid result."
-                )
-            )
-        return DockerExecutionResult(
-            compile_error=_optional_string(payload.get("compile_error")),
-            infrastructure_error=_optional_string(
-                payload.get("infrastructure_error")
-            ),
-            stdout=_string(payload.get("stdout")),
-            stderr=_string(payload.get("stderr")),
-            exit_code=(
-                payload.get("exit_code")
-                if isinstance(payload.get("exit_code"), int)
-                else None
-            ),
-            timed_out=bool(payload.get("timed_out")),
-            output_limited=bool(payload.get("output_limited")),
-            function_stdout=_string(payload.get("function_stdout")),
-            result_metadata=_optional_string(
-                payload.get("result_metadata")
-            ),
-            step_stdout=tuple(
-                item if isinstance(item, str) else ""
-                for item in payload.get("step_stdout", [])
-            ),
-            step_metadata=tuple(
-                item if isinstance(item, str) else None
-                for item in payload.get("step_metadata", [])
-            ),
-            progress_index=(
-                payload.get("progress_index")
-                if isinstance(payload.get("progress_index"), int)
-                else None
-            ),
-            constructor_metadata=_optional_string(
-                payload.get("constructor_metadata")
-            ),
-            memory_tool=(
-                payload.get("memory_tool")
-                if payload.get("memory_tool")
-                in {
-                    "none",
-                    "sanitizer",
-                    "valgrind",
-                    "sanitizer_and_valgrind",
-                }
-                else "none"
-            ),
-            valgrind_diagnostics=_optional_string(
-                payload.get("valgrind_diagnostics")
-            ),
-            leaked_bytes=_optional_int(payload.get("leaked_bytes")),
-            leaked_allocations=_optional_int(
-                payload.get("leaked_allocations")
-            ),
-            leak_kind=_optional_string(payload.get("leak_kind")),
-            compile_timed_out=bool(payload.get("compile_timed_out")),
-        )
+        return execution_result_from_payload(payload)
 
     def compile_source(
         self,
         work_directory: Path,
         *,
         timeout_seconds: float,
-    ) -> DockerExecutionResult:
+    ) -> ExecutionResult:
         manifest_path = work_directory / "runner-request.json"
         result_path = work_directory / "runner-result.json"
         manifest_path.write_text(
             json.dumps(
-                {
-                    "mode": "compile_source",
-                    "compile_timeout_seconds": timeout_seconds,
-                    "output_limit_bytes": _OUTPUT_LIMIT,
-                }
+                build_compile_manifest(compile_timeout_seconds=timeout_seconds)
             ),
             encoding="utf-8",
         )
@@ -399,44 +563,25 @@ class DockerExecutionProvider:
             timeout_seconds=timeout_seconds + 5,
         )
         if completed is None:
-            return DockerExecutionResult(
+            return ExecutionResult(
                 infrastructure_error=(
                     "The isolated runner did not complete the compile request."
                 ),
                 compile_timed_out=True,
             )
         if not _is_regular_result_file(result_path):
-            return DockerExecutionResult(
+            return ExecutionResult(
                 infrastructure_error="The isolated runner could not start."
             )
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return DockerExecutionResult(
+            return ExecutionResult(
                 infrastructure_error=(
                     "The isolated runner returned an invalid result."
                 )
             )
-        if not isinstance(payload, dict):
-            return DockerExecutionResult(
-                infrastructure_error=(
-                    "The isolated runner returned an invalid result."
-                )
-            )
-        return DockerExecutionResult(
-            stdout=_string(payload.get("stdout")),
-            stderr=_string(payload.get("stderr")),
-            exit_code=(
-                payload.get("exit_code")
-                if isinstance(payload.get("exit_code"), int)
-                else None
-            ),
-            output_limited=bool(payload.get("output_limited")),
-            compile_timed_out=bool(payload.get("compile_timed_out")),
-            infrastructure_error=_optional_string(
-                payload.get("infrastructure_error")
-            ),
-        )
+        return compile_result_from_payload(payload)
 
 
 def _string(value: object) -> str:
@@ -555,31 +700,19 @@ def docker_capabilities(
             payload = json.loads(result_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             payload = {}
-    return ProviderCapabilities(
-        provider="docker",
-        runtime_available=True,
-        image_available=True,
-        compiler_available=bool(payload.get("compiler_available")),
-        address_sanitizer_available=bool(
-            payload.get("address_sanitizer_available")
-        ),
-        undefined_behavior_sanitizer_available=bool(
-            payload.get("undefined_behavior_sanitizer_available")
-        ),
-        leak_sanitizer_available=bool(
-            payload.get("leak_sanitizer_available")
-        ),
-        valgrind_available=bool(payload.get("valgrind_available")),
-        unavailable_reason=_optional_string(
-            payload.get("unavailable_reason")
-        ),
-    )
+    return capabilities_from_probe_payload("docker", payload)
 
 
 def select_execution_provider(
     settings: Settings | None = None,
-) -> DockerExecutionProvider:
+) -> ExecutionProvider:
     selected = _validated_settings(settings or get_settings())
+    if selected.cpp_execution_provider == "modal":
+        # Imported lazily so Docker-only environments never import the
+        # `modal` package (and never need it installed).
+        from app.services.modal_provider import ModalExecutionProvider
+
+        return ModalExecutionProvider(selected)
     return DockerExecutionProvider(selected)
 
 

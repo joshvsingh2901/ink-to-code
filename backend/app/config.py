@@ -27,6 +27,10 @@ class Settings:
     cpp_docker_compile_timeout_seconds: float = 30
     cpp_docker_run_timeout_seconds: float = 8
     cpp_docker_valgrind_timeout_seconds: float = 20
+    modal_app_name: str = "inktocode-cpp-runner"
+    modal_runner_image: str = ""
+    modal_sandbox_timeout_seconds: float = 600
+    modal_sandbox_idle_timeout_seconds: float = 120
     max_source_chars: int = 100_000
     max_test_value_chars: int = 2_000
     max_request_bytes: int = 12_582_912
@@ -126,6 +130,14 @@ def get_settings() -> Settings:
         ),
         cpp_docker_valgrind_timeout_seconds=float(
             os.getenv("CPP_DOCKER_VALGRIND_TIMEOUT_SECONDS", "20")
+        ),
+        modal_app_name=os.getenv("MODAL_APP_NAME", "inktocode-cpp-runner"),
+        modal_runner_image=os.getenv("MODAL_RUNNER_IMAGE", ""),
+        modal_sandbox_timeout_seconds=float(
+            os.getenv("MODAL_SANDBOX_TIMEOUT_SECONDS", "600")
+        ),
+        modal_sandbox_idle_timeout_seconds=float(
+            os.getenv("MODAL_SANDBOX_IDLE_TIMEOUT_SECONDS", "120")
         ),
         max_source_chars=int(os.getenv("MAX_SOURCE_CHARS", "100000")),
         max_test_value_chars=int(os.getenv("MAX_TEST_VALUE_CHARS", "2000")),

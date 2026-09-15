@@ -11,8 +11,10 @@ node_modules/
 .venv/
 backend/.venv/
 .claude/settings.local.json
-AGENTS.md
-CLAUDE.md
+# Next.js regenerates these on every `next dev`/`next build`; unrelated to
+# the repo's own AGENTS.md/CLAUDE.md at the root, which are tracked.
+frontend/AGENTS.md
+frontend/CLAUDE.md
 .browser-*.mjs
 .playwright-mcp/
 .impeccable/

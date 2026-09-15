@@ -724,10 +724,12 @@ class MemoryDiagnosticResult(BaseModel):
     memory_access_status: SanitizerCheckStatus = "not_run"
     undefined_behavior_status: SanitizerCheckStatus = "not_run"
     leak_status: SanitizerCheckStatus = "not_run"
-    execution_provider: Literal["docker"] = "docker"
+    execution_provider: Literal["docker", "modal"] = "docker"
     memory_tool: Literal[
         "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
     ] = "none"
+    # True when the configured execution provider (Docker or Modal)
+    # runtime was reachable; the field name is kept for API back-compat.
     container_runtime_available: bool | None = None
     leaked_bytes: int | None = None
     leaked_allocations: int | None = None
@@ -985,10 +987,12 @@ class RunTestsResponse(BaseModel):
     address_sanitizer_available: bool | None = None
     undefined_behavior_sanitizer_available: bool | None = None
     leak_sanitizer_available: bool | None = None
-    execution_provider: Literal["docker"] = "docker"
+    execution_provider: Literal["docker", "modal"] = "docker"
     memory_tool: Literal[
         "none", "sanitizer", "valgrind", "sanitizer_and_valgrind"
     ] = "none"
+    # True when the configured execution provider (Docker or Modal)
+    # runtime was reachable; the field name is kept for API back-compat.
     container_runtime_available: bool | None = None
     function: FunctionResponse | None = None
     tests: list[

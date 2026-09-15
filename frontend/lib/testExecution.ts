@@ -329,7 +329,7 @@ type ResultBase = {
   memory_access_status: SanitizerCheckStatus;
   undefined_behavior_status: SanitizerCheckStatus;
   leak_status: SanitizerCheckStatus;
-  execution_provider: "host" | "docker";
+  execution_provider: "host" | "docker" | "modal";
   memory_tool:
     | "none"
     | "sanitizer"
@@ -538,7 +538,7 @@ export type RunTestsResult = {
   address_sanitizer_available: boolean | null;
   undefined_behavior_sanitizer_available: boolean | null;
   leak_sanitizer_available: boolean | null;
-  execution_provider: "host" | "docker";
+  execution_provider: "host" | "docker" | "modal";
   memory_tool:
     | "none"
     | "sanitizer"
@@ -866,7 +866,7 @@ function isResultBase(value: unknown): value is ResultBase {
     isSanitizerCheckStatus(result.memory_access_status) &&
     isSanitizerCheckStatus(result.undefined_behavior_status) &&
     isSanitizerCheckStatus(result.leak_status) &&
-    ["host", "docker"].includes(result.execution_provider ?? "") &&
+    ["host", "docker", "modal"].includes(result.execution_provider ?? "") &&
     ["none", "sanitizer", "valgrind", "sanitizer_and_valgrind"].includes(
       result.memory_tool ?? "",
     ) &&
@@ -1250,7 +1250,7 @@ function isRunTestsResult(value: unknown): value is RunTestsResult {
       typeof result.undefined_behavior_sanitizer_available === "boolean") &&
     (result.leak_sanitizer_available === null ||
       typeof result.leak_sanitizer_available === "boolean") &&
-    ["host", "docker"].includes(result.execution_provider ?? "") &&
+    ["host", "docker", "modal"].includes(result.execution_provider ?? "") &&
     ["none", "sanitizer", "valgrind", "sanitizer_and_valgrind"].includes(
       result.memory_tool ?? "",
     ) &&

@@ -56,9 +56,12 @@ jobs:
           tests/test_input_file_security.py
           tests/test_iterator_analysis.py
           tests/test_memory_diagnostic_pipeline.py
+          tests/test_modal_provider.py
           tests/test_payload_limits.py
+          tests/test_provider_contract.py
           tests/test_question_transcription.py
           tests/test_rate_limiting.py
+          tests/test_read_result.py
           tests/test_resource_limits.py
           tests/test_transcription.py
           tests/test_uploads.py
@@ -177,6 +180,54 @@ jobs:
       - name: Run complete backend suite
         working-directory: backend
         run: pytest -q -rs
+
+  runner-image:
+    name: Publish Runner Image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - backend-fast
+      - frontend
+      - execution-security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push isolated C++ runner image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./runner
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/inktocode-cpp-runner:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/inktocode-cpp-runner:latest
+
+      - name: Record published image digest
+        run: |
+          {
+            echo "### Runner image published"
+            echo ""
+            echo "- \`ghcr.io/${{ github.repository }}/inktocode-cpp-runner:${{ github.sha }}\`"
+            echo "- \`ghcr.io/${{ github.repository }}/inktocode-cpp-runner:latest\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Pin \`MODAL_RUNNER_IMAGE\` to the digest above (not \`:latest\`) -- see docs/internal/MODAL_DEPLOYMENT.md."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   dependency-security:
     name: Dependency Security

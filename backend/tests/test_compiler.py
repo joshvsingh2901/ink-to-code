@@ -122,6 +122,9 @@ def test_compiler_timeout_is_handled(monkeypatch):
         def compile_source(self, *_args, **_kwargs):
             return DockerExecutionResult(compile_timed_out=True)
 
+        def close(self):
+            return None
+
     with pytest.raises(CompilerServiceError) as caught:
         compile_cpp("int main() {}", execution_provider=TimeoutProvider())
     assert caught.value.code == "compiler_timeout"
@@ -149,6 +152,9 @@ def test_compiler_uses_safe_argument_list_and_exact_source(monkeypatch):
             invocation["source"] = (work_directory / "main.cpp").read_bytes()
             invocation["timeout"] = timeout_seconds
             return DockerExecutionResult(exit_code=0)
+
+        def close(self):
+            return None
 
     result = compile_cpp(submitted, execution_provider=RecordingProvider())
 
@@ -332,6 +338,9 @@ def test_unrecognized_compiler_output_remains_available_as_raw_fallback(
         def compile_source(self, *_args, **_kwargs):
             return DockerExecutionResult(exit_code=1, stderr=raw_stderr)
 
+        def close(self):
+            return None
+
     result = compile_cpp(
         "int main() {}", execution_provider=RawOutputProvider()
     )
@@ -352,6 +361,9 @@ def test_explanations_do_not_change_raw_compiler_stderr(monkeypatch):
     class DiagnosticProvider:
         def compile_source(self, *_args, **_kwargs):
             return DockerExecutionResult(exit_code=1, stderr=raw_stderr)
+
+        def close(self):
+            return None
 
     result = compile_cpp(
         "int main() {", execution_provider=DiagnosticProvider()

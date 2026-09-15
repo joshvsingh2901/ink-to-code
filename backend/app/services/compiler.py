@@ -4,7 +4,7 @@ from pathlib import Path
 from app.schemas.compilation import CompileResponse
 from app.services.compiler_diagnostics import parse_compiler_diagnostics
 from app.services.execution_providers import (
-    DockerExecutionProvider,
+    ExecutionProvider,
     select_execution_provider,
 )
 
@@ -32,7 +32,7 @@ def compile_cpp(
     *,
     compiler: str = COMPILER_EXECUTABLE,
     timeout_seconds: int = COMPILE_TIMEOUT_SECONDS,
-    execution_provider: DockerExecutionProvider | None = None,
+    execution_provider: ExecutionProvider | None = None,
 ) -> CompileResponse:
     if compiler != COMPILER_EXECUTABLE:
         raise CompilerServiceError(
@@ -40,6 +40,7 @@ def compile_cpp(
             "Custom compiler executables are not permitted.",
             503,
         )
+    provider: ExecutionProvider | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="inktocode-compile-") as directory:
             temporary_path = Path(directory)
@@ -80,3 +81,6 @@ def compile_cpp(
             "The isolated C++ runner is unavailable.",
             503,
         ) from error
+    finally:
+        if provider is not None:
+            provider.close()

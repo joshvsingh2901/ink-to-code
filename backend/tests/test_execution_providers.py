@@ -17,7 +17,7 @@ from app.services.execution_providers import (
     docker_capabilities,
     select_memory_provider,
 )
-from app.services.test_execution import _docker_process_output
+from app.services.test_execution import _provider_process_output
 from app.services.test_execution import _compile_executable
 from app.services.compiler import CompilerServiceError
 
@@ -260,7 +260,7 @@ def test_compile_timeout_uses_dedicated_service_error(
             compiler="g++",
             timeout_seconds=10,
             run_memory_checks=True,
-            docker_provider=provider,
+            provider=provider,
         )
 
     assert caught.value.code == "compiler_timeout"
@@ -310,7 +310,7 @@ def test_capability_cache_can_be_reset_and_is_cached(monkeypatch):
 def test_definite_valgrind_leak_is_confirmed_and_paths_are_redacted(
     tmp_path: Path,
 ):
-    output = _docker_process_output(
+    output = _provider_process_output(
         DockerExecutionResult(
             exit_code=97,
             memory_tool="sanitizer_and_valgrind",
@@ -333,7 +333,7 @@ def test_definite_valgrind_leak_is_confirmed_and_paths_are_redacted(
 
 
 def test_possible_valgrind_leak_is_warning_not_confirmed(tmp_path: Path):
-    output = _docker_process_output(
+    output = _provider_process_output(
         DockerExecutionResult(
             exit_code=97,
             memory_tool="sanitizer_and_valgrind",
@@ -352,7 +352,7 @@ def test_possible_valgrind_leak_is_warning_not_confirmed(tmp_path: Path):
 def test_non_leak_asan_and_ubsan_classifications_remain_specific(
     tmp_path: Path,
 ):
-    address = _docker_process_output(
+    address = _provider_process_output(
         DockerExecutionResult(
             stderr="AddressSanitizer: heap-buffer-overflow",
             exit_code=1,
@@ -361,7 +361,7 @@ def test_non_leak_asan_and_ubsan_classifications_remain_specific(
         AVAILABLE,
         tmp_path,
     )
-    undefined = _docker_process_output(
+    undefined = _provider_process_output(
         DockerExecutionResult(
             stderr="runtime error: signed integer overflow",
             exit_code=1,

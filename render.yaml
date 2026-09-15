@@ -1,0 +1,110 @@
+# Declarative Render service definition for the InkToCode backend.
+#
+# Env values are intentionally NOT set here -- every key below must be
+# configured in the Render dashboard (or a Render environment group)
+# instead. This file only declares which keys the service expects; it
+# carries no secrets and no defaults for anything security-sensitive.
+#
+# The isolated C++ execution provider on Render must be `modal`: Render's
+# standard web service runtime does not support running privileged Docker
+# containers, so the `docker` provider (`runner/`) is not usable here. See
+# docs/internal/MODAL_DEPLOYMENT.md for Modal token creation, publishing
+# the runner image, and the required live security-test procedure before
+# relying on this in production.
+
+services:
+  - type: web
+    name: inktocode-backend
+    runtime: python
+    plan: starter
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      # Frontend / CORS
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: ENVIRONMENT
+        sync: false
+      - key: ENABLE_HSTS
+        sync: false
+
+      # Gemini (transcription + AI test generation)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_TRANSCRIPTION_MODEL
+        sync: false
+      - key: GEMINI_TEST_GENERATION_MODEL
+        sync: false
+      - key: MAX_QUESTION_CHARS
+        sync: false
+
+      # Isolated C++ execution provider -- must be "modal" on Render
+      - key: CPP_EXECUTION_PROVIDER
+        sync: false
+      - key: MODAL_TOKEN_ID
+        sync: false
+      - key: MODAL_TOKEN_SECRET
+        sync: false
+      - key: MODAL_APP_NAME
+        sync: false
+      - key: MODAL_RUNNER_IMAGE
+        sync: false
+      - key: MODAL_SANDBOX_TIMEOUT_SECONDS
+        sync: false
+      - key: MODAL_SANDBOX_IDLE_TIMEOUT_SECONDS
+        sync: false
+
+      # Shared execution resource/timeout knobs (also read by the Modal
+      # provider for cpu/memory sizing; the Docker-only timeout knobs
+      # below are unused when CPP_EXECUTION_PROVIDER=modal but remain
+      # valid to set)
+      - key: CPP_RUNNER_IMAGE
+        sync: false
+      - key: CPP_RUNNER_MEMORY
+        sync: false
+      - key: CPP_RUNNER_CPUS
+        sync: false
+      - key: CPP_RUNNER_PIDS
+        sync: false
+      - key: CPP_RUNNER_USER
+        sync: false
+      - key: CPP_DOCKER_COMPILE_TIMEOUT_SECONDS
+        sync: false
+      - key: CPP_DOCKER_RUN_TIMEOUT_SECONDS
+        sync: false
+      - key: CPP_DOCKER_VALGRIND_TIMEOUT_SECONDS
+        sync: false
+      - key: CPP_MAX_CONCURRENT_JOBS
+        sync: false
+      - key: CPP_ACQUIRE_TIMEOUT_SECONDS
+        sync: false
+
+      # Request/response limits
+      - key: MAX_SOURCE_CHARS
+        sync: false
+      - key: MAX_TEST_VALUE_CHARS
+        sync: false
+      - key: MAX_REQUEST_BYTES
+        sync: false
+
+      # Rate limiting
+      - key: RATE_LIMIT_ENABLED
+        sync: false
+      - key: RATE_LIMIT_AI_PER_WINDOW
+        sync: false
+      - key: RATE_LIMIT_AI_WINDOW_SECONDS
+        sync: false
+      - key: RATE_LIMIT_COMPILE_PER_MINUTE
+        sync: false
+      - key: RATE_LIMIT_GLOBAL_AI_PER_MINUTE
+        sync: false
+      - key: AI_MAX_CONCURRENT_CALLS
+        sync: false
+      - key: AI_ACQUIRE_TIMEOUT_SECONDS
+        sync: false
+
+      # Trust boundary
+      - key: TRUSTED_PROXY_COUNT
+        sync: false

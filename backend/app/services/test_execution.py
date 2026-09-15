@@ -35,8 +35,8 @@ from app.services.compiler import (
 )
 from app.services.big_five_diagnosis import diagnose_big_five
 from app.services.execution_providers import (
-    DockerExecutionResult,
-    DockerExecutionProvider,
+    ExecutionResult,
+    ExecutionProvider,
     ProviderCapabilities,
     select_execution_provider,
     select_memory_provider,
@@ -312,40 +312,40 @@ def _run_process(
     timeout_seconds: float,
     run_memory_checks: bool = False,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
-    docker_provider: DockerExecutionProvider | None = None,
-    docker_capabilities: ProviderCapabilities | None = None,
+    provider: ExecutionProvider | None = None,
+    capabilities: ProviderCapabilities | None = None,
 ) -> ProcessOutput:
-    if docker_provider is None:
+    if provider is None:
         raise CompilerServiceError(
             "runner_unavailable",
             "The isolated C++ runner is unavailable.",
             503,
         )
-    docker_result = docker_provider.compile_and_run(
+    result = provider.compile_and_run(
         working_directory,
         stdin,
         timeout_seconds=timeout_seconds,
         run_memory_checks=run_memory_checks,
     )
-    if docker_result.infrastructure_error and not run_memory_checks:
+    if result.infrastructure_error and not run_memory_checks:
         raise CompilerServiceError(
             "runner_unavailable",
             "The isolated C++ runner is unavailable.",
             503,
         )
-    capabilities = docker_capabilities or ProviderCapabilities(
+    resolved_capabilities = capabilities or ProviderCapabilities(
         "docker", True, True, True, False, False, False, False
     )
-    return _docker_process_output(
-        docker_result,
-        capabilities,
+    return _provider_process_output(
+        result,
+        resolved_capabilities,
         working_directory,
         run_memory_checks=run_memory_checks,
     )
 
 
-def _docker_process_output(
-    result: DockerExecutionResult,
+def _provider_process_output(
+    result: ExecutionResult,
     capabilities: ProviderCapabilities,
     working_directory: Path,
     *,
@@ -373,7 +373,7 @@ def _docker_process_output(
             memory_access_status="unavailable",
             undefined_behavior_status="unavailable",
             leak_status="unavailable",
-            execution_provider="docker",
+            execution_provider=capabilities.provider,
             container_runtime_available=True,
             infrastructure_error=result.infrastructure_error,
         )
@@ -474,7 +474,7 @@ def _docker_process_output(
         memory_access_status=access_status,
         undefined_behavior_status=undefined_status,
         leak_status=classified_leak_status,
-        execution_provider="docker",
+        execution_provider=capabilities.provider,
         memory_tool=result.memory_tool,
         container_runtime_available=True,
         leaked_bytes=result.leaked_bytes,
@@ -482,6 +482,11 @@ def _docker_process_output(
         leak_kind=result.leak_kind,
         infrastructure_error=result.infrastructure_error,
     )
+
+
+# Back-compat alias: earlier code (and tests) referred to this function as
+# _docker_process_output before it became provider-neutral.
+_docker_process_output = _provider_process_output
 
 
 def _redact_container_paths(value: str) -> str:
@@ -780,16 +785,16 @@ def _compile_executable(
     timeout_seconds: int,
     run_memory_checks: bool = False,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
-    docker_provider: DockerExecutionProvider | None = None,
+    provider: ExecutionProvider | None = None,
 ) -> tuple[str | None, bool]:
     del compiler, sanitizer_capabilities
-    if docker_provider is None:
+    if provider is None:
         raise CompilerServiceError(
             "runner_unavailable",
             "The isolated C++ runner is unavailable.",
             503,
         )
-    result = docker_provider.compile_and_run(
+    result = provider.compile_and_run(
         working_directory,
         "",
         timeout_seconds=timeout_seconds,
@@ -2506,8 +2511,8 @@ def _program_results(
     *,
     timeout_seconds: float,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
-    docker_provider: DockerExecutionProvider | None = None,
-    docker_capabilities: ProviderCapabilities | None = None,
+    provider: ExecutionProvider | None = None,
+    capabilities: ProviderCapabilities | None = None,
 ) -> list[ProgramTestResult]:
     results: list[ProgramTestResult] = []
     for test in request.tests:
@@ -2518,8 +2523,8 @@ def _program_results(
             timeout_seconds=timeout_seconds,
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
-            docker_provider=docker_provider,
-            docker_capabilities=docker_capabilities,
+            provider=provider,
+            capabilities=capabilities,
         )
         match_type = _classify_program_output_match(
             test.expected_stdout,
@@ -2738,8 +2743,8 @@ def _function_results(
     *,
     timeout_seconds: float,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
-    docker_provider: DockerExecutionProvider | None = None,
-    docker_capabilities: ProviderCapabilities | None = None,
+    provider: ExecutionProvider | None = None,
+    capabilities: ProviderCapabilities | None = None,
 ) -> list[
     FunctionTestResult
     | FunctionOutputTestResult
@@ -2765,8 +2770,8 @@ def _function_results(
             timeout_seconds=timeout_seconds,
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
-            docker_provider=docker_provider,
-            docker_capabilities=docker_capabilities,
+            provider=provider,
+            capabilities=capabilities,
         )
         metadata: dict[str, object] | None = None
         if output.result_metadata is not None:
@@ -3160,8 +3165,8 @@ def _object_results(
     *,
     timeout_seconds: float,
     sanitizer_capabilities: SanitizerCapabilities | None = None,
-    docker_provider: DockerExecutionProvider | None = None,
-    docker_capabilities: ProviderCapabilities | None = None,
+    provider: ExecutionProvider | None = None,
+    capabilities: ProviderCapabilities | None = None,
 ) -> list[ObjectScenarioTestResult]:
     results: list[ObjectScenarioTestResult] = []
     for scenario_index, (test, prepared) in enumerate(
@@ -3174,8 +3179,8 @@ def _object_results(
             timeout_seconds=timeout_seconds,
             run_memory_checks=request.run_memory_checks,
             sanitizer_capabilities=sanitizer_capabilities,
-            docker_provider=docker_provider,
-            docker_capabilities=docker_capabilities,
+            provider=provider,
+            capabilities=capabilities,
         )
         constructor_metadata: dict[str, object] | None = None
         if output.constructor_metadata is not None:
@@ -5042,25 +5047,21 @@ def run_test_request(
             arguments_by_test.append(prepared_arguments)
 
     try:
-        docker_provider = select_execution_provider()
+        provider = select_execution_provider()
     except ValueError as error:
         raise CompilerServiceError(
             "runner_unavailable",
             "The isolated C++ runner is unavailable.",
             503,
         ) from error
-    provider_name = "docker"
+    provider_name = provider.name
     provider_unavailable: str | None = None
-    docker_capabilities: ProviderCapabilities | None = None
+    provider_capabilities: ProviderCapabilities | None = None
     if request.run_memory_checks:
         provider_name, selected_provider, provider_unavailable = (
             select_memory_provider()
         )
-        docker_provider = (
-            selected_provider
-            if isinstance(selected_provider, DockerExecutionProvider)
-            else None
-        )
+        provider = selected_provider if selected_provider else None
         if provider_name == "docker" and selected_provider is None:
             return RunTestsResponse(
                 mode=request.mode,
@@ -5080,7 +5081,7 @@ def run_test_request(
                 ),
                 tests=[],
             )
-        docker_capabilities = docker_provider.capabilities()
+        provider_capabilities = provider.capabilities()
 
     try:
         with tempfile.TemporaryDirectory(prefix="inktocode-tests-") as directory:
@@ -5102,12 +5103,12 @@ def run_test_request(
             (working_directory / "main.cpp").write_bytes(source.encode("utf-8"))
             sanitizer_capabilities = (
                 SanitizerCapabilities(
-                    docker_capabilities.address_sanitizer_available,
-                    docker_capabilities.undefined_behavior_sanitizer_available,
-                    docker_capabilities.leak_sanitizer_available
-                    or docker_capabilities.valgrind_available,
+                    provider_capabilities.address_sanitizer_available,
+                    provider_capabilities.undefined_behavior_sanitizer_available,
+                    provider_capabilities.leak_sanitizer_available
+                    or provider_capabilities.valgrind_available,
                 )
-                if docker_capabilities is not None
+                if provider_capabilities is not None
                 else None
             )
             compile_error, sanitizer_unavailable = _compile_executable(
@@ -5116,7 +5117,7 @@ def run_test_request(
                 timeout_seconds=compile_timeout_seconds,
                 run_memory_checks=request.run_memory_checks,
                 sanitizer_capabilities=sanitizer_capabilities,
-                docker_provider=docker_provider,
+                provider=provider,
             )
             if compile_error is not None:
                 if sanitizer_unavailable:
@@ -5127,7 +5128,7 @@ def run_test_request(
                         memory_status="unavailable",
                         memory_summary=(
                             compile_error
-                            if docker_provider is not None
+                            if provider is not None
                             else (
                                 "Memory diagnostics are unavailable with the "
                                 "current compiler."
@@ -5150,8 +5151,8 @@ def run_test_request(
                         ),
                         execution_provider=provider_name,
                         container_runtime_available=(
-                            docker_capabilities.runtime_available
-                            if docker_capabilities
+                            provider_capabilities.runtime_available
+                            if provider_capabilities
                             else False
                         ),
                         function=(
@@ -5188,8 +5189,8 @@ def run_test_request(
                     ),
                     execution_provider=provider_name,
                     container_runtime_available=(
-                        docker_capabilities.runtime_available
-                        if docker_capabilities
+                        provider_capabilities.runtime_available
+                        if provider_capabilities
                         else None
                     ),
                     function=(
@@ -5207,8 +5208,8 @@ def run_test_request(
                     request,
                     timeout_seconds=test_timeout_seconds,
                     sanitizer_capabilities=sanitizer_capabilities,
-                    docker_provider=docker_provider,
-                    docker_capabilities=docker_capabilities,
+                    provider=provider,
+                    capabilities=provider_capabilities,
                 )
                 infrastructure_failure = _memory_infrastructure_failure(
                     results
@@ -5251,8 +5252,8 @@ def run_test_request(
                         results[0].memory_tool if results else "none"
                     ),
                     container_runtime_available=(
-                        docker_capabilities.runtime_available
-                        if docker_capabilities
+                        provider_capabilities.runtime_available
+                        if provider_capabilities
                         else None
                     ),
                     tests=results,
@@ -5266,8 +5267,8 @@ def run_test_request(
                     object_scenarios,
                     timeout_seconds=test_timeout_seconds,
                     sanitizer_capabilities=sanitizer_capabilities,
-                    docker_provider=docker_provider,
-                    docker_capabilities=docker_capabilities,
+                    provider=provider,
+                    capabilities=provider_capabilities,
                 )
                 infrastructure_failure = _memory_infrastructure_failure(
                     object_results
@@ -5312,8 +5313,8 @@ def run_test_request(
                         else "none"
                     ),
                     container_runtime_available=(
-                        docker_capabilities.runtime_available
-                        if docker_capabilities
+                        provider_capabilities.runtime_available
+                        if provider_capabilities
                         else None
                     ),
                     tests=object_results,
@@ -5327,8 +5328,8 @@ def run_test_request(
                 mutation_parameter_names,
                 timeout_seconds=test_timeout_seconds,
                 sanitizer_capabilities=sanitizer_capabilities,
-                docker_provider=docker_provider,
-                docker_capabilities=docker_capabilities,
+                provider=provider,
+                capabilities=provider_capabilities,
             )
             infrastructure_failure = _memory_infrastructure_failure(
                 function_results
@@ -5374,8 +5375,8 @@ def run_test_request(
                     else "none"
                 ),
                 container_runtime_available=(
-                    docker_capabilities.runtime_available
-                    if docker_capabilities
+                    provider_capabilities.runtime_available
+                    if provider_capabilities
                     else None
                 ),
                 function=_function_response(function),
@@ -5389,6 +5390,9 @@ def run_test_request(
             "The isolated C++ runner could not compile or run the tests.",
             503,
         ) from error
+    finally:
+        if provider is not None:
+            provider.close()
 
 
 def run_cpp_tests(

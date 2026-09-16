@@ -179,9 +179,9 @@ modal.Sandbox.exec(*args, stdout=StreamType.PIPE, stderr=StreamType.PIPE,
     bufsize=-1, pty=False, ...) -> ContainerProcess
 
 modal.Sandbox.terminate(*, wait=False) -> int | None
-modal.Sandbox.open(path, mode="r") -> FileIO   # used only to WRITE inputs
-modal.Sandbox.rm(path, recursive=False) -> None
-modal.Sandbox.mkdir(path, parents=False) -> None
+modal.Sandbox.filesystem.write_bytes(data: bytes, remote_path: str) -> None
+modal.Sandbox.filesystem.write_text(data: str, remote_path: str) -> None
+modal.Sandbox.filesystem.remove(remote_path: str, *, recursive=False) -> None
 
 modal.Image.from_registry(tag, secret=None, *,
     setup_dockerfile_commands=[], force_build=False,
@@ -203,14 +203,21 @@ modal.App.lookup(name, *, client=None, environment_name=None,
 
 ### Findings that shaped `modal_provider.py`
 
-- **`sb.open()` vs `sb.filesystem.*`**: this pinned version exposes
-  `Sandbox.open`/`Sandbox.rm`/`Sandbox.mkdir` directly on the `Sandbox`
-  object (no separate `.filesystem` namespace). `modal_provider.py` uses
-  `sandbox.open(path, "wb"/"w")` as a context manager to **write** inputs
-  (`main.cpp`, `runner-request.json`) only. It is never used to read the
-  result — see the symlink-safety note below.
-- **Reading results never uses `sb.open()`**: `Sandbox.open()`'s read path
-  was not verified to reject a symlink the way `read_result.py`'s
+- **`sandbox.filesystem.*`, not `sb.open()`/`sb.rm()`**: earlier drafts of
+  this integration targeted the legacy `Sandbox.open()`/`Sandbox.rm()`/
+  `Sandbox.mkdir()` methods. The live Modal gate (§4) discovered that Modal
+  has fully removed that legacy filesystem API server-side, so those calls
+  no longer work against real infrastructure; `modal_provider.py` was
+  migrated to the current, non-deprecated `sandbox.filesystem` namespace.
+  `_upload_inputs()` calls `sandbox.filesystem.write_bytes(main_cpp,
+  _MAIN_CPP_PATH)` and `sandbox.filesystem.write_text(json.dumps(manifest),
+  _REQUEST_PATH)` to write inputs (`main.cpp`, `runner-request.json`), and
+  `sandbox.filesystem.remove(_RESULT_PATH)` to clear any stale result file
+  before each run. This namespace is used only to **write** inputs and
+  clear stale state — it is never used to read the result; see the
+  symlink-safety note below.
+- **Reading results never goes through `sandbox.filesystem`**: its read
+  path was not verified to reject a symlink the way `read_result.py`'s
   `O_NOFOLLOW` does, and the implementation spec was explicit that it must
   not be trusted for this. Every result read goes through
   `sandbox.exec("python3", "/opt/inktocode/read_result.py", ...)` and its

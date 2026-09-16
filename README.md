@@ -4,6 +4,8 @@ Turn handwritten C++ into editable code, compile it, test it, and generate struc
 
 Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable source, then provides an IDE-style environment for compilation, manual testing, AI-generated tests, and deeper C++ behavior checks. Gemini handles multimodal transcription and proposes structured test plans, but deterministic validation, compiler tooling, harness generation, and execution remain authoritative—the project is more than an OCR wrapper.
 
+**[Live demo →](https://inktocode-frontend.vercel.app)** — a real, fully smoke-tested deployment: Vercel frontend, FastAPI on Render, Gemini transcription/AI-test generation, and isolated C++ execution via Modal cloud sandboxes.
+
 <!-- Add polished Ink to Code editor screenshot here -->
 
 ## Highlights
@@ -15,8 +17,8 @@ Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable
 - Manual tests and constrained AI-generated practice tests
 - Strict AI-test schemas, capability gating, value validation, deduplication, and bounded repair
 - Defined support for primitives, arrays, pointers, 15 STL containers, iterators, classes, operators, inheritance, polymorphism, and templates
-- Isolated compilation, testing, ASan, UBSan, and Valgrind diagnostics through a pluggable execution provider — Docker locally by default, or Modal cloud sandboxes for deployment (see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md))
-- 1,104 automated frontend/backend tests currently pass (881 backend + 223 frontend) with the Docker runner available
+- Isolated compilation, testing, and memory diagnostics (AddressSanitizer, UndefinedBehaviorSanitizer, and — on the Docker path — Valgrind) through a pluggable execution provider: `DockerExecutionProvider` for local/self-hosted use, `ModalExecutionProvider` in production (see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md))
+- 1,104 automated frontend/backend tests currently pass (881 backend + 223 frontend) with the Docker runner available, plus a live Modal integration suite run against real cloud infrastructure before production deploys
 
 ## How It Works
 
@@ -59,6 +61,29 @@ flowchart TD
 ```
 
 The frontend owns upload, review, editor, and result presentation. FastAPI separates routes, Pydantic contracts, external AI calls, source analysis, compiler operations, and execution services. All submitted C++ compilation and execution fails closed through the configured execution provider — Docker locally by default, or Modal isolated cloud sandboxes when deployed; the API host has no execution fallback on either path.
+
+### Deployment Topology
+
+The same application code runs against two interchangeable execution back ends, selected by `CPP_EXECUTION_PROVIDER`:
+
+```mermaid
+flowchart LR
+    subgraph Production["Production (live demo)"]
+        FE1["Next.js frontend<br/>Vercel"] --> BE1["FastAPI backend<br/>Render"]
+        BE1 --> Gemini1["Gemini"]
+        BE1 --> Modal["ModalExecutionProvider"]
+        Modal --> Sandbox["Isolated cloud sandbox<br/>C++ compile + run"]
+    end
+
+    subgraph Local["Local / self-hosted"]
+        FE2["Next.js frontend"] --> BE2["FastAPI backend"]
+        BE2 --> Gemini2["Gemini"]
+        BE2 --> Docker["DockerExecutionProvider"]
+        Docker --> Runner["Hardened Docker runner<br/>(runner/)"]
+    end
+```
+
+Both providers implement the same `ExecutionProvider` interface and run the identical `runner/` image contents — only the launch mechanism differs. `DockerExecutionProvider` is the hardened default for running Ink to Code locally or on your own infrastructure. Render — like most PaaS hosts — does not let a web service run a privileged Docker daemon, so production execution instead runs through Modal's isolated, ephemeral cloud sandboxes with equivalent or compensating controls (see [Execution Safety](#execution-safety) below), rather than weakening isolation or self-managing a VM just to keep a Docker daemon available.
 
 ## Multimodal Transcription Pipeline
 
@@ -153,15 +178,13 @@ and `AGENTS.md` for the complete, per-control rationale):
 | Capability dropping | native (`--cap-drop ALL`) | not an equivalent control (gVisor userspace kernel + non-root instead) |
 | Memory limit | hard cap | hard cap, OOM-kills |
 | CPU limit | hard CFS quota | soft throttle (wall-clock timeout is the real control on both) |
-| PID limit | native (`--pids-limit`) | `ulimit`, unverified under gVisor pending a live test |
+| PID limit | native (`--pids-limit`) | `ulimit -u`, proven under gVisor by the live Modal security-test suite (§4) |
 | Secret isolation | no `-e` flags passed at all | hermetic `env -i` launch; no Modal/Gemini credential ever reaches user code |
 | Isolated workspace | one bind-mounted temp directory | no host mounts at all (stronger) |
 
-Public deployment still requires deployment-specific configuration,
-monitoring, and production smoke testing — see
-[`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md)
-for the Modal token/image setup and the required live security tests
-before relying on the compensating controls above in production.
+Public deployment is live at the [demo above](https://inktocode-frontend.vercel.app). Before relying on the compensating controls above in production, the live Modal security-test suite (`backend/tests/test_modal_integration.py`, marked `modal_live`) was run twice against real Modal infrastructure, and a full end-to-end production smoke test was completed against the live deployment — see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md) for the Modal token/image setup and the exact live security-test procedure.
+
+Memory diagnostics are proven on both paths, but not identically: Valgrind is proven on the Docker path; on Modal, ASan/UBSan/LeakSanitizer are the proven memory-diagnostic tools (Valgrind is not confirmed working through the Modal sandbox specifically).
 
 ## Tech Stack
 
@@ -184,6 +207,8 @@ Current local audit results:
 | Frontend lint | passed |
 | Frontend production build | passed |
 | Docker runner integration | passed |
+| Live Modal security-test suite | 12/12 passed, run twice against real Modal infrastructure |
+| Production smoke test | 17/17 real end-to-end checks passed against the [live deployment](https://inktocode-frontend.vercel.app) |
 
 Backend tests mock external Gemini requests and do not consume API quota. No coverage percentage, transcription-accuracy figure, or AI test-quality benchmark is claimed.
 
@@ -306,7 +331,6 @@ Component-specific details are available in [`frontend/README.md`](frontend/READ
 ## Future Work
 
 - production deployment hardening, orchestration, and monitoring
-- a hosted, safely isolated demo
 - broader C++ syntax and signature coverage
 - operational observability and reproducible performance measurements
 - labeled transcription and AI test-generation benchmarks

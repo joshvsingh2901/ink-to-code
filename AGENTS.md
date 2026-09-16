@@ -693,4 +693,3 @@ Intentional limitations (do not expand without a separate design stage):
 - No `reverse_iterator`, `set::iterator`, `map::iterator`, or `unordered_*::iterator`.
 - No nested element types in iterator parameters (e.g., `vector<vector<int>>::iterator`).
 - No raw algorithm injection — students must `#include <algorithm>` and `#include <numeric>`.
-

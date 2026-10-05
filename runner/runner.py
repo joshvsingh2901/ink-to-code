@@ -15,7 +15,10 @@ RESULT = WORK / "runner-result.json"
 SANITIZER_FLAGS = [
     "-std=c++17",
     "-O0",
-    "-g",
+    # Sanitizer reports need source line tables, not full variable/type
+    # debug metadata. This keeps useful stack locations while reducing
+    # compiler work and peak memory inside the 256 MiB sandbox.
+    "-gline-tables-only",
     "-fno-omit-frame-pointer",
     "-fsanitize=address,undefined",
 ]
@@ -115,10 +118,33 @@ def run(command, *, timeout, stdin="", environment=None, output_limit=65536):
 
 
 def compile_program(output, sanitized=True, timeout=10, source="main.cpp"):
-    command = ["clang++" if sanitized else "g++"]
-    command += SANITIZER_FLAGS if sanitized else ["-std=c++17", "-O0", "-g"]
-    command += [source, "-o", output]
-    return run(command, timeout=timeout)
+    if not sanitized:
+        return run(
+            ["g++", "-std=c++17", "-O0", "-g", source, "-o", output],
+            timeout=timeout,
+        )
+    # A compile-and-link Clang invocation keeps the driver and a separate
+    # frontend alive together. Compile alone uses the in-process frontend,
+    # avoiding that overlap in the memory-limited sandbox. Both stages
+    # share the original deadline; neither gets an extra compile allowance.
+    deadline = time.monotonic() + timeout
+    object_name = output + ".o"
+    try:
+        compiled, timed_out, limited = run(
+            ["clang++", *SANITIZER_FLAGS, "-c", source, "-o", object_name],
+            timeout=timeout,
+        )
+        if timed_out or limited or compiled.returncode != 0:
+            return compiled, timed_out, limited
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return compiled, True, limited
+        return run(
+            ["clang++", *SANITIZER_FLAGS, object_name, "-o", output],
+            timeout=remaining,
+        )
+    finally:
+        (WORK / object_name).unlink(missing_ok=True)
 
 
 def compile_source(request):
@@ -337,6 +363,14 @@ def compile_and_run(request):
         max(float(request.get("valgrind_timeout_seconds", 20)), 1), 60
     )
     memory_checks = bool(request.get("run_memory_checks"))
+    # The plain executable is only used for the leak-check fallback. Keep
+    # compilation and execution on the same capability decision.
+    needs_valgrind = (
+        memory_checks
+        and not request.get("leak_sanitizer_available")
+        and request.get("valgrind_available")
+        and shutil.which("valgrind") is not None
+    )
     if request.get("compile_only"):
         compiled, compilation_timed_out, compilation_output_limited = compile_program(
             "program", sanitized=memory_checks, timeout=compile_timeout
@@ -361,11 +395,7 @@ def compile_and_run(request):
                 }
             )
             return
-        if (
-            memory_checks
-            and request.get("valgrind_available")
-            and shutil.which("valgrind")
-        ):
+        if needs_valgrind:
             plain, plain_timed_out, _ = compile_program(
                 "program-valgrind",
                 sanitized=False,
@@ -422,18 +452,11 @@ def compile_and_run(request):
     leaked_allocations = None
 
     sanitizer_report = stderr.lower()
-    leak_supported = bool(request.get("leak_sanitizer_available"))
     sanitizer_failed = any(
         marker in sanitizer_report
         for marker in ("addresssanitizer", "runtime error:", "leaksanitizer")
     )
-    if (
-        memory_checks
-        and not sanitizer_failed
-        and not leak_supported
-        and request.get("valgrind_available")
-        and shutil.which("valgrind")
-    ):
+    if needs_valgrind and not sanitizer_failed:
         if (WORK / "program-valgrind").is_file():
             checked, valgrind_timed_out, valgrind_output_limited = run(
                 ["valgrind", *VALGRIND_FLAGS, str(WORK / "program-valgrind")],

@@ -39,6 +39,10 @@ services:
         sync: false
       - key: MAX_QUESTION_CHARS
         sync: false
+      - key: ENABLE_DEMO_TRANSCRIPTION_FAST_PATH
+        sync: false
+      - key: DEMO_TRANSCRIPTION_DELAY_SECONDS
+        sync: false
 
       # Isolated C++ execution provider -- must be "modal" on Render
       - key: CPP_EXECUTION_PROVIDER
@@ -54,6 +58,12 @@ services:
       - key: MODAL_SANDBOX_TIMEOUT_SECONDS
         sync: false
       - key: MODAL_SANDBOX_IDLE_TIMEOUT_SECONDS
+        sync: false
+      - key: DEMO_MEMORY_CHECK_PROFILE
+        sync: false
+      - key: DEMO_MEMORY_CHECK_COMPILE_TIMEOUT_SECONDS
+        sync: false
+      - key: DEMO_MEMORY_CHECK_MEMORY_MB
         sync: false
 
       # Shared execution resource/timeout knobs (also read by the Modal

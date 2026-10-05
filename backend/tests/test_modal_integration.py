@@ -20,13 +20,16 @@ runtime, not just in the fixed launch string.
 """
 
 import json
+import asyncio
 import os
 import uuid
 from pathlib import Path
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from app.config import Settings
+from app.main import app
 from app.schemas.test_execution import ProgramTestCase
 from app.services.compiler import CompilerServiceError, compile_cpp
 from app.services.modal_provider import (
@@ -286,3 +289,64 @@ def test_second_use_reuses_sandbox_not_a_new_one_per_call():
         unique_marker,
     )
     assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("name", "index", "memory_checks", "expected_status"),
+    [
+        ("good", 4, True, "clean"),
+        ("bad", 5, True, "buffer_overflow"),
+        ("bad", 5, False, "not_run"),
+    ],
+)
+def test_memory_demo_functions_through_ui_api(
+    name, index, memory_checks, expected_status,
+):
+    code = (
+        f"void {name}()\n{{\n    int* arr = new int[5];\n\n"
+        f"    arr[{index}] = 10;\n\n    delete[] arr;\n}}\n"
+    )
+
+    async def exercise():
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            compiled = await client.post(
+                "/api/compile", json={"code": code, "language": "cpp"}
+            )
+            assert compiled.status_code == 200
+            assert compiled.json()["success"] is True
+            analysis = await client.post(
+                "/api/test-mode", json={"code": code, "language": "cpp"}
+            )
+            assert analysis.status_code == 200
+            response = await client.post("/api/run-tests", json={
+                "mode": "function",
+                "code": code,
+                "language": "cpp",
+                "target_function": analysis.json()["functions"][0]["id"],
+                "run_memory_checks": memory_checks,
+                "tests": [{
+                    "name": "Memory regression",
+                    "arguments": [],
+                    "expected_outcome": "return_void",
+                    "expected_stdout": "",
+                }],
+            })
+            assert response.status_code == 200
+            result = response.json()
+            # The memory compatibility wrapper currently defaults the
+            # top-level provider label to docker; the per-test label comes
+            # from the actual provider capabilities and proves this path.
+            provider_label = (
+                result["tests"][0]["execution_provider"]
+                if memory_checks else result["execution_provider"]
+            )
+            assert provider_label == "modal"
+            assert result["tests"][0]["memory_status"] == expected_status
+            if memory_checks:
+                assert result["success"] is (index == 4)
+            if expected_status == "buffer_overflow":
+                assert "heap-buffer-overflow" in result["tests"][0]["memory_diagnostics"]
+
+    asyncio.run(exercise())

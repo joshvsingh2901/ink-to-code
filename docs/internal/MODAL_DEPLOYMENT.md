@@ -36,17 +36,21 @@ beyond being present in the process environment.
 | `MODAL_RUNNER_IMAGE` | `app/config.py` | yes | the published GHCR image reference, **pinned to a digest** (`ghcr.io/<owner>/<repo>/inktocode-cpp-runner@sha256:...`), never `:latest`, in any environment that isn't purely local experimentation |
 | `MODAL_SANDBOX_TIMEOUT_SECONDS` | `app/config.py` | no (default `600`) | hard sandbox lifetime cap passed to `Sandbox.create(timeout=...)` |
 | `MODAL_SANDBOX_IDLE_TIMEOUT_SECONDS` | `app/config.py` | no (default `120`) | idle-teardown backstop passed to `Sandbox.create(idle_timeout=...)`, in case `provider.close()` is ever missed |
+| `DEMO_MEMORY_CHECK_PROFILE` | `app/config.py` | no (default `false`) | opt-in demo profile applied only to requests with `run_memory_checks=true` |
+| `DEMO_MEMORY_CHECK_COMPILE_TIMEOUT_SECONDS` | `app/config.py` | no (default `30`) | compile deadline for demo-profile memory-check requests only |
+| `DEMO_MEMORY_CHECK_MEMORY_MB` | `app/config.py` | no (default `512`) | Modal sandbox RAM for demo-profile memory-check requests; accepted values are 512 or 1024 MiB |
 
 `_validated_settings()` in `execution_providers.py` fails closed at
 provider-selection time if `CPP_EXECUTION_PROVIDER=modal` and
 `MODAL_RUNNER_IMAGE` is empty — it does not fall through to Docker.
 
 `CPP_RUNNER_MEMORY` and `CPP_RUNNER_CPUS` (already used by the Docker
-path) are reused for Modal too — `ModalExecutionProvider` parses them into
+path) are reused for ordinary Modal requests too — `ModalExecutionProvider` parses them into
 the `(cpu, cpu)` / `(memory_mib, memory_mib)` tuples `Sandbox.create()`
 expects, via `_memory_mib()` in `modal_provider.py` (`"256m"` → `256`,
-`"1g"` → `1024`). There are no separate Modal-specific resource-size
-variables.
+`"1g"` → `1024`). When the explicit demo profile is enabled, only memory-check
+requests use `DEMO_MEMORY_CHECK_MEMORY_MB`; normal compile and test requests
+continue using `CPP_RUNNER_MEMORY`.
 
 ## 2. Creating a Modal API token
 

@@ -6,7 +6,10 @@ the fixed launch command, and the sandbox lifecycle can all be asserted
 directly.
 """
 
+import importlib.util
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -300,6 +303,67 @@ def test_sandbox_create_kwargs_are_security_critical_and_correct(tmp_path):
     assert FakeSandbox.create_positional_calls[0] == ("sleep", "infinity")
 
 
+@pytest.mark.parametrize("configured_memory", [512, 1024])
+def test_demo_memory_profile_uses_configured_ram_and_compile_deadline(
+    tmp_path, monkeypatch, configured_memory,
+):
+    (tmp_path / "main.cpp").write_text("int main() {}")
+    provider = ModalExecutionProvider(
+        _settings(
+            cpp_docker_compile_timeout_seconds=10,
+            demo_memory_check_profile=True,
+            demo_memory_check_compile_timeout_seconds=30,
+            demo_memory_check_memory_mb=configured_memory,
+        )
+    )
+    monkeypatch.setattr(
+        provider,
+        "capabilities",
+        lambda: ProviderCapabilities(
+            "modal", True, True, True, True, True, True, True
+        ),
+    )
+    result = provider.compile_and_run(
+        tmp_path,
+        "",
+        timeout_seconds=10,
+        compile_only=True,
+        run_memory_checks=True,
+    )
+
+    assert result.infrastructure_error == "The isolated runner could not start."
+    assert FakeSandbox.create_calls[0]["memory"] == (
+        configured_memory,
+        configured_memory,
+    )
+    sandbox = FakeSandbox.instances[0]
+    manifest = json.loads(sandbox.files["/work/runner-request.json"])
+    assert manifest["compile_timeout_seconds"] == 30
+    assert sandbox.exec_calls[0][1]["timeout"] == 35
+
+
+def test_demo_memory_profile_leaves_ordinary_modal_request_unchanged(tmp_path):
+    (tmp_path / "main.cpp").write_text("int main() {}")
+    provider = ModalExecutionProvider(
+        _settings(
+            cpp_docker_compile_timeout_seconds=10,
+            demo_memory_check_profile=True,
+            demo_memory_check_compile_timeout_seconds=30,
+            demo_memory_check_memory_mb=512,
+        )
+    )
+    result = provider.compile_and_run(
+        tmp_path, "", timeout_seconds=10, compile_only=True
+    )
+
+    assert result.infrastructure_error == "The isolated runner could not start."
+    assert FakeSandbox.create_calls[0]["memory"] == (256, 256)
+    sandbox = FakeSandbox.instances[0]
+    manifest = json.loads(sandbox.files["/work/runner-request.json"])
+    assert manifest["compile_timeout_seconds"] == 10
+    assert sandbox.exec_calls[0][1]["timeout"] == 15
+
+
 def test_image_built_only_via_from_registry_with_configured_digest(tmp_path):
     (tmp_path / "main.cpp").write_text("int main() {}")
     provider = ModalExecutionProvider(
@@ -523,6 +587,58 @@ def test_compile_only_exec_timeout_sets_compile_timed_out(tmp_path):
 
     assert result.compile_timed_out is True
     assert sandbox.terminate_calls == 1
+
+
+def test_lsan_compile_finishes_inside_existing_outer_budget(tmp_path, monkeypatch):
+    """Two valid 8s compiles used to exceed the unchanged 15s outer cap.
+
+    Run the actual isolated-runner dispatch with mocked compiler calls and
+    a virtual clock, through the provider's real timeout/error handling.
+    No compiler or student process is started on the test host.
+    """
+    path = Path(__file__).resolve().parents[2] / "runner" / "runner.py"
+    spec = importlib.util.spec_from_file_location("runner_budget_regression", path)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    (tmp_path / "main.cpp").write_text("int main() {}")
+    provider = ModalExecutionProvider(_settings())
+    monkeypatch.setattr(provider, "capabilities", lambda: ProviderCapabilities(
+        "modal", True, True, True, True, True, True, True,
+    ))
+    monkeypatch.setattr(runner.shutil, "which", lambda _: "/usr/bin/valgrind")
+    sandbox = provider._ensure_sandbox(tmp_path)
+    elapsed = 0
+    compiler_limits = []
+    payloads = []
+    outer_limits = []
+
+    def fake_compile(*args, timeout, **kwargs):
+        nonlocal elapsed
+        compiler_limits.append(timeout)
+        elapsed += 8
+        if elapsed > outer_limits[-1]:
+            raise modal.exception.ExecTimeoutError("outer compile budget exceeded")
+        return subprocess.CompletedProcess([], 0, b"", b""), False, False
+
+    def fake_exec(*args, **kwargs):
+        if args == _READ_RESULT_COMMAND:
+            return _result_process(payloads[-1])
+        outer_limits.append(kwargs["timeout"])
+        runner.compile_and_run(json.loads(sandbox.files["/work/runner-request.json"]))
+        return FakeProcess()
+
+    monkeypatch.setattr(runner, "compile_program", fake_compile)
+    monkeypatch.setattr(runner, "write_result", payloads.append)
+    monkeypatch.setattr(sandbox, "exec", fake_exec)
+    result = provider.compile_and_run(
+        tmp_path, "", timeout_seconds=10, compile_only=True, run_memory_checks=True,
+    )
+    assert result.infrastructure_error is None
+    assert result.compile_timed_out is False
+    assert compiler_limits == [10]
+    assert outer_limits == [15]
+    assert elapsed == 8
 
 
 def test_non_json_stdout_yields_invalid_result_error(tmp_path):

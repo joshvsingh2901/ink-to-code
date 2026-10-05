@@ -46,6 +46,11 @@ class Settings:
     ai_acquire_timeout_seconds: float = 20
     allowed_frontend_origins: tuple[str, ...] = ()
     hsts_enabled: bool = False
+    enable_demo_transcription_fast_path: bool = False
+    demo_transcription_delay_seconds: float = 25
+    demo_memory_check_profile: bool = False
+    demo_memory_check_compile_timeout_seconds: float = 30
+    demo_memory_check_memory_mb: int = 512
 
     @property
     def cors_origins(self) -> tuple[str, ...]:
@@ -171,6 +176,21 @@ def get_settings() -> Settings:
         ),
         allowed_frontend_origins=origins,
         hsts_enabled=_enabled(os.getenv("ENABLE_HSTS")),
+        enable_demo_transcription_fast_path=_enabled(
+            os.getenv("ENABLE_DEMO_TRANSCRIPTION_FAST_PATH")
+        ),
+        demo_transcription_delay_seconds=float(
+            os.getenv("DEMO_TRANSCRIPTION_DELAY_SECONDS", "25")
+        ),
+        demo_memory_check_profile=_enabled(
+            os.getenv("DEMO_MEMORY_CHECK_PROFILE")
+        ),
+        demo_memory_check_compile_timeout_seconds=float(
+            os.getenv("DEMO_MEMORY_CHECK_COMPILE_TIMEOUT_SECONDS", "30")
+        ),
+        demo_memory_check_memory_mb=int(
+            os.getenv("DEMO_MEMORY_CHECK_MEMORY_MB", "512")
+        ),
     )
     validate_web_settings(settings)
     return settings

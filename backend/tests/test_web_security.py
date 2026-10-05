@@ -104,6 +104,22 @@ def test_production_environment_requires_an_explicit_origin(monkeypatch):
         get_settings()
 
 
+def test_demo_environment_settings_are_parsed(monkeypatch):
+    monkeypatch.setenv("ENABLE_DEMO_TRANSCRIPTION_FAST_PATH", "true")
+    monkeypatch.setenv("DEMO_TRANSCRIPTION_DELAY_SECONDS", "25")
+    monkeypatch.setenv("DEMO_MEMORY_CHECK_PROFILE", "true")
+    monkeypatch.setenv("DEMO_MEMORY_CHECK_COMPILE_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("DEMO_MEMORY_CHECK_MEMORY_MB", "512")
+
+    configured = get_settings()
+
+    assert configured.enable_demo_transcription_fast_path is True
+    assert configured.demo_transcription_delay_seconds == 25
+    assert configured.demo_memory_check_profile is True
+    assert configured.demo_memory_check_compile_timeout_seconds == 30
+    assert configured.demo_memory_check_memory_mb == 512
+
+
 def test_api_security_headers_and_frame_protection_are_present():
     response = asyncio.run(request(create_app(settings())))
     assert response.headers["x-content-type-options"] == "nosniff"

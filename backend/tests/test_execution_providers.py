@@ -15,6 +15,7 @@ from app.services.execution_providers import (
     _docker_base_command,
     _is_regular_result_file,
     docker_capabilities,
+    select_execution_provider,
     select_memory_provider,
 )
 from app.services.test_execution import _provider_process_output
@@ -88,6 +89,21 @@ def test_auto_fails_closed_when_docker_is_unavailable(monkeypatch):
 def test_host_mode_is_rejected():
     with pytest.raises(ValueError, match="Host execution is disabled"):
         select_memory_provider(settings("host"))
+
+
+@pytest.mark.parametrize("memory_mb", [0, 256, 2048])
+def test_demo_memory_profile_never_accepts_out_of_range_modal_ram(memory_mb):
+    configured = settings("modal")
+    configured = Settings(
+        **{
+            **configured.__dict__,
+            "modal_runner_image": "ghcr.io/example/runner@sha256:deadbeef",
+            "demo_memory_check_profile": True,
+            "demo_memory_check_memory_mb": memory_mb,
+        }
+    )
+    with pytest.raises(ValueError, match="must be 512 or 1024"):
+        select_execution_provider(configured)
 
 
 def test_docker_required_never_silently_falls_back(monkeypatch):

@@ -106,6 +106,14 @@ def _validated_settings(settings: Settings) -> Settings:
             "CPP_EXECUTION_PROVIDER must be docker or modal. Host execution "
             "is disabled."
         )
+    if not 0 <= settings.demo_transcription_delay_seconds <= 300:
+        raise ValueError("DEMO_TRANSCRIPTION_DELAY_SECONDS is invalid.")
+    if not 1 <= settings.demo_memory_check_compile_timeout_seconds <= 120:
+        raise ValueError(
+            "DEMO_MEMORY_CHECK_COMPILE_TIMEOUT_SECONDS is invalid."
+        )
+    if settings.demo_memory_check_memory_mb not in {512, 1024}:
+        raise ValueError("DEMO_MEMORY_CHECK_MEMORY_MB must be 512 or 1024.")
     is_modal = settings.cpp_execution_provider == "modal"
     if is_modal:
         if not settings.modal_runner_image:
@@ -269,20 +277,24 @@ def clamped_timeouts(
     timeout_seconds: float,
     *,
     compile_only: bool,
+    run_memory_checks: bool = False,
 ) -> tuple[float, float]:
     """Return (run_timeout, compile_timeout) clamped to configured bounds."""
     run_timeout = min(
         max(timeout_seconds, 0.05),
         settings.cpp_docker_run_timeout_seconds,
     )
-    compile_timeout = (
-        min(
-            max(timeout_seconds, 1),
-            settings.cpp_docker_compile_timeout_seconds,
+    if run_memory_checks and settings.demo_memory_check_profile:
+        compile_timeout = settings.demo_memory_check_compile_timeout_seconds
+    else:
+        compile_timeout = (
+            min(
+                max(timeout_seconds, 1),
+                settings.cpp_docker_compile_timeout_seconds,
+            )
+            if compile_only
+            else settings.cpp_docker_compile_timeout_seconds
         )
-        if compile_only
-        else settings.cpp_docker_compile_timeout_seconds
-    )
     return run_timeout, compile_timeout
 
 
@@ -456,7 +468,10 @@ class DockerExecutionProvider:
         run_memory_checks: bool = False,
     ) -> ExecutionResult:
         run_timeout, compile_timeout = clamped_timeouts(
-            self.settings, timeout_seconds, compile_only=compile_only
+            self.settings,
+            timeout_seconds,
+            compile_only=compile_only,
+            run_memory_checks=run_memory_checks,
         )
         capabilities = self.capabilities() if run_memory_checks else None
         manifest = build_run_manifest(

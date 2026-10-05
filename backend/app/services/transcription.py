@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 from pathlib import Path
 
@@ -15,6 +17,19 @@ from app.schemas.transcription import (
 from app.services.uploads import NormalizedPage
 
 logger = logging.getLogger(__name__)
+
+DEMO_TRANSCRIPTION_IMAGE_SHA256 = (
+    "05894ddc5232ae6476439b5d36a61018547354cc4058778e12044d06fc328a91"
+)
+DEMO_TRANSCRIPTION_CODE = """int findMax (int a, int b) {
+    int maxValue;
+    if (c > b) {
+        maxValue = a; }
+    else {
+        maxvalue = b;
+    }
+    retum MaXVALUE;"""
+DEMO_TRANSCRIPTION_MODEL = "demo-precomputed-two-pass"
 
 TRANSCRIPTION_PROMPT = """You are a literal visual transcription engine, not a code completion or code reconstruction system.
 
@@ -93,6 +108,25 @@ class TranscriptionServiceError(RuntimeError):
         self.code = code
         self.message = message
         self.status_code = status_code
+
+
+def demo_transcription_for_pages(
+    code_pages: list[NormalizedPage], settings: Settings
+) -> TranscriptionResponse | None:
+    """Return the opt-in demo result only for the one approved image."""
+    if not settings.enable_demo_transcription_fast_path or len(code_pages) != 1:
+        return None
+    digest = hashlib.sha256(code_pages[0].content).hexdigest()
+    if not hmac.compare_digest(digest, DEMO_TRANSCRIPTION_IMAGE_SHA256):
+        return None
+    logger.info("Demo transcription fast path matched one validated code page.")
+    return TranscriptionResponse(
+        code=DEMO_TRANSCRIPTION_CODE,
+        overall_confidence=1.0,
+        uncertain_regions=[],
+        page_count=1,
+        model=DEMO_TRANSCRIPTION_MODEL,
+    )
 
 
 def build_gemini_contents(

@@ -110,6 +110,7 @@ class ModalExecutionProvider:
         self.settings = settings
         self._sandbox = None
         self._work_directory: Path | None = None
+        self._sandbox_uses_demo_memory = False
 
     def capabilities(self) -> ProviderCapabilities:
         return modal_capabilities(
@@ -123,6 +124,7 @@ class ModalExecutionProvider:
         sandbox = self._sandbox
         self._sandbox = None
         self._work_directory = None
+        self._sandbox_uses_demo_memory = False
         if sandbox is None:
             return
         try:
@@ -133,15 +135,26 @@ class ModalExecutionProvider:
                 "reclaimed by its idle timeout."
             )
 
-    def _ensure_sandbox(self, work_directory: Path):
+    def _ensure_sandbox(
+        self, work_directory: Path, *, run_memory_checks: bool = False
+    ):
+        use_demo_memory = (
+            run_memory_checks and self.settings.demo_memory_check_profile
+        )
         if self._sandbox is not None:
             if self._work_directory != work_directory:
                 raise ValueError(
                     "A ModalExecutionProvider instance may only be used "
                     "with a single work directory."
                 )
+            if self._sandbox_uses_demo_memory != use_demo_memory:
+                raise ValueError(
+                    "A ModalExecutionProvider instance cannot mix demo-memory "
+                    "and ordinary execution."
+                )
             return self._sandbox
         self._work_directory = work_directory
+        self._sandbox_uses_demo_memory = use_demo_memory
         app = modal.App.lookup(
             self.settings.modal_app_name, create_if_missing=True
         )
@@ -156,7 +169,11 @@ class ModalExecutionProvider:
             self.settings.modal_runner_image
         ).entrypoint([])
         cpu = float(self.settings.cpp_runner_cpus)
-        memory = _memory_mib(self.settings.cpp_runner_memory)
+        memory = (
+            self.settings.demo_memory_check_memory_mb
+            if use_demo_memory
+            else _memory_mib(self.settings.cpp_runner_memory)
+        )
         self._sandbox = modal.Sandbox.create(
             # Override the image's ENTRYPOINT with an idle process. Without
             # this, the sandbox's container runs the isolated runner
@@ -201,6 +218,7 @@ class ModalExecutionProvider:
         work_directory: Path,
         *,
         outer_timeout: float,
+        run_memory_checks: bool = False,
     ) -> tuple[str, dict | None]:
         """Run one manifest through the sandbox.
 
@@ -210,7 +228,9 @@ class ModalExecutionProvider:
         folded into a status the caller maps to an ExecutionResult.
         """
         try:
-            sandbox = self._ensure_sandbox(work_directory)
+            sandbox = self._ensure_sandbox(
+                work_directory, run_memory_checks=run_memory_checks
+            )
         except ValueError:
             raise
         except Exception:  # noqa: BLE001
@@ -271,7 +291,10 @@ class ModalExecutionProvider:
         run_memory_checks: bool = False,
     ) -> ExecutionResult:
         run_timeout, compile_timeout = clamped_timeouts(
-            self.settings, timeout_seconds, compile_only=compile_only
+            self.settings,
+            timeout_seconds,
+            compile_only=compile_only,
+            run_memory_checks=run_memory_checks,
         )
         capabilities = self.capabilities() if run_memory_checks else None
         manifest = build_run_manifest(
@@ -296,7 +319,10 @@ class ModalExecutionProvider:
         )
         outer_timeout = compile_timeout + 5 if compile_only else run_timeout + 5
         status, payload = self._invoke(
-            manifest, work_directory, outer_timeout=outer_timeout
+            manifest,
+            work_directory,
+            outer_timeout=outer_timeout,
+            run_memory_checks=run_memory_checks,
         )
         if status == "timeout":
             return ExecutionResult(

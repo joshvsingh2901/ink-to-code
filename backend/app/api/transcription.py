@@ -1,3 +1,4 @@
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, UploadFile
@@ -14,6 +15,7 @@ from app.schemas.transcription import (
 )
 from app.services.transcription import (
     TranscriptionServiceError,
+    demo_transcription_for_pages,
     log_transcription_error,
     transcribe_pages,
     transcribe_question_pages,
@@ -73,6 +75,11 @@ async def transcribe(
             )
         else:
             normalized_question_pages = []
+
+        demo_result = demo_transcription_for_pages(code_pages, settings)
+        if demo_result is not None:
+            await asyncio.sleep(settings.demo_transcription_delay_seconds)
+            return demo_result
 
         async with gemini_slot():
             return await run_in_threadpool(

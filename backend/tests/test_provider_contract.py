@@ -177,6 +177,37 @@ def test_clamped_timeouts_compile_only_ceiling_is_configured_value():
     assert compile_timeout == 30
 
 
+def test_demo_memory_profile_changes_only_memory_check_compile_deadline():
+    configured = _settings(
+        cpp_docker_compile_timeout_seconds=10,
+        demo_memory_check_profile=True,
+        demo_memory_check_compile_timeout_seconds=30,
+    )
+    _, memory_compile_timeout = clamped_timeouts(
+        configured,
+        10,
+        compile_only=True,
+        run_memory_checks=True,
+    )
+    _, ordinary_compile_timeout = clamped_timeouts(
+        configured,
+        10,
+        compile_only=True,
+        run_memory_checks=False,
+    )
+    memory_run_timeout, memory_runtime_compile_timeout = clamped_timeouts(
+        configured,
+        2,
+        compile_only=False,
+        run_memory_checks=True,
+    )
+
+    assert memory_compile_timeout == 30
+    assert ordinary_compile_timeout == 10
+    assert memory_run_timeout == 2
+    assert memory_runtime_compile_timeout == 30
+
+
 # ---------------------------------------------------------------------------
 # execution_result_from_payload
 # ---------------------------------------------------------------------------

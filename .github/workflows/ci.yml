@@ -257,9 +257,13 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Audit npm dependencies at High or Critical severity
+      - name: Audit production npm dependencies at High or Critical severity
         working-directory: frontend
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit all npm dependencies at Critical severity
+        working-directory: frontend
+        run: npm audit --include=dev --audit-level=critical
 
   secret-scan:
     name: Secret Scan

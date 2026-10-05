@@ -1,12 +1,14 @@
 # Ink to Code
 
+[![CI and Security](https://github.com/joshvsingh2901/ink-to-code/actions/workflows/ci.yml/badge.svg)](https://github.com/joshvsingh2901/ink-to-code/actions/workflows/ci.yml)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Open%20InkToCode-000000?logo=vercel&logoColor=white)](https://inktocode-frontend.vercel.app)
+
 Turn handwritten C++ into editable code, compile it, test it, and generate structured practice feedback.
 
 Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable source, then provides an IDE-style environment for compilation, manual testing, AI-generated tests, and deeper C++ behavior checks. Gemini handles multimodal transcription and proposes structured test plans, but deterministic validation, compiler tooling, harness generation, and execution remain authoritative—the project is more than an OCR wrapper.
 
 **[Live demo →](https://inktocode-frontend.vercel.app)** — a real, fully smoke-tested deployment: Vercel frontend, FastAPI on Render, Gemini transcription/AI-test generation, and isolated C++ execution via Modal cloud sandboxes.
 
-<!-- Add polished Ink to Code editor screenshot here -->
 
 ## Highlights
 
@@ -18,7 +20,7 @@ Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable
 - Strict AI-test schemas, capability gating, value validation, deduplication, and bounded repair
 - Defined support for primitives, arrays, pointers, 15 STL containers, iterators, classes, operators, inheritance, polymorphism, and templates
 - Isolated compilation, testing, and memory diagnostics (AddressSanitizer, UndefinedBehaviorSanitizer, and — on the Docker path — Valgrind) through a pluggable execution provider: `DockerExecutionProvider` for local/self-hosted use, `ModalExecutionProvider` in production (see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md))
-- 1,104 automated frontend/backend tests currently pass (881 backend + 223 frontend) with the Docker runner available, plus a live Modal integration suite run against real cloud infrastructure before production deploys
+- 1,207 automated frontend/backend tests currently pass in CI (979 backend + 228 frontend), with 15 opt-in backend tests deselected from the normal regression plus a live Modal integration suite run against real cloud infrastructure before production deploys
 
 ## How It Works
 
@@ -201,9 +203,9 @@ Current local audit results:
 
 | Check | Result |
 | --- | --- |
-| Backend tests | 881 passed with the Docker runner available |
+| Backend tests | 979 passed, 15 opt-in tests deselected in the normal full regression |
 | Backend Python compilation | `python -m compileall app` passed |
-| Frontend tests | 223 / 223 passed |
+| Frontend tests | 228 / 228 passed |
 | Frontend lint | passed |
 | Frontend production build | passed |
 | Docker runner integration | passed |

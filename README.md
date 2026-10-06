@@ -7,8 +7,7 @@ Turn handwritten C++ into editable code, compile it, test it, and generate struc
 
 Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable source, then provides an IDE-style environment for compilation, manual testing, AI-generated tests, and deeper C++ behavior checks. Gemini handles multimodal transcription and proposes structured test plans, but deterministic validation, compiler tooling, harness generation, and execution remain authoritative—the project is more than an OCR wrapper.
 
-**[Live demo →](https://inktocode-frontend.vercel.app)** — a real, fully smoke-tested deployment: Vercel frontend, FastAPI on Render, Gemini transcription/AI-test generation, and isolated C++ execution via Modal cloud sandboxes.
-
+**[Live demo →](https://inktocode-frontend.vercel.app)** — Vercel frontend, FastAPI on Render, Gemini transcription/AI-test generation, and isolated C++ execution via Modal cloud sandboxes.
 
 ## Highlights
 
@@ -20,7 +19,7 @@ Ink to Code converts handwritten C++ from images or PDFs into reviewed, editable
 - Strict AI-test schemas, capability gating, value validation, deduplication, and bounded repair
 - Defined support for primitives, arrays, pointers, 15 STL containers, iterators, classes, operators, inheritance, polymorphism, and templates
 - Isolated compilation, testing, and memory diagnostics (AddressSanitizer, UndefinedBehaviorSanitizer, and — on the Docker path — Valgrind) through a pluggable execution provider: `DockerExecutionProvider` for local/self-hosted use, `ModalExecutionProvider` in production (see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md))
-- 1,207 automated frontend/backend tests currently pass in CI (979 backend + 228 frontend), with 15 opt-in backend tests deselected from the normal regression plus a live Modal integration suite run against real cloud infrastructure before production deploys
+- 1,207 automated frontend/backend tests currently pass in CI (979 backend + 228 frontend), with 15 opt-in backend tests deselected from the normal regression plus an opt-in live Modal integration suite for deployment verification
 
 ## How It Works
 
@@ -47,9 +46,12 @@ flowchart TD
     GeminiTranscription --> Review["Editable review"]
     Review --> Monaco["Monaco editor"]
 
-    Monaco --> Compiler["C++17 compiler + type analysis"]
-    Compiler --> Harness["Deterministic dynamic C++ harness"]
-    Harness --> HostRun["Host temporary-directory execution<br/>Normal functional tests"]
+    Monaco --> Analysis["Deterministic source analysis"]
+    Analysis --> Harness["Temporary C++ test harness"]
+    Monaco --> Provider["Execution provider: Docker or Modal"]
+    Harness --> Provider
+    Provider --> Compiler["Isolated C++17 compilation"]
+    Compiler --> Run["Isolated test execution on explicit request"]
 
     Frontend --> Question["Question text / image extraction"]
     Question --> Capability["Deterministic capability gate"]
@@ -58,8 +60,8 @@ flowchart TD
     Validation --> Harness
 
     Harness --> Memory["Optional memory diagnostics"]
-    Memory --> Provider["Execution provider: Docker or Modal"]
-    Provider --> Tools["ASan / UBSan / Valgrind"]
+    Memory --> Provider
+    Run --> Tools["Optional ASan / UBSan / Valgrind checks"]
 ```
 
 The frontend owns upload, review, editor, and result presentation. FastAPI separates routes, Pydantic contracts, external AI calls, source analysis, compiler operations, and execution services. All submitted C++ compilation and execution fails closed through the configured execution provider — Docker locally by default, or Modal isolated cloud sandboxes when deployed; the API host has no execution fallback on either path.
@@ -184,7 +186,7 @@ and `AGENTS.md` for the complete, per-control rationale):
 | Secret isolation | no `-e` flags passed at all | hermetic `env -i` launch; no Modal/Gemini credential ever reaches user code |
 | Isolated workspace | one bind-mounted temp directory | no host mounts at all (stronger) |
 
-Public deployment is live at the [demo above](https://inktocode-frontend.vercel.app). Before relying on the compensating controls above in production, the live Modal security-test suite (`backend/tests/test_modal_integration.py`, marked `modal_live`) was run twice against real Modal infrastructure, and a full end-to-end production smoke test was completed against the live deployment — see [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md) for the Modal token/image setup and the exact live security-test procedure.
+The [live demo](https://inktocode-frontend.vercel.app) uses Modal. Its opt-in security suite (`backend/tests/test_modal_integration.py`, marked `modal_live`) requires real cloud infrastructure and is separate from normal CI. See [`docs/internal/MODAL_DEPLOYMENT.md`](docs/internal/MODAL_DEPLOYMENT.md) for the deployment controls and live verification procedure. A green CI run does not replace these live checks.
 
 Memory diagnostics are proven on both paths, but not identically: Valgrind is proven on the Docker path; on Modal, ASan/UBSan/LeakSanitizer are the proven memory-diagnostic tools (Valgrind is not confirmed working through the Modal sandbox specifically).
 
@@ -199,7 +201,7 @@ Memory diagnostics are proven on both paths, but not identically: Valgrind is pr
 
 ## Verification
 
-Current local audit results:
+Automated results verified against [CI run 37391347878](https://github.com/joshvsingh2901/ink-to-code/actions/runs/37391347878); the badge above tracks the latest run:
 
 | Check | Result |
 | --- | --- |
@@ -209,30 +211,53 @@ Current local audit results:
 | Frontend lint | passed |
 | Frontend production build | passed |
 | Docker runner integration | passed |
-| Live Modal security-test suite | 12/12 passed, run twice against real Modal infrastructure |
-| Production smoke test | 17/17 real end-to-end checks passed against the [live deployment](https://inktocode-frontend.vercel.app) |
 
 Backend tests mock external Gemini requests and do not consume API quota. No coverage percentage, transcription-accuracy figure, or AI test-quality benchmark is claimed.
 
 ## Continuous Integration
 
-GitHub Actions now separates fast backend checks, frontend verification,
-Docker-backed execution-security tests, main-branch full regression,
-dependency auditing, and secret scanning. Pull requests run every gate except
-the four-to-five-minute full backend regression; pushes to `main` and manual
-workflow dispatches run the complete set.
+GitHub Actions runs backend checks, frontend tests/lint/build, Docker-backed
+execution-security tests, dependency audits, and secret scanning on pull
+requests. Pushes to `main` and manual runs also execute the full backend
+regression. Main-branch pushes publish the runner image.
 
-Workflows use read-only repository permissions and never receive Gemini or
-deployment credentials. See
+Workflow permissions default to read-only. Only the runner-image publishing
+job receives package-write permission; no job receives Gemini, Render, or
+Modal credentials. See
 [`CI_SECURITY_PLAN.md`](CI_SECURITY_PLAN.md) for the enforced test map,
-scanner policies, expected runtime, and the exact pre-deployment procedure.
+scanner policies, known dependency findings, and verification procedures.
+
+`main` requires Backend Fast, Frontend, Execution Security, Dependency Security,
+and Secret Scan from GitHub Actions. Force pushes and branch deletion are
+disabled; no additional reviewer is required for solo maintenance. Standard
+administrator access remains available.
+
+## Frontend Deployment
+
+Vercel imports this repository with these project settings:
+
+| Setting | Value |
+| --- | --- |
+| Production branch | `main` |
+| Root Directory | `frontend` |
+| Framework Preset | Next.js |
+| Node.js version | 24.x |
+| Install Command | `npm ci` |
+| Build Command | `npm run build` |
+| Output Directory | Next.js default |
+| `NEXT_PUBLIC_API_BASE_URL` | `https://inktocode-backend.onrender.com` (Production and Preview) |
+
+The root directory is essential: the Next.js app and lockfile are inside
+`frontend/`. Building at the repository root fails because it has no `app/`
+directory. Mock transcription is disabled in production. The backend health
+endpoint is [available here](https://inktocode-backend.onrender.com/health).
 
 ## Local Setup
 
 ### Prerequisites
 
 - Python 3.13 or another version compatible with the backend dependencies
-- Node.js 20+
+- Node.js 24 (matches CI and Vercel)
 - a C++17 compiler available as `g++` or a compatible local toolchain
 - a Gemini API key for real transcription and AI-test generation
 - Docker for all C++ compilation, tests, and memory diagnostics
@@ -313,7 +338,7 @@ npm run build
 ink-to-code/
 ├── frontend/       Next.js upload, review, Monaco, and results UI
 ├── backend/        FastAPI routes, schemas, AI services, compiler, and test engine
-├── runner/         Restricted Linux memory-diagnostic image and entrypoint
+├── runner/         Isolated C++ compilation, execution, and diagnostics image
 ├── docs/           Portfolio assets and internal implementation plans
 └── README.md       Project overview and local setup
 ```
